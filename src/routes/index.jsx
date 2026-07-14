@@ -3,6 +3,9 @@ import DashboardLayout from '../layouts/DashboardLayout'
 import AuthLayout from '../layouts/AuthLayout'
 import Login from '../pages/Login'
 import Register from '../pages/Register'
+import VerifyOtp from '../pages/VerifyOtp'
+import ForgotPassword from '../pages/ForgotPassword'
+import ResetPassword from '../pages/ResetPassword'
 import Home from '../pages/Home'
 import History from '../pages/History'
 import AIAssistant from '../pages/AIAssistant'
@@ -28,6 +31,30 @@ export default function AppRoutes() {
         element={
           <AuthLayout>
             <Register />
+          </AuthLayout>
+        }
+      />
+      <Route
+        path="/verify-otp"
+        element={
+          <AuthLayout>
+            <VerifyOtp />
+          </AuthLayout>
+        }
+      />
+      <Route
+        path="/forgot-password"
+        element={
+          <AuthLayout>
+            <ForgotPassword />
+          </AuthLayout>
+        }
+      />
+      <Route
+        path="/reset-password"
+        element={
+          <AuthLayout>
+            <ResetPassword />
           </AuthLayout>
         }
       />

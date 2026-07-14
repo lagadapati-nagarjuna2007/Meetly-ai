@@ -4,7 +4,18 @@ import Sidebar from '../components/Sidebar'
 import { motion, AnimatePresence } from 'framer-motion'
 
 export default function DashboardLayout() {
-  const { user } = useAuth()
+  const { user, isLoading } = useAuth()
+
+  if (isLoading) {
+    return (
+      <div className="w-full h-screen bg-[#05060c] flex items-center justify-center">
+        <div className="flex flex-col items-center gap-3">
+          <div className="w-7 h-7 rounded-full border border-white/10 border-t-purple-500 animate-spin" />
+          <span className="text-[10px] text-gray-500 font-bold uppercase tracking-widest">Restoring Session...</span>
+        </div>
+      </div>
+    )
+  }
 
   if (!user) {
     return <Navigate to="/login" replace />

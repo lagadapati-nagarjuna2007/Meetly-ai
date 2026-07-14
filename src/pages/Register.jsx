@@ -47,8 +47,8 @@ export default function Register() {
     try {
       const success = await register(name, email, password)
       if (success) {
-        showToast('Account created! Please sign in.', 'success')
-        navigate('/login')
+        showToast('Verification code sent to your email!', 'success')
+        navigate(`/verify-otp?email=${encodeURIComponent(email)}`)
       }
     } catch (err) {
       showToast(err.message || 'Registration failed', 'error')

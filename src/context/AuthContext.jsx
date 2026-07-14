@@ -1,113 +1,217 @@
-import { createContext, useContext, useState } from 'react'
+import { createContext, useContext, useState, useEffect } from 'react'
 
 const AuthContext = createContext(null)
-
-const DEFAULT_USERS = [
-  {
-    name: 'Nagarjuna Sai',
-    email: 'nagarjuna@meetly.ai',
-    password: 'password',
-    role: 'Student',
-    avatar: 'https://images.unsplash.com/photo-1535713875002-d1d0cf377fde?auto=format&fit=crop&w=150&h=150&q=80'
-  }
-]
+const API_URL = 'http://localhost:5000/api/auth'
 
 export function AuthProvider({ children }) {
-  const [user, setUser] = useState(() => {
-    const savedUser = localStorage.getItem('meetly_user')
-    return savedUser ? JSON.parse(savedUser) : null
-  })
-  
-  const [registeredUsers, setRegisteredUsers] = useState(() => {
-    const saved = localStorage.getItem('meetly_registered_users')
-    if (saved) {
-      return JSON.parse(saved)
-    } else {
-      localStorage.setItem('meetly_registered_users', JSON.stringify(DEFAULT_USERS))
-      return DEFAULT_USERS
+  const [user, setUser] = useState(null)
+  const [isLoading, setIsLoading] = useState(true)
+
+  // 1. Restore session on mount using cookie credentials
+  useEffect(() => {
+    const checkSession = async () => {
+      try {
+        const res = await fetch(`${API_URL}/me`, {
+          method: 'GET',
+          headers: { 'Content-Type': 'application/json' },
+          credentials: 'include'
+        })
+        if (res.ok) {
+          const data = await res.json()
+          setUser(data.user)
+        } else {
+          setUser(null)
+        }
+      } catch (err) {
+        console.error('Session check failed:', err)
+        setUser(null)
+      } finally {
+        setIsLoading(false)
+      }
     }
-  })
+    checkSession()
+  }, [])
 
-  const [isLoading, setIsLoading] = useState(false)
-
+  // 2. SIGN IN
   const login = async (email, password) => {
     setIsLoading(true)
-    await new Promise((resolve) => setTimeout(resolve, 800))
-    
-    // Check if user exists in the mock list and matches password
-    const foundUser = registeredUsers.find(
-      (u) => u.email.toLowerCase() === email.toLowerCase() && u.password === password
-    )
+    try {
+      const res = await fetch(`${API_URL}/login`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ email, password }),
+        credentials: 'include'
+      })
 
-    if (foundUser) {
-      // Exclude password from the session user state
-      const { password: _, ...sessionUser } = foundUser
-      setUser(sessionUser)
-      localStorage.setItem('meetly_user', JSON.stringify(sessionUser))
+      const data = await res.json()
+      
+      if (!res.ok) {
+        throw new Error(data.message || 'Invalid Email or Password')
+      }
+
+      setUser(data.user)
       setIsLoading(false)
       return true
-    } else {
+    } catch (err) {
       setIsLoading(false)
-      throw new Error('Invalid email or password')
+      throw err
     }
   }
 
+  // 3. SIGN UP (Calls backend signup - does not log in)
   const register = async (name, email, password) => {
     setIsLoading(true)
-    await new Promise((resolve) => setTimeout(resolve, 1000))
+    try {
+      const res = await fetch(`${API_URL}/signup`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ fullName: name, email, password }),
+        credentials: 'include'
+      })
 
-    // Check if email already exists
-    const exists = registeredUsers.some(
-      (u) => u.email.toLowerCase() === email.toLowerCase()
-    )
+      const data = await res.json()
 
-    if (exists) {
+      if (!res.ok) {
+        throw new Error(data.message || 'Registration failed')
+      }
+
       setIsLoading(false)
-      throw new Error('An account with this email already exists')
+      return true
+    } catch (err) {
+      setIsLoading(false)
+      throw err
+    }
+  }
+
+  // 4. VERIFY OTP
+  const verifyOtp = async (email, otp) => {
+    setIsLoading(true)
+    try {
+      const res = await fetch(`${API_URL}/verify-otp`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ email, otp }),
+        credentials: 'include'
+      })
+
+      const data = await res.json()
+
+      if (!res.ok) {
+        throw new Error(data.message || 'Verification failed')
+      }
+
+      setIsLoading(false)
+      return true
+    } catch (err) {
+      setIsLoading(false)
+      throw err
+    }
+  }
+
+  // 5. RESEND OTP
+  const resendOtp = async (email) => {
+    const res = await fetch(`${API_URL}/resend-otp`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ email }),
+      credentials: 'include'
+    })
+
+    const data = await res.json()
+
+    if (!res.ok) {
+      throw new Error(data.message || 'Failed to resend code')
     }
 
-    const newUser = {
-      name,
-      email,
-      password,
-      role: 'Student',
-      avatar: 'https://images.unsplash.com/photo-1535713875002-d1d0cf377fde?auto=format&fit=crop&w=150&h=150&q=80'
-    }
-
-    const updatedList = [...registeredUsers, newUser]
-    setRegisteredUsers(updatedList)
-    localStorage.setItem('meetly_registered_users', JSON.stringify(updatedList))
-    
-    setIsLoading(false)
     return true
   }
 
-  const logout = () => {
-    setUser(null)
-    localStorage.removeItem('meetly_user')
+  // 6. FORGOT PASSWORD
+  const forgotPassword = async (email) => {
+    setIsLoading(true)
+    try {
+      const res = await fetch(`${API_URL}/forgot-password`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ email }),
+        credentials: 'include'
+      })
+
+      const data = await res.json()
+
+      if (!res.ok) {
+        throw new Error(data.message || 'Failed to send recovery code')
+      }
+
+      setIsLoading(false)
+      return true
+    } catch (err) {
+      setIsLoading(false)
+      throw err
+    }
+  }
+
+  // 7. RESET PASSWORD
+  const resetPassword = async (email, otp, newPassword) => {
+    setIsLoading(true)
+    try {
+      const res = await fetch(`${API_URL}/reset-password`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ email, otp, newPassword }),
+        credentials: 'include'
+      })
+
+      const data = await res.json()
+
+      if (!res.ok) {
+        throw new Error(data.message || 'Failed to reset password')
+      }
+
+      setIsLoading(false)
+      return true
+    } catch (err) {
+      setIsLoading(false)
+      throw err
+    }
+  }
+
+  // 8. LOG OUT
+  const logout = async () => {
+    try {
+      await fetch(`${API_URL}/logout`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        credentials: 'include'
+      })
+    } catch (err) {
+      console.error('Logout request error:', err)
+    } finally {
+      setUser(null)
+    }
   }
 
   const updateProfile = (name, email) => {
     if (!user) return
-    
-    // Update active session
-    const updatedSessionUser = { ...user, name, email }
-    setUser(updatedSessionUser)
-    localStorage.setItem('meetly_user', JSON.stringify(updatedSessionUser))
-
-    // Update in registered list
-    const updatedList = registeredUsers.map((u) => {
-      if (u.email.toLowerCase() === user.email.toLowerCase()) {
-        return { ...u, name, email }
-      }
-      return u
-    })
-    setRegisteredUsers(updatedList)
-    localStorage.setItem('meetly_registered_users', JSON.stringify(updatedList))
+    const updated = { ...user, name, email }
+    setUser(updated)
   }
 
   return (
-    <AuthContext.Provider value={{ user, login, register, logout, updateProfile, isLoading }}>
+    <AuthContext.Provider
+      value={{
+        user,
+        isLoading,
+        login,
+        register,
+        verifyOtp,
+        resendOtp,
+        forgotPassword,
+        resetPassword,
+        logout,
+        updateProfile
+      }}
+    >
       {children}
     </AuthContext.Provider>
   )
