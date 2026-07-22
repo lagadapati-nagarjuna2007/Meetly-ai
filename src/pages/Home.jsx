@@ -15,14 +15,12 @@ import {
   ArrowRight,
   Plus,
   Copy,
-  CheckCircle,
-  ToggleLeft,
-  ToggleRight
+  CheckCircle
 } from 'lucide-react'
 
 export default function Home() {
   const { user } = useAuth()
-  const { meetings, createMeeting, joinMeeting } = useMeetings()
+  const { meetings, createMeeting, joinMeeting, isCreatingMeeting, isJoiningMeeting } = useMeetings()
   const { showToast } = useToast()
   const navigate = useNavigate()
 
@@ -32,10 +30,8 @@ export default function Home() {
   
   // Create Meeting Fields
   const [meetingName, setMeetingName] = useState('')
-  const [meetingDesc, setMeetingDesc] = useState('')
-  const [reqAttendance, setReqAttendance] = useState(true)
-  const [reqFocus, setReqFocus] = useState(true)
-  const [reqSummary, setReqSummary] = useState(true)
+  const [meetingType, setMeetingType] = useState('public')
+  const [meetingPassword, setMeetingPassword] = useState('')
   
   // Create Success State
   const [createdMtg, setCreatedMtg] = useState(null)
@@ -45,50 +41,60 @@ export default function Home() {
   const [joinPassword, setJoinPassword] = useState('')
 
   // Handle Create Submit
-  const handleCreateSubmit = (e) => {
+  const handleCreateSubmit = async (e) => {
     e.preventDefault()
     if (!meetingName.trim()) {
-      showToast('Please enter a meeting name', 'error')
+      showToast('Please enter a meeting title', 'error')
       return
     }
 
-    const mtg = createMeeting(
-      meetingName,
-      meetingDesc,
-      reqAttendance,
-      reqFocus,
-      reqSummary
-    )
-    setCreatedMtg(mtg)
-    showToast('Meeting created successfully!', 'success')
+    try {
+      const mtg = await createMeeting(
+        meetingName.trim(),
+        meetingType,
+        meetingPassword
+      )
+      setCreatedMtg(mtg)
+      showToast('Meeting created successfully!', 'success')
+    } catch (err) {
+      showToast(err.message || 'Failed to create meeting', 'error')
+    }
   }
 
   // Handle Join Submit
-  const handleJoinSubmit = (e) => {
+  const handleJoinSubmit = async (e) => {
     e.preventDefault()
     if (!joinId.trim()) {
-      showToast('Please enter a meeting ID', 'error')
+      showToast('Please enter a meeting code', 'error')
       return
     }
 
-    const mtg = joinMeeting(joinId)
-    showToast(`Joining meeting: ${mtg.name}`, 'success')
-    setIsJoinOpen(false)
-    navigate(`/meeting/${mtg.id}`)
+    try {
+      const mtg = await joinMeeting(joinId.trim(), joinPassword)
+      showToast('Joined meeting successfully!', 'success')
+      setIsJoinOpen(false)
+      setJoinId('')
+      setJoinPassword('')
+      navigate(`/meeting/${mtg.id}`)
+    } catch (err) {
+      showToast(err.message || 'Failed to join meeting', 'error')
+    }
   }
 
   const handleCopyLink = () => {
-    const link = `https://meetly.ai/room/${createdMtg.id}`
+    const link = `${window.location.origin}/meeting/${createdMtg.id}`
     navigator.clipboard.writeText(link)
     showToast('Link copied to clipboard!', 'success')
   }
 
   const handleStartMeeting = () => {
     setIsCreateOpen(false)
+    const code = createdMtg.id
     setCreatedMtg(null)
     setMeetingName('')
-    setMeetingDesc('')
-    navigate(`/meeting/${createdMtg.id}`)
+    setMeetingType('public')
+    setMeetingPassword('')
+    navigate(`/meeting/${code}`)
   }
 
   return (
@@ -180,9 +186,30 @@ export default function Home() {
 
         {/* Meeting Cards Stack */}
         <div className="flex flex-col gap-2.5">
-          {meetings.slice(0, 4).map((mtg, index) => (
-            <MeetingCard key={mtg.id} meeting={mtg} index={index} />
-          ))}
+          {meetings && meetings.length > 0 ? (
+            meetings.slice(0, 4).map((mtg, index) => (
+              <MeetingCard key={mtg.id} meeting={mtg} index={index} />
+            ))
+          ) : (
+            <div className="flex flex-col items-center justify-center py-10 px-4 bg-white/2 border border-white/5 rounded-2xl gap-3 text-center">
+              <div className="w-9 h-9 rounded-full bg-white/5 flex items-center justify-center text-gray-400">
+                <Video size={16} />
+              </div>
+              <div className="flex flex-col gap-0.5">
+                <h3 className="text-xs font-semibold text-white">No meetings yet</h3>
+                <p className="text-[10px] text-gray-500">Create your first meeting.</p>
+              </div>
+              <button
+                onClick={() => {
+                  setCreatedMtg(null)
+                  setIsCreateOpen(true)
+                }}
+                className="mt-1 px-3 py-1.8 bg-[#7c3aed] hover:bg-[#8b5cf6] text-white rounded-xl text-[10px] font-bold transition-all duration-200 cursor-pointer shadow-md"
+              >
+                Create Meeting
+              </button>
+            </div>
+          )}
         </div>
       </div>
 
@@ -234,55 +261,45 @@ export default function Home() {
             />
             
             <div className="flex flex-col gap-1 text-left">
-              <label className="text-xs font-semibold text-gray-300 pl-0.5">Description</label>
-              <textarea
-                rows={3}
-                placeholder="Optional meeting details and topics"
-                value={meetingDesc}
-                onChange={(e) => setMeetingDesc(e.target.value)}
-                className="w-full bg-[#0a0b12]/50 border border-white/5 rounded-xl px-4 py-3 text-xs text-white placeholder-gray-600 focus:outline-none focus:border-[#7c3aed] transition-all duration-200"
+              <label className="text-xs font-semibold text-gray-300 pl-0.5">Meeting Type</label>
+              <div className="grid grid-cols-2 gap-3 mt-1.5">
+                <button
+                  type="button"
+                  onClick={() => setMeetingType('public')}
+                  className={`py-2.5 px-4 rounded-xl text-xs font-bold border transition-all duration-200 cursor-pointer ${
+                    meetingType === 'public'
+                      ? 'bg-[#8b5cf6]/15 border-[#8b5cf6]/50 text-white'
+                      : 'bg-white/2 border-white/5 text-gray-400 hover:text-white'
+                  }`}
+                >
+                  Public
+                </button>
+                <button
+                  type="button"
+                  onClick={() => setMeetingType('private')}
+                  className={`py-2.5 px-4 rounded-xl text-xs font-bold border transition-all duration-200 cursor-pointer ${
+                    meetingType === 'private'
+                      ? 'bg-[#8b5cf6]/15 border-[#8b5cf6]/50 text-white'
+                      : 'bg-white/2 border-white/5 text-gray-400 hover:text-white'
+                  }`}
+                >
+                  Private
+                </button>
+              </div>
+            </div>
+
+            {meetingType === 'private' && (
+              <Input
+                label="Optional Password"
+                type="password"
+                placeholder="Enter password if required"
+                value={meetingPassword}
+                onChange={(e) => setMeetingPassword(e.target.value)}
               />
-            </div>
+            )}
 
-            <div className="flex flex-col gap-2.5 bg-white/2 rounded-xl p-3 border border-white/5">
-              <span className="text-[10px] font-bold text-gray-500 uppercase tracking-widest pl-0.5">Features</span>
-              
-              <div className="flex items-center justify-between text-xs font-semibold px-1">
-                <span className="text-gray-300">Attendance Requirement</span>
-                <button
-                  type="button"
-                  onClick={() => setReqAttendance(!reqAttendance)}
-                  className="text-[#8b5cf6] cursor-pointer"
-                >
-                  {reqAttendance ? <ToggleRight size={26} /> : <ToggleLeft size={26} className="text-gray-600" />}
-                </button>
-              </div>
-
-              <div className="flex items-center justify-between text-xs font-semibold px-1">
-                <span className="text-gray-300">Enable Focus Analysis</span>
-                <button
-                  type="button"
-                  onClick={() => setReqFocus(!reqFocus)}
-                  className="text-[#8b5cf6] cursor-pointer"
-                >
-                  {reqFocus ? <ToggleRight size={26} /> : <ToggleLeft size={26} className="text-gray-600" />}
-                </button>
-              </div>
-
-              <div className="flex items-center justify-between text-xs font-semibold px-1">
-                <span className="text-gray-300">Enable AI Summary</span>
-                <button
-                  type="button"
-                  onClick={() => setReqSummary(!reqSummary)}
-                  className="text-[#8b5cf6] cursor-pointer"
-                >
-                  {reqSummary ? <ToggleRight size={26} /> : <ToggleLeft size={26} className="text-gray-600" />}
-                </button>
-              </div>
-            </div>
-
-            <Button type="submit" className="w-full py-3 mt-2 text-xs font-bold">
-              Generate Meeting Code
+            <Button type="submit" disabled={isCreatingMeeting} className="w-full py-3 mt-2 text-xs font-bold">
+              {isCreatingMeeting ? 'Generating Code...' : 'Generate Meeting Code'}
             </Button>
           </form>
         ) : (
@@ -346,8 +363,8 @@ export default function Home() {
             onChange={(e) => setJoinPassword(e.target.value)}
           />
 
-          <Button type="submit" variant="secondary" className="w-full py-3 mt-2 text-xs font-bold">
-            Join Meeting
+          <Button type="submit" variant="secondary" disabled={isJoiningMeeting} className="w-full py-3 mt-2 text-xs font-bold">
+            {isJoiningMeeting ? 'Joining...' : 'Join Meeting'}
           </Button>
         </form>
       </Modal>

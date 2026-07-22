@@ -10,12 +10,26 @@ import {
   Moon,
   ChevronRight
 } from 'lucide-react'
-import { useState } from 'react'
+import { useState, useEffect } from 'react'
 
 export default function Sidebar() {
   const { user } = useAuth()
   const navigate = useNavigate()
-  const [darkMode, setDarkMode] = useState(true)
+  const [darkMode, setDarkMode] = useState(() => {
+    const saved = localStorage.getItem('darkMode')
+    return saved !== 'false'
+  })
+
+  useEffect(() => {
+    localStorage.setItem('darkMode', darkMode)
+    if (darkMode) {
+      document.documentElement.classList.add('dark')
+      document.documentElement.classList.remove('light')
+    } else {
+      document.documentElement.classList.add('light')
+      document.documentElement.classList.remove('dark')
+    }
+  }, [darkMode])
 
   const navItems = [
     { name: 'Home', path: '/', icon: Home },
@@ -73,7 +87,9 @@ export default function Sidebar() {
           </div>
           <button
             onClick={() => setDarkMode(!darkMode)}
-            className="w-9 h-5 rounded-full bg-[#7c3aed] p-0.5 transition-all duration-200 relative cursor-pointer"
+            className={`w-9 h-5 rounded-full p-0.5 transition-all duration-200 relative cursor-pointer ${
+              darkMode ? 'bg-[#7c3aed]' : 'bg-gray-600'
+            }`}
           >
             <div
               className={`w-4 h-4 rounded-full bg-white transition-transform duration-200 shadow-md ${
