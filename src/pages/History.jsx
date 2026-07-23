@@ -27,6 +27,10 @@ export default function History() {
     loadHistory()
   }, [fetchHistory])
 
+  const handleMeetingDeleted = (deletedDbId) => {
+    setEndedMeetings((prev) => prev.filter((m) => m.dbId !== deletedDbId))
+  }
+
   // Combine live/active meetings and historical ended meetings
   const allMeetings = [...meetings, ...endedMeetings]
 
@@ -171,7 +175,12 @@ export default function History() {
       <div className="flex flex-col gap-3">
         {filteredMeetings.length > 0 ? (
           filteredMeetings.map((mtg, idx) => (
-            <MeetingCard key={mtg.dbId || mtg.id} meeting={mtg} index={idx} />
+            <MeetingCard 
+              key={mtg.dbId || mtg.id} 
+              meeting={mtg} 
+              index={idx} 
+              onDeleted={handleMeetingDeleted}
+            />
           ))
         ) : (
           <div className="flex flex-col items-center justify-center py-16 px-4 bg-white/2 border border-white/5 rounded-2xl gap-3">

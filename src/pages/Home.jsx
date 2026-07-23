@@ -32,6 +32,7 @@ export default function Home() {
   const [meetingName, setMeetingName] = useState('')
   const [meetingType, setMeetingType] = useState('public')
   const [meetingPassword, setMeetingPassword] = useState('')
+  const [enableAiAnalyzer, setEnableAiAnalyzer] = useState(false)
   
   // Create Success State
   const [createdMtg, setCreatedMtg] = useState(null)
@@ -52,7 +53,8 @@ export default function Home() {
       const mtg = await createMeeting(
         meetingName.trim(),
         meetingType,
-        meetingPassword
+        meetingPassword,
+        enableAiAnalyzer
       )
       setCreatedMtg(mtg)
       showToast('Meeting created successfully!', 'success')
@@ -94,6 +96,7 @@ export default function Home() {
     setMeetingName('')
     setMeetingType('public')
     setMeetingPassword('')
+    setEnableAiAnalyzer(false)
     navigate(`/meeting/${code}`)
   }
 
@@ -219,7 +222,7 @@ export default function Home() {
           setCreatedMtg(null)
           setIsCreateOpen(true)
         }}
-        className="fixed bottom-22 right-8 w-11 h-11 bg-[#7c3aed] hover:bg-[#8b5cf6] text-white rounded-full flex items-center justify-center shadow-lg shadow-purple-900/40 transition-all duration-200 cursor-pointer hover:rotate-90 z-20"
+        className="fixed bottom-6 right-6 w-11 h-11 bg-[#7c3aed] hover:bg-[#8b5cf6] text-white rounded-full flex items-center justify-center shadow-lg shadow-purple-900/40 transition-all duration-200 cursor-pointer hover:rotate-90 z-20"
       >
         <Plus size={18} />
       </button>
@@ -297,6 +300,26 @@ export default function Home() {
                 onChange={(e) => setMeetingPassword(e.target.value)}
               />
             )}
+
+            <div className="flex items-center justify-between p-3.5 bg-white/2 border border-white/5 rounded-2xl mt-1 text-left">
+              <div className="flex flex-col gap-0.5">
+                <span className="text-xs font-bold text-white">Enable AI Analyzer</span>
+                <span className="text-[10px] text-gray-500 font-semibold">Record transcripts and generate summaries</span>
+              </div>
+              <button
+                type="button"
+                onClick={() => setEnableAiAnalyzer(!enableAiAnalyzer)}
+                className={`w-10 h-6 rounded-full p-1 transition-all duration-300 focus:outline-none cursor-pointer shrink-0 ${
+                  enableAiAnalyzer ? 'bg-[#7c3aed]' : 'bg-slate-800'
+                }`}
+              >
+                <div
+                  className={`w-4 h-4 rounded-full bg-white transition-all duration-300 transform ${
+                    enableAiAnalyzer ? 'translate-x-4' : 'translate-x-0'
+                  }`}
+                />
+              </button>
+            </div>
 
             <Button type="submit" disabled={isCreatingMeeting} className="w-full py-3 mt-2 text-xs font-bold">
               {isCreatingMeeting ? 'Generating Code...' : 'Generate Meeting Code'}

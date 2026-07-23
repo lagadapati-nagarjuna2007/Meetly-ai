@@ -1,4 +1,5 @@
 import express from 'express'
+import multer from 'multer'
 import {
   createMeeting,
   joinMeeting,
@@ -11,9 +12,13 @@ import {
   renameMeeting,
   deleteMeeting,
   getRecentMeetings,
-  getMeetingHistory
+  getMeetingHistory,
+  submitTranscriptChunk,
+  generateSummary
 } from '../controllers/meetingController.js'
 import { authenticateToken } from '../middleware/auth.js'
+
+const upload = multer({ storage: multer.memoryStorage() })
 
 const router = express.Router()
 
@@ -28,6 +33,8 @@ router.post('/leave', leaveMeeting)
 router.get('/leave', leaveMeeting) // Support for navigator.sendBeacon
 router.post('/end', endMeeting)
 router.post('/lock', lockMeeting)
+router.post('/transcript', upload.single('file'), submitTranscriptChunk)
+router.post('/summary/generate', generateSummary)
 
 // Details and metadata endpoints
 router.get('/details/:meetingId', getMeetingDetails)

@@ -8,6 +8,7 @@ import { Server } from 'socket.io'
 import authRoutes from './routes/auth.js'
 import meetingRoutes from './routes/meetings.js'
 import { supabase } from './config/supabase.js'
+import { startRetentionCleanup } from './controllers/meetingController.js'
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url))
 dotenv.config({ path: path.resolve(__dirname, '../.env') })
@@ -52,6 +53,7 @@ app.get('/health', (req, res) => {
 
 const httpServer = app.listen(PORT, () => {
   console.log(`[Meetly AI Backend] server successfully listening on port ${PORT}`)
+  startRetentionCleanup()
 })
 
 // Configure Socket.IO server

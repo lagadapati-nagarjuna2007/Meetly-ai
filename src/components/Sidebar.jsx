@@ -41,7 +41,7 @@ export default function Sidebar() {
   ]
 
   return (
-    <aside className="w-[260px] h-full bg-[#07080f] border-r border-white/5 flex flex-col justify-between select-none shrink-0">
+    <aside className="w-[280px] min-w-[280px] max-w-[280px] h-screen bg-[#07080f] border-r border-white/5 flex flex-col select-none shrink-0">
       {/* Upper Section */}
       <div className="flex flex-col">
         {/* Brand Logo and Title */}
@@ -78,7 +78,7 @@ export default function Sidebar() {
       </div>
 
       {/* Lower Section */}
-      <div className="px-3.5 pb-5 flex flex-col gap-4 border-t border-white/5 pt-4">
+      <div className="mt-auto px-3.5 pb-5 flex flex-col gap-4 border-t border-white/5 pt-4">
         {/* Dark Mode Toggle */}
         <div className="flex items-center justify-between px-3 py-2 bg-white/2 rounded-xl border border-white/5">
           <div className="flex items-center gap-2 text-gray-300">

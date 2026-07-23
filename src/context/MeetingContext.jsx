@@ -54,7 +54,7 @@ export function MeetingProvider({ children }) {
 
   // 2. CREATE MEETING
   // Atomic creation: stores meeting details AND LiveKit token immediately in state
-  const createMeeting = async (title, type = 'public', password = '') => {
+  const createMeeting = async (title, type = 'public', password = '', enableAiAnalyzer = false) => {
     if (creatingRef.current) {
       console.log('[MeetingContext] Create meeting already in-flight, ignoring duplicate call.')
       return currentMeeting
@@ -72,7 +72,8 @@ export function MeetingProvider({ children }) {
         body: JSON.stringify({
           meetingTitle: title,
           meetingType: type,
-          meetingPassword: password
+          meetingPassword: password,
+          enableAiAnalyzer
         }),
         credentials: 'include'
       })
@@ -93,7 +94,8 @@ export function MeetingProvider({ children }) {
         type: data.meeting.meeting_type,
         roomName: data.roomName || data.meeting.room_name,
         token: data.livekitToken,
-        livekitUrl: data.livekitUrl
+        livekitUrl: data.livekitUrl,
+        enableAiAnalyzer: data.meeting.enable_ai_analyzer
       }
 
       setCurrentMeeting(activeMtg)
@@ -358,6 +360,21 @@ export function MeetingProvider({ children }) {
     return await res.json()
   }
 
+  // 13. GENERATE MEETING SUMMARY
+  const generateMeetingSummary = async (meetingId) => {
+    const res = await fetch(`${API_URL}/summary/generate`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ meetingId }),
+      credentials: 'include'
+    })
+    const data = await res.json()
+    if (!res.ok) {
+      throw new Error(data.message || 'Unable to generate meeting summary. Please try again.')
+    }
+    return data.summary
+  }
+
   return (
     <MeetingContext.Provider
       value={{
@@ -381,6 +398,7 @@ export function MeetingProvider({ children }) {
         fetchHistory,
         fetchMeetingDetails,
         fetchMeetingParticipants,
+        generateMeetingSummary,
         refreshMeetings
       }}
     >

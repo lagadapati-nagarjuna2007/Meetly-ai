@@ -27,7 +27,7 @@ export default function DashboardLayout() {
       <Sidebar />
 
       {/* Main Content Area */}
-      <main className="flex-1 h-full overflow-y-auto relative p-6 md:p-8 flex flex-col text-left">
+      <main className="flex-1 h-full overflow-y-auto relative p-6 md:p-8 pb-24 md:pb-28 flex flex-col text-left">
         {/* Title Bar Desktop Window Controls (Matches mockup top-right layout) */}
         <div className="absolute top-5 right-7 flex items-center gap-4.5 text-gray-500 z-30 select-none">
           <button className="hover:text-white transition-colors duration-200 cursor-pointer">

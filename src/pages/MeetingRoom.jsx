@@ -431,6 +431,148 @@ function MeetingRoomContent({
   const roomState = room?.state
   console.log('[MeetingRoomContent Render] roomState:', roomState, 'localParticipant:', !!localParticipant, 'participants count:', participants?.length || 0)
 
+  // Transcript chunk collection
+  useEffect(() => {
+    console.log('[AI Analyzer Debug] useEffect triggered. conditions check:', {
+      hasMeetingData: !!meetingData,
+      enable_ai_analyzer: meetingData?.enable_ai_analyzer,
+      roomState
+    })
+
+    if (!meetingData || !meetingData.enable_ai_analyzer || roomState !== 'connected') {
+      return
+    }
+
+    console.log('[AI Analyzer] AI Analyzer started')
+    let mediaRecorder = null
+    let stream = null
+    let intervalId = null
+
+    const startRecording = async () => {
+      try {
+        console.log('[AI Analyzer] Requesting microphone access stream...')
+        // Request dedicated mic stream specifically for recording to prevent interfering with LiveKit
+        stream = await navigator.mediaDevices.getUserMedia({ audio: true })
+        console.log('[AI Analyzer] Microphone access granted successfully.')
+        
+        // Choose supported mimeType
+        let mimeType = 'audio/webm'
+        if (!MediaRecorder.isTypeSupported(mimeType)) {
+          if (MediaRecorder.isTypeSupported('audio/mp4')) {
+            mimeType = 'audio/mp4'
+          } else if (MediaRecorder.isTypeSupported('audio/ogg')) {
+            mimeType = 'audio/ogg'
+          } else {
+            mimeType = '' // Default
+          }
+        }
+        console.log('[AI Analyzer] Using MediaRecorder mimeType:', mimeType)
+
+        // Setup MediaRecorder
+        mediaRecorder = new MediaRecorder(stream, mimeType ? { mimeType } : undefined)
+        let chunks = []
+
+        mediaRecorder.ondataavailable = (e) => {
+          if (e.data && e.data.size > 0) {
+            chunks.push(e.data)
+            console.log('[AI Analyzer] Audio data available:', e.data.size, 'bytes')
+          }
+        }
+
+        mediaRecorder.onstop = async () => {
+          console.log('[AI Analyzer] MediaRecorder stopped. Processing chunks...')
+          const audioBlob = new Blob(chunks, { type: mimeType || 'audio/webm' })
+          chunks = [] // Reset chunks
+
+          console.log('[AI Analyzer] Audio chunk created:', audioBlob.size, 'bytes')
+
+          // Analyze simple volume/silence using Web Audio API to prevent empty API calls
+          let isSilent = false
+          try {
+            const arrayBuffer = await audioBlob.arrayBuffer()
+            const audioCtx = new (window.AudioContext || window.webkitAudioContext)()
+            const audioBuffer = await audioCtx.decodeAudioData(arrayBuffer)
+            const channelData = audioBuffer.getChannelData(0)
+            
+            // Calculate Root Mean Square (RMS) volume
+            let sum = 0
+            for (let i = 0; i < channelData.length; i++) {
+              sum += channelData[i] * channelData[i]
+            }
+            const rms = Math.sqrt(sum / channelData.length)
+            console.log('[AI Analyzer] Audio chunk RMS volume:', rms)
+            if (rms < 0.005) {
+              isSilent = true
+            }
+            await audioCtx.close()
+          } catch (volErr) {
+            console.warn('[AI Analyzer Warning] Web Audio API volume analysis failed or skipped (continuing upload):', volErr)
+          }
+
+          if (isSilent) {
+            console.log('[AI Analyzer] Audio chunk is silent, skipping upload.')
+            return
+          }
+
+          // Send to backend via multipart/form-data
+          const formData = new FormData()
+          formData.append('file', audioBlob, 'audio.webm')
+          formData.append('meetingId', meetingData.meeting_id)
+          formData.append('speakerName', user?.full_name || user?.name || 'Anonymous')
+
+          try {
+            console.log('[AI Analyzer] Uploading transcript chunk...')
+            const apiUrl = import.meta.env.VITE_API_URL || 'http://localhost:5000'
+            const res = await fetch(`${apiUrl}/api/meetings/transcript`, {
+              method: 'POST',
+              body: formData,
+              credentials: 'include' // Sent with session auth cookies
+            })
+            if (!res.ok) {
+              console.error('[AI Analyzer] Upload failed. Server returned status:', res.status, await res.text())
+            } else {
+              console.log('[AI Analyzer] Upload successful')
+            }
+          } catch (uploadErr) {
+            console.error('[AI Analyzer] Upload failed. Network error:', uploadErr)
+          }
+        }
+
+        // Start recording
+        mediaRecorder.start()
+        console.log('[AI Analyzer] MediaRecorder started')
+
+        // Trigger recording slice every 30 seconds
+        intervalId = setInterval(() => {
+          if (mediaRecorder && mediaRecorder.state === 'recording') {
+            console.log('[AI Analyzer] Slicing recorder chunk (30s interval)...')
+            mediaRecorder.stop()
+            mediaRecorder.start()
+          }
+        }, 30000) // 30 seconds chunks
+
+      } catch (err) {
+        console.error('[AI Analyzer Error] Failed to initialize mic recording:', err)
+        showToast('AI Analyzer failed to start recording: ' + (err.message || err), 'error')
+      }
+    }
+
+    startRecording()
+
+    return () => {
+      console.log('[AI Analyzer] Stopping transcript capture...')
+      if (intervalId) clearInterval(intervalId)
+      if (mediaRecorder && mediaRecorder.state !== 'inactive') {
+        try {
+          mediaRecorder.stop()
+        } catch (e) {}
+      }
+      if (stream) {
+        stream.getTracks().forEach(track => track.stop())
+      }
+    }
+  }, [meetingData, roomState, user, showToast])
+
   // Timer simulation
   const [seconds, setSeconds] = useState(0)
   useEffect(() => {

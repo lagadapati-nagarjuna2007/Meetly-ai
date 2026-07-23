@@ -134,6 +134,10 @@ html.light .bg-white\/2 {
   background-color: rgba(0, 0, 0, 0.03) !important;
 }
 
+html.light .bg-\[\#05060c\] {
+  background-color: #f8fafc !important;
+}
+
 html.light .bg-\[\#07080f\] {
   background-color: #ffffff !important;
 }

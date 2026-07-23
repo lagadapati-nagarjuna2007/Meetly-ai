@@ -162,7 +162,7 @@ const generateUniqueMeetingCode = async () => {
 export const createMeeting = async (req, res) => {
   let createdMeetingId = null
   try {
-    const { meetingTitle, meetingType, meetingPassword } = req.body
+    const { meetingTitle, meetingType, meetingPassword, enableAiAnalyzer } = req.body
 
     if (!meetingTitle || !meetingTitle.trim()) {
       return res.status(400).json({ message: 'Meeting title is required.' })
@@ -206,7 +206,8 @@ export const createMeeting = async (req, res) => {
           meeting_status: 'Waiting',
           is_deleted: false,
           meeting_password_hash: passwordHash,
-          meeting_type: type
+          meeting_type: type,
+          enable_ai_analyzer: !!enableAiAnalyzer
         }
       ])
       .select()
@@ -753,7 +754,7 @@ export const renameMeeting = async (req, res) => {
   }
 }
 
-// 10. DELETE MEETING (Soft Delete - Host only)
+// 10. DELETE MEETING (Hard Delete - Host only)
 export const deleteMeeting = async (req, res) => {
   try {
     const { id } = req.params
@@ -774,51 +775,34 @@ export const deleteMeeting = async (req, res) => {
       return res.status(403).json({ message: 'Unauthorized. Only the host can delete the meeting.' })
     }
 
-    const now = new Date().toISOString()
-
-    const { error: updateMtgErr } = await supabase
-      .from('meetings')
-      .update({
-        is_deleted: true,
-        meeting_status: 'Ended',
-        ended_at: now,
-        updated_at: now
-      })
-      .eq('meeting_id', meeting.meeting_id)
-
-    if (updateMtgErr) throw updateMtgErr
-
-    const { error: updatePartsErr } = await supabase
+    // Delete related participants first to satisfy foreign key constraints
+    const { error: deletePartsErr } = await supabase
       .from('participants')
-      .update({
-        participant_status: 'left',
-        left_at: now
-      })
+      .delete()
       .eq('meeting_id', meeting.meeting_id)
-      .in('participant_status', ['joined', 'active', 'disconnected'])
 
-    if (updatePartsErr) throw updatePartsErr
+    if (deletePartsErr) throw deletePartsErr
+
+    // Delete the meeting from the database
+    const { error: deleteMtgErr } = await supabase
+      .from('meetings')
+      .delete()
+      .eq('meeting_id', meeting.meeting_id)
+
+    if (deleteMtgErr) throw deleteMtgErr
+
+    console.log(`[Cleanup] Meeting ${meeting.meeting_id} deleted successfully.`)
 
     return res.status(200).json({ message: 'Meeting deleted successfully.' })
   } catch (err) {
     console.error('Delete meeting error:', err)
-    return res.status(500).json({ message: 'Server error during meeting deletion.' })
+    return res.status(500).json({ message: err.message || 'Server error during meeting deletion.' })
   }
 }
 
 // 11. GET USER RECENT MEETINGS
 export const getRecentMeetings = async (req, res) => {
   try {
-    const { data: participants, error: fetchPartErr } = await supabase
-      .from('participants')
-      .select('meeting_id')
-      .eq('user_id', req.user.id)
-      .in('participant_status', ['joined', 'active'])
-
-    if (fetchPartErr) throw fetchPartErr
-
-    const meetingIds = participants.map((p) => p.meeting_id)
-
     const { data: meetings, error: fetchMtgErr } = await supabase
       .from('meetings')
       .select(`
@@ -826,7 +810,7 @@ export const getRecentMeetings = async (req, res) => {
         host:host_id ( full_name )
       `)
       .eq('is_deleted', false)
-      .or(`host_id.eq.${req.user.id},meeting_id.in.(${meetingIds.join(',') || '00000000-0000-0000-0000-000000000000'})`)
+      .eq('host_id', req.user.id)
       .order('started_at', { ascending: false })
 
     if (fetchMtgErr) throw fetchMtgErr
@@ -843,7 +827,8 @@ export const getRecentMeetings = async (req, res) => {
         time: date.toLocaleTimeString('en-US', { hour: '2-digit', minute: '2-digit' }),
         duration: m.meeting_status === 'Ended' ? 'Completed' : m.meeting_status,
         status: m.meeting_status === 'Ended' ? 'Completed' : 'Live',
-        type: m.meeting_type
+        type: m.meeting_type,
+        enableAiAnalyzer: m.enable_ai_analyzer
       }
     })
 
@@ -857,19 +842,6 @@ export const getRecentMeetings = async (req, res) => {
 // 12. GET MEETING HISTORY
 export const getMeetingHistory = async (req, res) => {
   try {
-    const { data: participants, error: fetchPartErr } = await supabase
-      .from('participants')
-      .select('meeting_id')
-      .eq('user_id', req.user.id)
-
-    if (fetchPartErr) throw fetchPartErr
-
-    const meetingIds = participants.map((p) => p.meeting_id)
-
-    if (meetingIds.length === 0) {
-      return res.status(200).json([])
-    }
-
     const { data: meetings, error: fetchMtgErr } = await supabase
       .from('meetings')
       .select(`
@@ -878,7 +850,7 @@ export const getMeetingHistory = async (req, res) => {
       `)
       .eq('is_deleted', false)
       .eq('meeting_status', 'Ended')
-      .in('meeting_id', meetingIds)
+      .eq('host_id', req.user.id)
       .order('started_at', { ascending: false })
 
     if (fetchMtgErr) throw fetchMtgErr
@@ -904,7 +876,8 @@ export const getMeetingHistory = async (req, res) => {
           time: start.toLocaleTimeString('en-US', { hour: '2-digit', minute: '2-digit' }),
           duration: `${diffMins} min`,
           status: 'Completed',
-          participantsCount: count || 1
+          participantsCount: count || 1,
+          enableAiAnalyzer: m.enable_ai_analyzer
         }
       })
     )
@@ -914,4 +887,252 @@ export const getMeetingHistory = async (req, res) => {
     console.error('Get meeting history error:', err)
     return res.status(500).json({ message: 'Server error retrieving meeting history.' })
   }
+}
+
+// 13. SUBMIT TRANSCRIPT CHUNK (Whisper Speech-to-Text)
+export const submitTranscriptChunk = async (req, res) => {
+  console.log('[Transcript Chunk] Transcript endpoint called')
+  try {
+    const { meetingId, speakerName } = req.body
+    console.log('[Transcript Chunk] Request body info:', { meetingId, speakerName })
+    
+    if (!meetingId || !speakerName) {
+      console.error('[Transcript Chunk Error] Missing meetingId or speakerName')
+      return res.status(400).json({ message: 'Meeting ID and speaker name are required.' })
+    }
+
+    if (!req.file) {
+      console.error('[Transcript Chunk Error] Audio file NOT received in req.file')
+      return res.status(400).json({ message: 'No audio chunk file uploaded.' })
+    }
+
+    console.log('[Transcript Chunk] Audio file received:', {
+      fieldname: req.file.fieldname,
+      originalname: req.file.originalname,
+      encoding: req.file.encoding,
+      mimetype: req.file.mimetype,
+      size: req.file.size
+    })
+
+    const apiKey = process.env.GROQ_API_KEY
+    if (!apiKey) {
+      console.warn('[Transcript Chunk Error] GROQ_API_KEY is missing.')
+      return res.status(500).json({ message: 'Groq API key not configured on server.' })
+    }
+
+    // Prepare native FormData to send to Groq Whisper
+    const formData = new FormData()
+    const audioBlob = new Blob([req.file.buffer], { type: req.file.mimetype || 'audio/webm' })
+    formData.append('file', audioBlob, 'audio.webm')
+    formData.append('model', 'whisper-large-v3')
+
+    console.log('[Transcript Chunk] Sending audio to Groq Whisper...')
+    const groqRes = await fetch('https://api.groq.com/openai/v1/audio/transcriptions', {
+      method: 'POST',
+      headers: {
+        'Authorization': `Bearer ${apiKey}`
+      },
+      body: formData
+    })
+
+    if (!groqRes.ok) {
+      const errorText = await groqRes.text()
+      console.error('[Transcript Chunk Error] Groq API returned error status:', groqRes.status, 'Body:', errorText)
+      return res.status(500).json({ message: 'Failed to transcribe audio chunk.' })
+    }
+
+    const result = await groqRes.json()
+    console.log('[Transcript Chunk] Whisper response received successfully')
+    const transcribedText = result.text ? result.text.trim() : ''
+    console.log('[Transcript Chunk] Transcribed text:', transcribedText)
+
+    // Skip empty transcripts or typical silent whisper hallucinations
+    const hallucinations = [
+      'you', 'thank you', 'subtitles by', 'subtitles', 'thanks for watching',
+      'bye', 'hello', 'uh', 'um', 'please subscribe', 'subscribe'
+    ]
+    const isHallucination = transcribedText.length < 5 && hallucinations.includes(transcribedText.toLowerCase())
+
+    if (transcribedText && !isHallucination) {
+      console.log(`[Transcript Chunk] Transcript inserted into Supabase for ${speakerName}: "${transcribedText}"`)
+
+      // Insert into meeting_transcripts
+      const { error: insertErr } = await supabase
+        .from('meeting_transcripts')
+        .insert([
+          {
+            meeting_id: meetingId,
+            speaker_name: speakerName,
+            transcript: transcribedText
+          }
+        ])
+
+      if (insertErr) {
+        console.error('[Transcript Chunk Error] Supabase insert failed:', insertErr)
+        return res.status(500).json({ message: 'Failed to save transcript chunk to database.' })
+      }
+      console.log('[Transcript Chunk] Insert successful')
+    } else {
+      console.log(`[Transcript Chunk] Silence or empty response (isHallucination: ${isHallucination}), skipping DB insert.`)
+    }
+
+    return res.status(200).json({ message: 'Chunk processed successfully.', text: transcribedText })
+  } catch (err) {
+    console.error('[Transcript Chunk Error] Exception caught:', err)
+    return res.status(500).json({ message: err.message || 'Server error transcribing audio chunk.' })
+  }
+}
+
+// 14. GENERATE SUMMARY (Llama 3.3 Chat Completions)
+export const generateSummary = async (req, res) => {
+  try {
+    const { meetingId } = req.body
+    if (!meetingId) {
+      return res.status(400).json({ message: 'Meeting ID is required.' })
+    }
+
+    const apiKey = process.env.GROQ_API_KEY
+    if (!apiKey) {
+      return res.status(500).json({ message: 'Groq API key not configured on server.' })
+    }
+
+    // 1. Fetch transcripts ordered by created_at ASC
+    const { data: chunks, error: fetchErr } = await supabase
+      .from('meeting_transcripts')
+      .select('speaker_name, transcript')
+      .eq('meeting_id', meetingId)
+      .order('created_at', { ascending: true })
+
+    if (fetchErr) throw fetchErr
+
+    if (!chunks || chunks.length === 0) {
+      return res.status(400).json({
+        message: 'No transcript available. AI Analyzer was disabled or transcript capture failed.'
+      })
+    }
+
+    // 2. Concatenate transcripts
+    const transcriptText = chunks
+      .map(c => `${c.speaker_name}: ${c.transcript}`)
+      .join('\n')
+
+    console.log(`[Summary] Generating summary for meeting ${meetingId} from ${chunks.length} transcript chunks...`)
+
+    // 3. Call Groq Llama 3.3
+    const groqRes = await fetch('https://api.groq.com/openai/v1/chat/completions', {
+      method: 'POST',
+      headers: {
+        'Authorization': `Bearer ${apiKey}`,
+        'Content-Type': 'application/json'
+      },
+      body: JSON.stringify({
+        model: 'llama-3.3-70b-versatile',
+        messages: [
+          {
+            role: 'system',
+            content: `You are an AI Meeting Assistant.
+
+Read the following meeting transcript and generate a professional meeting summary.
+
+Requirements:
+- Summarize only what was discussed.
+- Include important decisions.
+- Include conclusions if mentioned.
+- Include action items only if explicitly discussed.
+- Do not invent information.
+- Do not include attendance.
+- Do not include timestamps.
+- Do not include speaker statistics.
+- Do not include sentiment analysis.
+- Return clean plain text suitable for a PDF.`
+          },
+          {
+            role: 'user',
+            content: transcriptText
+          }
+        ],
+        temperature: 0.1
+      })
+    })
+
+    if (!groqRes.ok) {
+      const errorText = await groqRes.text()
+      console.error('[Summary Error] Groq API returned error:', errorText)
+      return res.status(500).json({ message: 'Unable to generate meeting summary. Please try again.' })
+    }
+
+    const result = await groqRes.json()
+    const summary = result.choices?.[0]?.message?.content || ''
+
+    if (!summary) {
+      return res.status(500).json({ message: 'Unable to generate meeting summary. Please try again.' })
+    }
+
+    // 4. Save to meeting_ai_summaries table
+    // Delete any existing summary for this meeting first
+    await supabase
+      .from('meeting_ai_summaries')
+      .delete()
+      .eq('meeting_id', meetingId)
+
+    const { error: insertErr } = await supabase
+      .from('meeting_ai_summaries')
+      .insert([
+        {
+          meeting_id: meetingId,
+          summary
+        }
+      ])
+
+    if (insertErr) {
+      console.error('[Summary Error] Failed to save summary to DB:', insertErr)
+      return res.status(500).json({ message: 'Failed to save summary to database.' })
+    }
+
+    console.log(`[Summary Success] Generated summary for meeting ${meetingId}`)
+    return res.status(200).json({ summary })
+  } catch (err) {
+    console.error('Generate summary error:', err)
+    return res.status(500).json({ message: 'Unable to generate meeting summary. Please try again.' })
+  }
+}
+
+// 15. RETENTION CLEANUP SCHEDULE
+export const startRetentionCleanup = () => {
+  console.log('[Cleanup Job] Initializing 2-hour data retention cleanup schedule (every 10 minutes)...')
+  setInterval(async () => {
+    const now = new Date()
+    const twoHoursAgo = new Date(now.getTime() - 2 * 60 * 60 * 1000).toISOString()
+    try {
+      console.log('[Cleanup Job] Running periodic cleanup check for ended meetings older than 2 hours...')
+      const { data: expiredMeetings, error: queryErr } = await supabase
+        .from('meetings')
+        .select('meeting_id, meeting_code')
+        .eq('meeting_status', 'Ended')
+        .lt('ended_at', twoHoursAgo)
+
+      if (queryErr) {
+        console.error('[Cleanup Job Error] Failed to query expired meetings:', queryErr)
+        return
+      }
+
+      if (expiredMeetings && expiredMeetings.length > 0) {
+        const expiredIds = expiredMeetings.map(m => m.meeting_id)
+        console.log(`[Cleanup Job] Found ${expiredIds.length} expired meeting(s) older than 2 hours. Permanently deleting:`, expiredMeetings.map(m => m.meeting_code))
+
+        const { error: deleteErr } = await supabase
+          .from('meetings')
+          .delete()
+          .in('meeting_id', expiredIds)
+
+        if (deleteErr) {
+          console.error('[Cleanup Job Error] Failed to hard delete expired meetings:', deleteErr)
+        } else {
+          console.log('[Cleanup Job] Hard deleted expired meetings and their cascading records successfully.')
+        }
+      }
+    } catch (err) {
+      console.error('[Cleanup Job Error] Unexpected error during cleanup check:', err)
+    }
+  }, 10 * 60 * 1000)
 }
