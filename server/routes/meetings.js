@@ -14,7 +14,10 @@ import {
   getRecentMeetings,
   getMeetingHistory,
   submitTranscriptChunk,
-  generateSummary
+  generateSummary,
+  submitAttendance,
+  getAttendanceReport,
+  deleteAttendanceRecords
 } from '../controllers/meetingController.js'
 import { authenticateToken } from '../middleware/auth.js'
 
@@ -35,6 +38,9 @@ router.post('/end', endMeeting)
 router.post('/lock', lockMeeting)
 router.post('/transcript', upload.single('file'), submitTranscriptChunk)
 router.post('/summary/generate', generateSummary)
+router.post('/attendance', submitAttendance)
+router.get('/attendance/report/:meetingId', getAttendanceReport)
+router.delete('/attendance/report/:meetingId', deleteAttendanceRecords)
 
 // Details and metadata endpoints
 router.get('/details/:meetingId', getMeetingDetails)

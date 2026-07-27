@@ -9,13 +9,14 @@ import { jsPDF } from 'jspdf'
 
 export default function MeetingCard({ meeting, index = 0, onDeleted }) {
   const navigate = useNavigate()
-  const { deleteMeeting, generateMeetingSummary } = useMeetings()
+  const { deleteMeeting, generateMeetingSummary, getAttendanceReport, clearAttendanceRecords } = useMeetings()
   const { showToast } = useToast()
 
   const [dropdownOpen, setDropdownOpen] = useState(false)
   const [isDeleteConfirmOpen, setIsDeleteConfirmOpen] = useState(false)
   const [isDeleting, setIsDeleting] = useState(false)
   const [isGeneratingPdf, setIsGeneratingPdf] = useState(false)
+  const [isGeneratingAttendance, setIsGeneratingAttendance] = useState(false)
 
   // Cycle colors to match mockup image
   const bgColors = [
@@ -143,6 +144,161 @@ export default function MeetingCard({ meeting, index = 0, onDeleted }) {
     }
   }
 
+  const handleGenerateAttendanceReport = async () => {
+    setDropdownOpen(false)
+    setIsGeneratingAttendance(true)
+    showToast('Generating AI Attendance Report...', 'info')
+    try {
+      // 1. Retrieve records
+      const records = await getAttendanceReport(meeting.dbId)
+      if (!records || records.length === 0) {
+        showToast('No attendance records found for this meeting.', 'warning')
+        setIsGeneratingAttendance(false)
+        return
+      }
+
+      // 2. Generate PDF using jsPDF
+      const doc = new jsPDF()
+      const pageHeight = doc.internal.pageSize.height
+      const margin = 20
+      const lineSpacing = 7
+      let cursorY = 20
+
+      // MEETLY AI Header
+      doc.setFont('helvetica', 'bold')
+      doc.setFontSize(22)
+      doc.setTextColor(124, 58, 237) // purple #7c3aed
+      doc.text('MEETLY AI', margin, cursorY)
+      cursorY += 10
+
+      doc.setFontSize(14)
+      doc.setTextColor(100, 116, 139) // Slate gray #64748b
+      doc.text('AI Attendance Report', margin, cursorY)
+      cursorY += 10
+
+      // Divider Line
+      doc.setDrawColor(226, 232, 240)
+      doc.setLineWidth(0.5)
+      doc.line(margin, cursorY, 210 - margin, cursorY)
+      cursorY += 12
+
+      // Metadata Block
+      doc.setFont('helvetica', 'bold')
+      doc.setFontSize(10)
+      doc.setTextColor(71, 85, 105)
+      doc.text('Meeting Name:', margin, cursorY)
+      doc.setFont('helvetica', 'normal')
+      doc.text(meeting.name || 'Untitled Meeting', margin + 30, cursorY)
+      cursorY += 8
+
+      doc.setFont('helvetica', 'bold')
+      doc.text('Meeting Date:', margin, cursorY)
+      doc.setFont('helvetica', 'normal')
+      doc.text(meeting.date || 'N/A', margin + 30, cursorY)
+      cursorY += 8
+
+      doc.setFont('helvetica', 'bold')
+      doc.text('Duration:', margin, cursorY)
+      doc.setFont('helvetica', 'normal')
+      doc.text(meeting.duration || 'N/A', margin + 30, cursorY)
+      cursorY += 12
+
+      // Divider Line
+      doc.line(margin, cursorY, 210 - margin, cursorY)
+      cursorY += 12
+
+      // Table Header
+      doc.setFont('helvetica', 'bold')
+      doc.setFontSize(10)
+      doc.setTextColor(15, 23, 42)
+      doc.text('Participant Name', margin, cursorY)
+      doc.text('Meeting Duration', margin + 60, cursorY)
+      doc.text('Attendance %', margin + 110, cursorY)
+      doc.text('Status', margin + 145, cursorY)
+      cursorY += 6
+
+      doc.setDrawColor(200, 200, 200)
+      doc.line(margin, cursorY, 210 - margin, cursorY)
+      cursorY += 10
+
+      // Table Rows
+      doc.setFont('helvetica', 'normal')
+      records.forEach((rec) => {
+        if (cursorY + lineSpacing > pageHeight - margin - 20) {
+          doc.addPage()
+          cursorY = margin
+          // Repeat header
+          doc.setFont('helvetica', 'bold')
+          doc.text('Participant Name', margin, cursorY)
+          doc.text('Meeting Duration', margin + 60, cursorY)
+          doc.text('Attendance %', margin + 110, cursorY)
+          doc.text('Status', margin + 145, cursorY)
+          cursorY += 6
+          doc.line(margin, cursorY, 210 - margin, cursorY)
+          cursorY += 10
+          doc.setFont('helvetica', 'normal')
+        }
+
+        const durationFormatted = rec.meeting_duration_seconds >= 60 
+          ? `${Math.floor(rec.meeting_duration_seconds / 60)}m ${rec.meeting_duration_seconds % 60}s`
+          : `${rec.meeting_duration_seconds}s`
+
+        // Color status green if Present, red if Absent
+        const isPresent = rec.status === 'Present'
+        doc.setTextColor(51, 65, 85) // Reset color to slate-700
+        doc.text(rec.participant_name || 'Anonymous', margin, cursorY)
+        doc.text(durationFormatted, margin + 60, cursorY)
+        doc.text(`${rec.attendance_percentage}%`, margin + 110, cursorY)
+        
+        if (isPresent) {
+          doc.setTextColor(16, 185, 129) // emerald-500 #10b981
+        } else {
+          doc.setTextColor(239, 68, 68) // red-500 #ef4444
+        }
+        doc.text(rec.status, margin + 145, cursorY)
+        
+        cursorY += 8
+      })
+
+      // Reset text color
+      doc.setTextColor(51, 65, 85)
+
+      // Footer divider
+      cursorY += 5
+      if (cursorY + 15 > pageHeight - margin) {
+        doc.addPage()
+        cursorY = margin
+      }
+      doc.setDrawColor(226, 232, 240)
+      doc.line(margin, cursorY, 210 - margin, cursorY)
+      cursorY += 10
+
+      // Footer Note
+      doc.setFont('helvetica', 'italic')
+      doc.setFontSize(9)
+      doc.setTextColor(148, 163, 184)
+      doc.text('Generated by Meetly AI', margin, cursorY)
+
+      // 3. Trigger Download
+      const safeTitle = (meeting.name || 'attendance').toLowerCase().replace(/[^a-z0-9]+/g, '_')
+      doc.save(`meetly_attendance_${safeTitle}.pdf`)
+      showToast('AI Attendance Report downloaded successfully.', 'success')
+
+      // 4. Safe Generation Sequence: Delete records ONLY after successful PDF download
+      try {
+        await clearAttendanceRecords(meeting.dbId)
+        console.log('[Attendance] Temp DB records cleared post-generation successfully')
+      } catch (delErr) {
+        console.error('[Attendance Error] Failed to delete records post-generation:', delErr)
+      }
+    } catch (err) {
+      console.error('[Attendance Report Error]:', err)
+      showToast('Failed to retrieve or generate AI Attendance Report. Please try again.', 'error')
+    } finally {
+      setIsGeneratingAttendance(false)
+    }
+  }
+
   const handleDelete = async () => {
     setIsDeleting(true)
     try {
@@ -224,6 +380,16 @@ export default function MeetingCard({ meeting, index = 0, onDeleted }) {
                     >
                       <Sparkles size={13} className="opacity-80" />
                       <span>{isGeneratingPdf ? 'Generating Summary...' : 'Generate Summary'}</span>
+                    </button>
+                  )}
+                  {meeting.enableAiAttendance && (
+                    <button
+                      onClick={handleGenerateAttendanceReport}
+                      disabled={isGeneratingAttendance}
+                      className="w-full text-left px-4 py-2.5 text-xs font-semibold text-[#34d399] hover:text-[#6ee7b7] hover:bg-white/5 flex items-center gap-2 cursor-pointer transition-all duration-200 disabled:opacity-50 border-b border-white/5"
+                    >
+                      <BarChart2 size={13} className="opacity-80" />
+                      <span>{isGeneratingAttendance ? 'Generating Report...' : 'Generate Report'}</span>
                     </button>
                   )}
                   <button

@@ -162,7 +162,7 @@ const generateUniqueMeetingCode = async () => {
 export const createMeeting = async (req, res) => {
   let createdMeetingId = null
   try {
-    const { meetingTitle, meetingType, meetingPassword, enableAiAnalyzer } = req.body
+    const { meetingTitle, meetingType, meetingPassword, enableAiAnalyzer, enableAiAttendance } = req.body
 
     if (!meetingTitle || !meetingTitle.trim()) {
       return res.status(400).json({ message: 'Meeting title is required.' })
@@ -207,7 +207,8 @@ export const createMeeting = async (req, res) => {
           is_deleted: false,
           meeting_password_hash: passwordHash,
           meeting_type: type,
-          enable_ai_analyzer: !!enableAiAnalyzer
+          enable_ai_analyzer: !!enableAiAnalyzer,
+          enable_ai_attendance: !!enableAiAttendance
         }
       ])
       .select()
@@ -828,7 +829,8 @@ export const getRecentMeetings = async (req, res) => {
         duration: m.meeting_status === 'Ended' ? 'Completed' : m.meeting_status,
         status: m.meeting_status === 'Ended' ? 'Completed' : 'Live',
         type: m.meeting_type,
-        enableAiAnalyzer: m.enable_ai_analyzer
+        enableAiAnalyzer: m.enable_ai_analyzer,
+        enableAiAttendance: m.enable_ai_attendance
       }
     })
 
@@ -877,7 +879,8 @@ export const getMeetingHistory = async (req, res) => {
           duration: `${diffMins} min`,
           status: 'Completed',
           participantsCount: count || 1,
-          enableAiAnalyzer: m.enable_ai_analyzer
+          enableAiAnalyzer: m.enable_ai_analyzer,
+          enableAiAttendance: m.enable_ai_attendance
         }
       })
     )
@@ -1135,4 +1138,203 @@ export const startRetentionCleanup = () => {
       console.error('[Cleanup Job Error] Unexpected error during cleanup check:', err)
     }
   }, 10 * 60 * 1000)
+}
+
+// 16. SUBMIT ATTENDANCE (AI Face Detection record)
+export const submitAttendance = async (req, res) => {
+  console.log('[Attendance] Attendance endpoint called')
+  try {
+    const {
+      meetingId,
+      presenceSeconds,
+      meetingDurationSeconds,
+      cameraPermission
+    } = req.body
+
+    if (!meetingId) {
+      console.error('[Attendance Error] Missing meetingId')
+      return res.status(400).json({ message: 'Meeting ID is required.' })
+    }
+
+    // Fetch the meeting to check if current user is the host
+    const { data: meetingCheck, error: mErrCheck } = await supabase
+      .from('meetings')
+      .select('host_id')
+      .eq('meeting_id', meetingId)
+      .maybeSingle()
+
+    if (mErrCheck) {
+      console.error('[Attendance Error] Failed to fetch meeting host_id:', mErrCheck)
+    } else if (meetingCheck && meetingCheck.host_id === req.user.id) {
+      console.log('[Attendance] Bypassing attendance submission: User is the meeting host.')
+      return res.status(200).json({ message: 'Host attendance bypassed.' })
+    }
+
+    console.log('[Attendance Backend Received]', {
+      meetingId,
+      userId: req.user.id,
+      presenceSeconds,
+      meetingDurationSeconds
+    })
+
+    // Fetch existing attendance record for this user and meeting if it exists
+    console.log(`[Attendance] Attendance SELECT running for meetingId=${meetingId}, userId=${req.user.id}`)
+    const { data: existingRecord, error: fetchErr } = await supabase
+      .from('meeting_attendance')
+      .select('presence_seconds, meeting_duration_seconds, camera_permission')
+      .eq('meeting_id', meetingId)
+      .eq('user_id', req.user.id)
+      .maybeSingle()
+
+    if (fetchErr) {
+      console.error('[Attendance Error] Attendance SELECT failed:', fetchErr)
+    } else {
+      console.log(`[Attendance] Attendance SELECT completed. Record found:`, !!existingRecord)
+    }
+
+    let finalDuration = meetingDurationSeconds !== undefined ? Number(meetingDurationSeconds) : 0
+    let finalPresence = presenceSeconds !== undefined ? Number(presenceSeconds) : 0
+    let finalCameraPermission = !!cameraPermission
+
+    if (existingRecord) {
+      console.log('[Attendance] Attendance UPDATE (Rejoin): Accumulating metrics')
+      finalDuration = (existingRecord.meeting_duration_seconds || 0) + finalDuration
+      finalPresence = (existingRecord.presence_seconds || 0) + finalPresence
+      finalCameraPermission = existingRecord.camera_permission || finalCameraPermission
+    } else {
+      console.log('[Attendance] Attendance INSERT (First Join): Initializing metrics')
+    }
+
+    const finalPercentage = finalDuration > 0 ? (finalPresence / finalDuration) * 100 : 0
+    const finalStatus = finalPercentage >= 75 ? 'Present' : 'Absent'
+
+    console.log('[Attendance Backend Mapped Values to Write]', {
+      meetingId,
+      userId: req.user.id,
+      finalDuration,
+      finalPresence,
+      finalPercentage: finalPercentage.toFixed(2),
+      finalStatus,
+      finalCameraPermission
+    })
+
+    // Upsert to handle disconnects/reconnects without duplicate rows
+    const { error: upsertErr } = await supabase
+      .from('meeting_attendance')
+      .upsert(
+        {
+          meeting_id: meetingId,
+          user_id: req.user.id,
+          meeting_duration_seconds: finalDuration,
+          presence_seconds: finalPresence,
+          attendance_percentage: Number(finalPercentage.toFixed(2)),
+          status: finalStatus,
+          camera_permission: finalCameraPermission
+        },
+        {
+          onConflict: 'meeting_id,user_id'
+        }
+      )
+
+    if (upsertErr) {
+      console.error('[Attendance Error] Supabase upsert failed:', upsertErr)
+      return res.status(500).json({ message: 'Failed to save attendance record.' })
+    }
+
+    console.log('[Attendance] Attendance saved successfully')
+    return res.status(200).json({ message: 'Attendance recorded successfully.' })
+  } catch (err) {
+    console.error('[Attendance Error] Unexpected exception:', err)
+    return res.status(500).json({ message: err.message || 'Server error recording attendance.' })
+  }
+}
+
+// 17. GET ATTENDANCE REPORT
+export const getAttendanceReport = async (req, res) => {
+  console.log('[Attendance] Attendance report request received for meetingId:', req.params.meetingId)
+  try {
+    const { meetingId } = req.params
+    if (!meetingId) {
+      return res.status(400).json({ message: 'Meeting ID is required.' })
+    }
+
+    // Fetch the meeting to find host_id
+    const { data: meeting, error: mErr } = await supabase
+      .from('meetings')
+      .select('host_id')
+      .eq('meeting_id', meetingId)
+      .maybeSingle()
+
+    const hostId = meeting?.host_id
+
+    // Join users table to get the user's full_name dynamically
+    console.log(`[Attendance] Attendance SELECT running for report meetingId=${meetingId}`)
+    let query = supabase
+      .from('meeting_attendance')
+      .select('*, user:user_id ( full_name )')
+      .eq('meeting_id', meetingId)
+
+    if (hostId) {
+      query = query.neq('user_id', hostId)
+    }
+
+    const { data: records, error } = await query
+
+    if (error) {
+      console.error('[Attendance Error] Attendance SELECT failed for report:', error)
+      return res.status(500).json({ message: 'Failed to retrieve attendance logs.' })
+    }
+
+    const rowCount = records?.length || 0
+    console.log(`[Attendance] Attendance SELECT returned ${rowCount} rows`)
+
+    // Map records to match frontend expected fields
+    const mapped = (records || []).map((rec) => ({
+      id: rec.id,
+      meeting_id: rec.meeting_id,
+      user_id: rec.user_id,
+      participant_name: rec.user?.full_name || 'Anonymous User',
+      meeting_duration_seconds: rec.meeting_duration_seconds,
+      presence_seconds: rec.presence_seconds,
+      attendance_percentage: rec.attendance_percentage,
+      status: rec.status,
+      camera_permission: rec.camera_permission
+    }))
+
+    // Sort by name in memory
+    mapped.sort((a, b) => a.participant_name.localeCompare(b.participant_name))
+
+    console.log(`[Attendance] Attendance report generated successfully with ${mapped.length} records`)
+    return res.status(200).json(mapped)
+  } catch (err) {
+    console.error('[Attendance Error] Unexpected exception fetching report:', err)
+    return res.status(500).json({ message: 'Server error retrieving attendance report.' })
+  }
+}
+
+// 18. DELETE ATTENDANCE RECORDS (After successful PDF download verification)
+export const deleteAttendanceRecords = async (req, res) => {
+  console.log('[Attendance] Attendance delete request received')
+  try {
+    const { meetingId } = req.params
+    if (!meetingId) {
+      return res.status(400).json({ message: 'Meeting ID is required.' })
+    }
+
+    const { error } = await supabase
+      .from('meeting_attendance')
+      .delete()
+      .eq('meeting_id', meetingId)
+
+    if (error) {
+      console.error('[Attendance Error] Failed to delete records from DB:', error)
+      return res.status(500).json({ message: 'Failed to delete attendance logs.' })
+    }
+
+    console.log('[Attendance] Attendance deleted successfully for meeting:', meetingId)
+    return res.status(200).json({ message: 'Attendance records cleared.' })
+  } catch (err) {
+    console.error('[Attendance Error] Unexpected exception deleting attendance:', err)
+    return res.status(500).json({ message: 'Server error deleting attendance records.' })
+  }
 }

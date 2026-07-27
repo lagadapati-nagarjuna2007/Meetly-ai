@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useRef } from 'react'
+import React, { useState, useEffect, useRef, useCallback } from 'react'
 import { useParams, useNavigate } from 'react-router-dom'
 import { io } from 'socket.io-client'
 import {
@@ -108,6 +108,7 @@ function MeetingRoomInner() {
   const [isHost, setIsHost] = useState(false)
   const [isLoading, setIsLoading] = useState(true)
   const [roomError, setRoomError] = useState(null)
+  const [attendanceConsent, setAttendanceConsent] = useState(null)
   const joinAttemptedRef = useRef(false)
 
   console.log('[MeetingRoom Render] id:', id, 'isLoading:', isLoading, 'hasMeetingData:', !!meetingData, 'hasToken:', !!livekitToken, 'roomError:', roomError)
@@ -124,7 +125,11 @@ function MeetingRoomInner() {
         if (!isMounted) return
         setMeetingData(data.meeting)
         if (data.meeting && user) {
-          setIsHost(data.meeting.host_id === user.id)
+          const host = data.meeting.host_id === user.id
+          setIsHost(host)
+          if (host) {
+            setAttendanceConsent('Granted')
+          }
         }
       } catch (err) {
         if (!isMounted) return
@@ -145,11 +150,17 @@ function MeetingRoomInner() {
 
   // 2. Auto-join meeting room if Token is missing (e.g. on F5 Refresh)
   useEffect(() => {
-    console.log('[MeetingRoom useEffect 2] ensureToken check. meetingData:', !!meetingData, 'hasToken:', !!livekitToken, 'attempted:', joinAttemptedRef.current)
+    console.log('[MeetingRoom useEffect 2] ensureToken check. meetingData:', !!meetingData, 'hasToken:', !!livekitToken, 'attempted:', joinAttemptedRef.current, 'attendanceConsent:', attendanceConsent)
 
     let timeoutId = null
     const ensureToken = async () => {
       if (meetingData && !livekitToken && !joinAttemptedRef.current) {
+        // If AI Attendance is enabled, wait until consent is resolved before joining
+        if (meetingData.enable_ai_attendance && attendanceConsent === null) {
+          console.log('[MeetingRoom useEffect 2] AI Attendance is enabled, waiting for user consent.')
+          return
+        }
+
         joinAttemptedRef.current = true
         console.log('[MeetingRoom useEffect 2] Starting auto-join for meeting code:', meetingData.meeting_code)
 
@@ -182,7 +193,7 @@ function MeetingRoomInner() {
     return () => {
       if (timeoutId) clearTimeout(timeoutId)
     }
-  }, [meetingData, livekitToken, joinMeeting, showToast])
+  }, [meetingData, livekitToken, joinMeeting, showToast, attendanceConsent])
 
   // 3. Browser Tab Close & Refresh Handling (sendBeacon)
   useEffect(() => {
@@ -200,7 +211,7 @@ function MeetingRoomInner() {
     }
   }, [meetingData?.meeting_id])
 
-  const handleLeave = async () => {
+  const handleLeave = useCallback(async () => {
     console.log('[MeetingRoom] handleLeave triggered')
     if (meetingData) {
       try {
@@ -211,9 +222,9 @@ function MeetingRoomInner() {
     }
     showToast('You left the meeting.', 'info')
     navigate('/')
-  }
+  }, [meetingData, leaveMeeting, navigate, showToast])
 
-  const handleEndMeeting = async () => {
+  const handleEndMeeting = useCallback(async () => {
     if (!meetingData) return
     const confirmEnd = window.confirm('Are you sure you want to end this meeting for all participants?')
     if (!confirmEnd) return
@@ -225,9 +236,9 @@ function MeetingRoomInner() {
     } catch (err) {
       showToast(err.message || 'Failed to end meeting', 'error')
     }
-  }
+  }, [meetingData, endMeeting, navigate, showToast])
 
-  const handleDeleteMeeting = async () => {
+  const handleDeleteMeeting = useCallback(async () => {
     if (!meetingData) return
     const confirmDel = window.confirm('Are you sure you want to delete this meeting?')
     if (!confirmDel) return
@@ -239,9 +250,9 @@ function MeetingRoomInner() {
     } catch (err) {
       showToast(err.message || 'Failed to delete meeting', 'error')
     }
-  }
+  }, [meetingData, deleteMeeting, navigate, showToast])
 
-  const handleRename = async () => {
+  const handleRename = useCallback(async () => {
     if (!meetingData) return
     const newTitle = prompt('Enter new meeting title:', meetingData.meeting_title)
     if (newTitle && newTitle.trim() && newTitle.trim() !== meetingData.meeting_title) {
@@ -253,20 +264,20 @@ function MeetingRoomInner() {
         showToast(err.message || 'Failed to rename meeting', 'error')
       }
     }
-  }
+  }, [meetingData, renameMeeting, showToast])
 
-  const handleCopyCode = () => {
+  const handleCopyCode = useCallback(() => {
     if (!meetingData) return
     navigator.clipboard.writeText(meetingData.meeting_code)
     showToast('Meeting code copied!', 'success')
-  }
+  }, [meetingData, showToast])
 
-  const handleCopyLink = () => {
+  const handleCopyLink = useCallback(() => {
     if (!meetingData) return
     const link = `${window.location.origin}/meeting/${meetingData.meeting_code}`
     navigator.clipboard.writeText(link)
     showToast('Meeting link copied!', 'success')
-  }
+  }, [meetingData, showToast])
 
   // Error UI
   if (roomError) {
@@ -298,6 +309,59 @@ function MeetingRoomInner() {
               className="flex-1 px-4 py-2.5 bg-purple-600 hover:bg-purple-500 text-white rounded-xl text-xs font-bold transition-all cursor-pointer"
             >
               Back to Home
+            </button>
+          </div>
+        </div>
+      </div>
+    )
+  }
+
+  // If AI Attendance is enabled and consent is not decided, show the consent dialog
+  if (meetingData && meetingData.enable_ai_attendance && attendanceConsent === null) {
+    return (
+      <div className="fixed inset-0 z-50 bg-[#04050b]/90 backdrop-blur-md flex items-center justify-center p-6 text-left select-none">
+        <div className="max-w-md w-full bg-slate-900 border border-white/10 rounded-2xl p-6 flex flex-col gap-4 shadow-2xl">
+          <div className="flex items-center gap-3">
+            <div className="w-10 h-10 rounded-full bg-purple-500/10 border border-purple-500/20 flex items-center justify-center text-purple-400">
+              <AlertTriangle size={20} className="text-purple-400" />
+            </div>
+            <div>
+              <h2 className="text-sm font-bold text-white">AI Attendance Consent</h2>
+              <p className="text-[10px] text-gray-500">Privacy-First Face Detection</p>
+            </div>
+          </div>
+          <div className="text-xs text-gray-300 leading-relaxed flex flex-col gap-2.5 p-4 bg-black/40 rounded-xl border border-white/5">
+            <p className="font-semibold text-white">AI Attendance uses your camera locally for face-presence detection during the meeting.</p>
+            <p>If you turn off your meeting video, other participants will not see you, but AI Attendance may continue using your camera locally.</p>
+            <p className="text-[11px] text-gray-400">No attendance video, image, screenshot, face embedding, or biometric identifier is stored or transmitted.</p>
+          </div>
+          <div className="flex flex-col gap-2 mt-2">
+            <button
+              onClick={async () => {
+                try {
+                  console.log('[Attendance] Requesting camera access for AI Attendance...')
+                  const stream = await navigator.mediaDevices.getUserMedia({ video: true })
+                  // Stop the track immediately so it can be requested again inside the detector session
+                  stream.getTracks().forEach(track => track.stop())
+                  console.log('[Attendance] Camera permission granted')
+                  setAttendanceConsent('Granted')
+                } catch (err) {
+                  console.warn('[Attendance] Camera permission denied or failed:', err)
+                  setAttendanceConsent('Denied')
+                }
+              }}
+              className="w-full py-2.5 bg-purple-600 hover:bg-purple-500 text-white rounded-xl text-xs font-bold transition-all cursor-pointer flex items-center justify-center gap-2"
+            >
+              Allow AI Attendance
+            </button>
+            <button
+              onClick={() => {
+                console.log('[Attendance] User opted out of AI Attendance')
+                setAttendanceConsent('Camera Disabled')
+              }}
+              className="w-full py-2.5 bg-slate-800 hover:bg-slate-700 text-gray-300 rounded-xl text-xs font-bold transition-all cursor-pointer"
+            >
+              Join Without AI Attendance
             </button>
           </div>
         </div>
@@ -350,6 +414,7 @@ function MeetingRoomInner() {
         activateMeeting={activateMeeting}
         showToast={showToast}
         user={user}
+        attendanceConsent={attendanceConsent}
       />
       <RoomAudioRenderer />
     </LiveKitRoom>
@@ -395,7 +460,8 @@ function MeetingRoomContent({
   lockMeeting,
   activateMeeting,
   showToast,
-  user
+  user,
+  attendanceConsent
 }) {
   const room = useMaybeRoomContext()
   const { localParticipant } = useLocalParticipant()
@@ -409,6 +475,7 @@ function MeetingRoomContent({
   const [sharingActive, setSharingActive] = useState(false)
   const [camError, setCamError] = useState(null)
   const [camInitializing, setCamInitializing] = useState(false)
+  const [attendanceCamError, setAttendanceCamError] = useState(false)
 
   // Drawer Panel Toggles
   const [rightPanelOpen, setRightPanelOpen] = useState(true)
@@ -430,6 +497,560 @@ function MeetingRoomContent({
 
   const roomState = room?.state
   console.log('[MeetingRoomContent Render] roomState:', roomState, 'localParticipant:', !!localParticipant, 'participants count:', participants?.length || 0)
+
+  // AI Attendance tracking parameters
+  const detectorRef = useRef(null)
+  const cameraStreamRef = useRef(null)
+  const animationFrameIdRef = useRef(null)
+  const hasUploaded = useRef(false)
+
+  const presenceSeconds = useRef(0)
+  const tempAbsenceSeconds = useRef(0)
+  const consecutiveDetections = useRef(0)
+  const isPresent = useRef(false)
+  const totalSeconds = useRef(0)
+  const cameraInterruptedCount = useRef(0)
+  const tempAbsenceIncidents = useRef(0)
+  const videoRef = useRef(null)
+  const attendanceCameraStreamRef = useRef(null)
+
+  // Get local camera video track from LiveKit
+  const localVideoTrack = localParticipant?.getTrackPublication(Track.Source.Camera)?.videoTrack ||
+                          Array.from(localParticipant?.videoTrackPublications?.values() || []).find(p => p.source === Track.Source.Camera)?.videoTrack
+
+  const isInitializingRef = useRef(false)
+  const sessionStartTimeRef = useRef(null)
+
+  const meetingDataRef = useRef(meetingData)
+  const isHostRef = useRef(isHost)
+  const attendanceConsentRef = useRef(attendanceConsent)
+  const userRef = useRef(user)
+  const handleLeaveRef = useRef(handleLeave)
+  const handleLeaveWithAttendanceRef = useRef(null)
+
+  useEffect(() => {
+    meetingDataRef.current = meetingData
+  }, [meetingData])
+
+  useEffect(() => {
+    isHostRef.current = isHost
+  }, [isHost])
+
+  useEffect(() => {
+    attendanceConsentRef.current = attendanceConsent
+  }, [attendanceConsent])
+
+  useEffect(() => {
+    userRef.current = user
+  }, [user])
+
+  useEffect(() => {
+    handleLeaveRef.current = handleLeave
+  }, [handleLeave])
+
+  // Track when the participant successfully joins the LiveKit room
+  useEffect(() => {
+    if (meetingData?.enable_ai_attendance && !isHost && roomState === 'connected') {
+      if (!sessionStartTimeRef.current) {
+        sessionStartTimeRef.current = Date.now()
+        console.log('[Attendance Debug] Participant joined. Session timer started:', new Date(sessionStartTimeRef.current).toISOString())
+      }
+    }
+  }, [meetingData, isHost, roomState])
+
+  const uploadAttendance = async () => {
+    if (isHost) {
+      console.log('[Attendance] Bypassing upload: User is the meeting host.')
+      return true
+    }
+
+    const duration = sessionStartTimeRef.current 
+      ? Math.max(0, Math.floor((Date.now() - sessionStartTimeRef.current) / 1000))
+      : 0
+
+    if (duration <= 0) {
+      console.log('[Attendance] Bypassing upload: Session duration is 0 seconds (startup check or join event).')
+      return true
+    }
+
+    if (hasUploaded.current) return true
+    hasUploaded.current = true
+
+    const percentage = duration > 0 ? (presenceSeconds.current / duration) * 100 : 0
+    const status = percentage >= 75 ? 'Present' : 'Absent'
+    const camPermission = attendanceConsent === 'Granted'
+
+    const payload = {
+      meetingId: meetingData.meeting_id,
+      presenceSeconds: presenceSeconds.current,
+      meetingDurationSeconds: duration,
+      attendancePercentage: Number(percentage.toFixed(2)),
+      status,
+      cameraPermission: camPermission
+    }
+
+    console.log('[Attendance Finalize]', {
+      meetingId: meetingData.meeting_id,
+      userId: user?.id || 'unknown',
+      isHost,
+      sessionStart: sessionStartTimeRef.current ? new Date(sessionStartTimeRef.current).toISOString() : null,
+      sessionDurationSeconds: duration,
+      presenceSeconds: presenceSeconds.current,
+      cameraPermission: camPermission
+    })
+    console.log('[Attendance Upload Payload]', payload)
+
+    const maxRetries = 3
+    let attempt = 0
+    const delay = (ms) => new Promise(res => setTimeout(res, ms))
+
+    while (attempt < maxRetries) {
+      try {
+        const apiUrl = import.meta.env.VITE_API_URL || 'http://localhost:5000'
+        const res = await fetch(`${apiUrl}/api/meetings/attendance`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(payload),
+          credentials: 'include'
+        })
+        if (res.ok) {
+          console.log('[Attendance] Upload successful')
+          return true
+        }
+      } catch (err) {
+        console.error(`[Attendance] Attempt ${attempt + 1} failed:`, err)
+      }
+      attempt++
+      if (attempt < maxRetries) {
+        await delay(Math.pow(2, attempt) * 500)
+      }
+    }
+    hasUploaded.current = false
+    return false
+  }
+
+  const cleanupResources = () => {
+    console.log('[Attendance] Cleaning up attendance resources...')
+    if (animationFrameIdRef.current) {
+      cancelAnimationFrame(animationFrameIdRef.current)
+      animationFrameIdRef.current = null
+    }
+    if (detectorRef.current) {
+      try {
+        detectorRef.current.close()
+      } catch (e) {
+        console.error('[Attendance Error] Error closing detector:', e)
+      }
+      detectorRef.current = null
+    }
+    if (cameraStreamRef.current) {
+      try {
+        cameraStreamRef.current.getTracks().forEach(track => track.stop())
+      } catch (e) {
+        console.error('[Attendance Error] Error stopping camera tracks:', e)
+      }
+      cameraStreamRef.current = null
+    }
+    if (attendanceCameraStreamRef.current) {
+      try {
+        attendanceCameraStreamRef.current.getTracks().forEach(track => track.stop())
+      } catch (e) {
+        console.error('[Attendance Error] Error stopping attendance camera tracks:', e)
+      }
+      attendanceCameraStreamRef.current = null
+    }
+  }
+
+  const handleLeaveWithAttendance = async () => {
+    console.log('[Attendance Finalize Trigger] leave-button')
+    if (meetingData?.enable_ai_attendance) {
+      try {
+        await uploadAttendance()
+      } catch (err) {
+        console.error('[Attendance] Final upload error:', err)
+      } finally {
+        cleanupResources()
+      }
+    }
+    handleLeave()
+  }
+  handleLeaveWithAttendanceRef.current = handleLeaveWithAttendance
+
+  const handleEndWithAttendance = async () => {
+    console.log('[Attendance Finalize Trigger] host-ended-meeting')
+    if (meetingData?.enable_ai_attendance) {
+      try {
+        await uploadAttendance()
+      } catch (err) {
+        console.error('[Attendance] Final upload error:', err)
+      } finally {
+        cleanupResources()
+      }
+    }
+    handleEndMeeting()
+  }
+
+  // 1. MediaPipe Detector Initialization Effect (runs once)
+  useEffect(() => {
+    if (!meetingData || !meetingData.enable_ai_attendance || isHost || attendanceConsent !== 'Granted') {
+      return
+    }
+
+    if (detectorRef.current || isInitializingRef.current) {
+      return // Prevent duplicate initialization
+    }
+
+    isInitializingRef.current = true
+    console.log('[Attendance] Starting AI Attendance')
+
+    const loadDetector = async () => {
+      try {
+        console.log('[Attendance] Loading MediaPipe')
+        const { FilesetResolver, FaceDetector } = await import('@mediapipe/tasks-vision')
+        
+        console.log('[Attendance] Loading WASM')
+        const vision = await FilesetResolver.forVisionTasks(
+          'https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.8/wasm'
+        )
+
+        console.log('[Attendance] Loading Face Detector model')
+        const modelUrl = 'https://storage.googleapis.com/mediapipe-models/face_detector/blaze_face_short_range/float16/1/blaze_face_short_range.tflite'
+        
+        console.log(`[Attendance] Verifying model access: ${modelUrl}`)
+        try {
+          const checkRes = await fetch(modelUrl, { method: 'HEAD' })
+          if (!checkRes.ok) {
+            throw new Error(`Model request returned HTTP ${checkRes.status} for URL: ${modelUrl}`)
+          }
+          console.log('[Attendance] Model URL accessibility verified (HTTP 200)')
+        } catch (fetchErr) {
+          console.error(`[Attendance Error] Pre-fetch verification check failed for URL ${modelUrl}:`, fetchErr)
+        }
+
+        console.log('[Attendance] Creating detector')
+        const detector = await FaceDetector.createFromOptions(vision, {
+          baseOptions: {
+            modelAssetPath: modelUrl,
+            delegate: 'GPU'
+          },
+          runningMode: 'VIDEO'
+        })
+
+        detectorRef.current = detector
+        isInitializingRef.current = false
+        console.log('[Attendance] Model loaded successfully')
+        console.log('[Attendance] Initialization completed')
+      } catch (err) {
+        isInitializingRef.current = false
+        console.error('[Attendance Error] MediaPipe FaceDetector initialization failed:', err)
+        console.error('[Attendance Error] Error details:', {
+          message: err.message,
+          stack: err.stack,
+          errorObject: err
+        })
+        showToast('AI Attendance system initialization failed: ' + (err.message || err), 'error')
+      }
+    }
+
+    loadDetector()
+
+    return () => {
+      console.log('[Attendance] Cleaning up detector on unmount')
+      if (detectorRef.current) {
+        try {
+          detectorRef.current.close()
+        } catch (e) {
+          console.error('[Attendance Error] Failed to close detector:', e)
+        }
+        detectorRef.current = null
+      }
+    }
+  }, [meetingData, attendanceConsent, showToast, isHost])
+
+  // 2. Local Camera Tracking Loop Effect
+  useEffect(() => {
+    if (!meetingData || !meetingData.enable_ai_attendance || isHost || attendanceConsent !== 'Granted') {
+      return
+    }
+
+    // Wait until detector is loaded
+    if (!detectorRef.current) {
+      console.log('[Attendance] Waiting for detector to be loaded...')
+      return
+    }
+
+    console.log('[Attendance] Initializing separate local camera stream for AI Attendance...')
+
+    // Create a hidden video element to attach the track
+    const video = document.createElement('video')
+    video.autoplay = true
+    video.playsInline = true
+    video.muted = true
+    video.style.position = 'fixed'
+    video.style.top = '0'
+    video.style.left = '0'
+    video.style.width = '1px'
+    video.style.height = '1px'
+    video.style.opacity = '0.001'
+    video.style.pointerEvents = 'none'
+    video.style.zIndex = '-9999'
+    document.body.appendChild(video)
+    videoRef.current = video
+
+    let activeStream = null
+    let clockInterval = null
+    let rafId = null
+
+    const startCamera = async () => {
+      try {
+        setAttendanceCamError(false)
+        console.log('[Attendance] Requesting getUserMedia for local camera stream...')
+        const stream = await navigator.mediaDevices.getUserMedia({
+          video: {
+            width: { ideal: 640 },
+            height: { ideal: 480 },
+            facingMode: 'user'
+          },
+          audio: false
+        })
+        activeStream = stream
+        attendanceCameraStreamRef.current = stream
+        console.log('[Attendance] Separate local camera stream obtained successfully.')
+
+        // Attach stream to hidden video element
+        video.srcObject = stream
+        videoRef.current = video
+        console.log('[Attendance] Separate camera stream attached to hidden video element.')
+
+        // Start requestAnimationFrame loop
+        console.log('[Attendance] Starting detection loop')
+        let lastTime = 0
+        const runDetection = (timestamp) => {
+          if (!detectorRef.current || !videoRef.current) return
+
+          if (timestamp - lastTime >= 400) {
+            lastTime = timestamp
+            try {
+              if (video.readyState >= 2) { // HAVE_CURRENT_DATA
+                const results = detectorRef.current.detectForVideo(video, timestamp)
+                const faceDetected = results && results.detections && results.detections.length > 0
+                
+                if (faceDetected) {
+                  console.log('[Attendance] Face detected')
+                  consecutiveDetections.current++
+                  if (consecutiveDetections.current >= 3) {
+                    if (!isPresent.current) {
+                      isPresent.current = true
+                    }
+                    if (tempAbsenceSeconds.current > 0) {
+                      console.log('[Attendance] Temporary absence cleared')
+                      tempAbsenceSeconds.current = 0
+                    }
+                  }
+                } else {
+                  console.log('[Attendance] Face missing')
+                  consecutiveDetections.current = 0
+                }
+              }
+            } catch (err) {
+              console.error('[Attendance Error] Face detection frame processing failed:', err)
+            }
+          }
+          rafId = requestAnimationFrame(runDetection)
+          animationFrameIdRef.current = rafId
+        }
+
+        rafId = requestAnimationFrame(runDetection)
+        animationFrameIdRef.current = rafId
+
+        // Clock timer (runs every 1 second)
+        clockInterval = setInterval(() => {
+          totalSeconds.current++
+
+          if (isPresent.current) {
+            if (consecutiveDetections.current === 0) {
+              tempAbsenceSeconds.current++
+              if (tempAbsenceSeconds.current === 1) {
+                console.log('[Attendance] Temporary absence started')
+                tempAbsenceIncidents.current++
+              }
+
+              if (tempAbsenceSeconds.current >= 20) {
+                if (isPresent.current) {
+                  console.log('[Attendance] Face missing for 20s. Marking Absent.')
+                  isPresent.current = false
+                }
+              } else {
+                presenceSeconds.current++
+              }
+            } else {
+              presenceSeconds.current++
+              tempAbsenceSeconds.current = 0
+            }
+          } else {
+            tempAbsenceSeconds.current++
+
+            if (consecutiveDetections.current >= 3) {
+              console.log('[Attendance] Face returned. Restoring presence state.')
+              isPresent.current = true
+              tempAbsenceSeconds.current = 0
+              presenceSeconds.current++
+            }
+          }
+
+          const elapsedSessionSeconds = sessionStartTimeRef.current 
+            ? Math.floor((Date.now() - sessionStartTimeRef.current) / 1000)
+            : 0
+          console.log(`[Attendance Debug] Face detected: ${isPresent.current} | Session duration: ${elapsedSessionSeconds} | Presence seconds: ${presenceSeconds.current}`)
+        }, 1000)
+
+      } catch (err) {
+        console.error('[Attendance Error] Failed to obtain separate local camera stream:', err)
+        setAttendanceCamError(true)
+        showToast('AI Attendance: Camera access failed or hardware busy.', 'warning')
+      }
+    }
+
+    startCamera()
+
+    return () => {
+      console.log('[Attendance] Cleaning up tracking loop and separate camera track')
+      if (clockInterval) clearInterval(clockInterval)
+      if (rafId) cancelAnimationFrame(rafId)
+      if (activeStream) {
+        try {
+          activeStream.getTracks().forEach(track => track.stop())
+        } catch (e) {
+          console.error('[Attendance Error] Failed to stop stream tracks:', e)
+        }
+      }
+      attendanceCameraStreamRef.current = null
+      if (video && video.parentNode) {
+        video.parentNode.removeChild(video)
+      }
+      videoRef.current = null
+    }
+  }, [meetingData, attendanceConsent, isHost])
+
+  // beforeunload listener for browser closing / refresh events
+  useEffect(() => {
+    const handleBeforeUnloadAttendance = () => {
+      const currentMeetingData = meetingDataRef.current
+      const currentIsHost = isHostRef.current
+      const currentConsent = attendanceConsentRef.current
+
+      if (currentMeetingData?.enable_ai_attendance && !currentIsHost && !hasUploaded.current) {
+        const duration = sessionStartTimeRef.current 
+          ? Math.max(0, Math.floor((Date.now() - sessionStartTimeRef.current) / 1000))
+          : 0
+
+        if (duration <= 0) {
+          console.log('[Attendance] Bypassing beforeunload upload: Session duration is 0 seconds.')
+          return
+        }
+
+        hasUploaded.current = true
+
+        const percentage = duration > 0 ? (presenceSeconds.current / duration) * 100 : 0
+        const status = percentage >= 75 ? 'Present' : 'Absent'
+        const camPermission = currentConsent === 'Granted'
+
+        const payload = {
+          meetingId: currentMeetingData.meeting_id,
+          presenceSeconds: presenceSeconds.current,
+          meetingDurationSeconds: duration,
+          attendancePercentage: Number(percentage.toFixed(2)),
+          status,
+          cameraPermission: camPermission
+        }
+
+        console.log('[Attendance Finalize Trigger] beforeunload')
+        console.log('[Attendance Finalize]', {
+          meetingId: currentMeetingData.meeting_id,
+          userId: userRef.current?.id || 'unknown',
+          isHost: currentIsHost,
+          sessionStart: sessionStartTimeRef.current ? new Date(sessionStartTimeRef.current).toISOString() : null,
+          sessionDurationSeconds: duration,
+          presenceSeconds: presenceSeconds.current,
+          cameraPermission: camPermission
+        })
+        console.log('[Attendance Upload Payload]', payload)
+
+        const apiUrl = `${import.meta.env.VITE_API_URL || 'http://localhost:5000'}/api/meetings/attendance`
+        const blob = new Blob([JSON.stringify(payload)], { type: 'application/json' })
+        navigator.sendBeacon(apiUrl, blob)
+      }
+    }
+
+    window.addEventListener('beforeunload', handleBeforeUnloadAttendance)
+    return () => {
+      window.removeEventListener('beforeunload', handleBeforeUnloadAttendance)
+    }
+  }, [])
+
+  // Dedicated mount/unmount effect for AI Attendance finalization fallback
+  useEffect(() => {
+    return () => {
+      // On unmount, if it is a participant and has not uploaded yet, do background upload
+      const currentMeetingData = meetingDataRef.current
+      const currentIsHost = isHostRef.current
+      const currentConsent = attendanceConsentRef.current
+
+      if (currentMeetingData?.enable_ai_attendance && !currentIsHost && !hasUploaded.current) {
+        const duration = sessionStartTimeRef.current 
+          ? Math.max(0, Math.floor((Date.now() - sessionStartTimeRef.current) / 1000))
+          : 0
+
+        if (duration <= 0) {
+          console.log('[Attendance] Bypassing unmount upload: Session duration is 0 seconds.')
+          return
+        }
+
+        hasUploaded.current = true
+        
+        const percentage = duration > 0 ? (presenceSeconds.current / duration) * 100 : 0
+        const status = percentage >= 75 ? 'Present' : 'Absent'
+        const camPermission = currentConsent === 'Granted'
+
+        const payload = {
+          meetingId: currentMeetingData.meeting_id,
+          presenceSeconds: presenceSeconds.current,
+          meetingDurationSeconds: duration,
+          attendancePercentage: Number(percentage.toFixed(2)),
+          status,
+          cameraPermission: camPermission
+        }
+
+        console.log('[Attendance Finalize Trigger] component-unmount')
+        console.log('[Attendance Finalize]', {
+          meetingId: currentMeetingData.meeting_id,
+          userId: userRef.current?.id || 'unknown',
+          isHost: currentIsHost,
+          sessionStart: sessionStartTimeRef.current ? new Date(sessionStartTimeRef.current).toISOString() : null,
+          sessionDurationSeconds: duration,
+          presenceSeconds: presenceSeconds.current,
+          cameraPermission: camPermission
+        })
+        console.log('[Attendance Upload Payload]', payload)
+
+        const apiUrl = `${import.meta.env.VITE_API_URL || 'http://localhost:5000'}/api/meetings/attendance`
+        if (navigator.sendBeacon) {
+          const blob = new Blob([JSON.stringify(payload)], { type: 'application/json' })
+          navigator.sendBeacon(apiUrl, blob)
+        } else {
+          fetch(apiUrl, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(payload),
+            keepalive: true,
+            credentials: 'include'
+          }).catch(err => {
+            console.error('[Attendance] Unmount background upload failed:', err)
+          })
+        }
+      }
+    }
+  }, [])
 
   // Transcript chunk collection
   useEffect(() => {
@@ -665,7 +1286,18 @@ function MeetingRoomContent({
 
       socket.current.on('meeting_ended', () => {
         showToast('The host has ended this meeting.', 'info')
-        handleLeave()
+        const currentMeetingData = meetingDataRef.current
+        const currentIsHost = isHostRef.current
+        if (currentMeetingData?.enable_ai_attendance && !currentIsHost) {
+          console.log('[Attendance Finalize Trigger] host-ended-meeting')
+          if (handleLeaveWithAttendanceRef.current) {
+            handleLeaveWithAttendanceRef.current()
+          } else {
+            handleLeaveRef.current()
+          }
+        } else {
+          handleLeaveRef.current()
+        }
       })
 
       socket.current.on('meeting_locked', ({ isLocked }) => {
@@ -694,7 +1326,7 @@ function MeetingRoomContent({
         socket.current.disconnect()
       }
     }
-  }, [meetingData?.room_name, handleLeave, setMeetingData, showToast])
+  }, [meetingData?.room_name, showToast, setMeetingData])
 
   const formatTimer = (sec) => {
     const m = Math.floor(sec / 60).toString().padStart(2, '0')
@@ -1087,14 +1719,43 @@ function MeetingRoomContent({
 
       {/* Bottom Controls Toolbar */}
       <footer className="h-16 border-t border-white/5 bg-[#080913] px-6 flex items-center justify-between shrink-0 select-none">
-        {/* Toggle Right Drawer panel */}
-        <div className="flex items-center gap-2">
+        {/* Toggle Right Drawer panel & AI Attendance Indicator */}
+        <div className="flex items-center gap-4">
           <button
             onClick={() => setRightPanelOpen(!rightPanelOpen)}
             className={`p-2.5 rounded-xl border border-white/5 text-gray-400 hover:text-white transition-all duration-200 cursor-pointer ${rightPanelOpen ? 'bg-white/5 text-white' : 'hover:bg-white/5'}`}
           >
             <MessageSquare size={16} />
           </button>
+
+          {meetingData?.enable_ai_attendance && !isHost && attendanceConsent === 'Granted' && (
+            <div className="flex items-center gap-2 px-3 py-1.5 rounded-xl bg-slate-900/80 border border-white/10 select-none">
+              {attendanceCamError ? (
+                <>
+                  <span className="relative flex h-2 w-2">
+                    <span className="relative inline-flex rounded-full h-2 w-2 bg-red-500"></span>
+                  </span>
+                  <span className="text-[10px] font-bold text-red-400">
+                    AI Attendance: Camera Unavailable
+                  </span>
+                </>
+              ) : (
+                <>
+                  <span className="relative flex h-2 w-2">
+                    <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-purple-400 opacity-75"></span>
+                    <span className="relative inline-flex rounded-full h-2 w-2 bg-purple-500"></span>
+                  </span>
+                  <span className="text-[10px] font-bold text-gray-300">
+                    {camActive ? (
+                      <span>AI Attendance: Active</span>
+                    ) : (
+                      <span>Meeting Camera: Off | AI Attendance Camera: Active Locally</span>
+                    )}
+                  </span>
+                </>
+              )}
+            </div>
+          )}
         </div>
 
         {/* Core Media Controls */}
@@ -1146,13 +1807,13 @@ function MeetingRoomContent({
             >
               Delete
             </button>
-            <Button variant="danger" onClick={handleEndMeeting} className="px-5 py-2 rounded-xl text-xs font-semibold flex items-center gap-1.5 shadow-lg shadow-red-600/25">
+            <Button variant="danger" onClick={handleEndWithAttendance} className="px-5 py-2 rounded-xl text-xs font-semibold flex items-center gap-1.5 shadow-lg shadow-red-600/25">
               <PhoneOff size={14} />
               <span>End Meeting</span>
             </Button>
           </div>
         ) : (
-          <Button variant="danger" onClick={handleLeave} className="px-5 py-2 rounded-xl text-xs font-semibold flex items-center gap-1.5 shadow-lg shadow-red-600/25">
+          <Button variant="danger" onClick={handleLeaveWithAttendance} className="px-5 py-2 rounded-xl text-xs font-semibold flex items-center gap-1.5 shadow-lg shadow-red-600/25">
             <PhoneOff size={14} />
             <span>Leave Room</span>
           </Button>

@@ -54,7 +54,7 @@ export function MeetingProvider({ children }) {
 
   // 2. CREATE MEETING
   // Atomic creation: stores meeting details AND LiveKit token immediately in state
-  const createMeeting = async (title, type = 'public', password = '', enableAiAnalyzer = false) => {
+  const createMeeting = async (title, type = 'public', password = '', enableAiAnalyzer = false, enableAiAttendance = false) => {
     if (creatingRef.current) {
       console.log('[MeetingContext] Create meeting already in-flight, ignoring duplicate call.')
       return currentMeeting
@@ -73,7 +73,8 @@ export function MeetingProvider({ children }) {
           meetingTitle: title,
           meetingType: type,
           meetingPassword: password,
-          enableAiAnalyzer
+          enableAiAnalyzer,
+          enableAiAttendance
         }),
         credentials: 'include'
       })
@@ -95,7 +96,8 @@ export function MeetingProvider({ children }) {
         roomName: data.roomName || data.meeting.room_name,
         token: data.livekitToken,
         livekitUrl: data.livekitUrl,
-        enableAiAnalyzer: data.meeting.enable_ai_analyzer
+        enableAiAnalyzer: data.meeting.enable_ai_analyzer,
+        enableAiAttendance: data.meeting.enable_ai_attendance
       }
 
       setCurrentMeeting(activeMtg)
@@ -375,6 +377,49 @@ export function MeetingProvider({ children }) {
     return data.summary
   }
 
+  // 14. SUBMIT ATTENDANCE RECORD
+  const submitAttendanceRecord = async (record) => {
+    const res = await fetch(`${API_URL}/attendance`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(record),
+      credentials: 'include'
+    })
+    const data = await res.json()
+    if (!res.ok) {
+      throw new Error(data.message || 'Failed to submit attendance.')
+    }
+    return data
+  }
+
+  // 15. GET ATTENDANCE REPORT
+  const getAttendanceReport = async (meetingId) => {
+    const res = await fetch(`${API_URL}/attendance/report/${meetingId}`, {
+      method: 'GET',
+      headers: { 'Content-Type': 'application/json' },
+      credentials: 'include'
+    })
+    const data = await res.json()
+    if (!res.ok) {
+      throw new Error(data.message || 'Failed to retrieve attendance logs.')
+    }
+    return data
+  }
+
+  // 16. CLEAR ATTENDANCE RECORDS (After successful download)
+  const clearAttendanceRecords = async (meetingId) => {
+    const res = await fetch(`${API_URL}/attendance/report/${meetingId}`, {
+      method: 'DELETE',
+      headers: { 'Content-Type': 'application/json' },
+      credentials: 'include'
+    })
+    const data = await res.json()
+    if (!res.ok) {
+      throw new Error(data.message || 'Failed to clear attendance logs.')
+    }
+    return data
+  }
+
   return (
     <MeetingContext.Provider
       value={{
@@ -399,6 +444,9 @@ export function MeetingProvider({ children }) {
         fetchMeetingDetails,
         fetchMeetingParticipants,
         generateMeetingSummary,
+        submitAttendanceRecord,
+        getAttendanceReport,
+        clearAttendanceRecords,
         refreshMeetings
       }}
     >

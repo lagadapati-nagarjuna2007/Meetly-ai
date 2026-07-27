@@ -33,6 +33,7 @@ export default function Home() {
   const [meetingType, setMeetingType] = useState('public')
   const [meetingPassword, setMeetingPassword] = useState('')
   const [enableAiAnalyzer, setEnableAiAnalyzer] = useState(false)
+  const [enableAiAttendance, setEnableAiAttendance] = useState(false)
   
   // Create Success State
   const [createdMtg, setCreatedMtg] = useState(null)
@@ -54,7 +55,8 @@ export default function Home() {
         meetingName.trim(),
         meetingType,
         meetingPassword,
-        enableAiAnalyzer
+        enableAiAnalyzer,
+        enableAiAttendance
       )
       setCreatedMtg(mtg)
       showToast('Meeting created successfully!', 'success')
@@ -97,6 +99,7 @@ export default function Home() {
     setMeetingType('public')
     setMeetingPassword('')
     setEnableAiAnalyzer(false)
+    setEnableAiAttendance(false)
     navigate(`/meeting/${code}`)
   }
 
@@ -316,6 +319,26 @@ export default function Home() {
                 <div
                   className={`w-4 h-4 rounded-full bg-white transition-all duration-300 transform ${
                     enableAiAnalyzer ? 'translate-x-4' : 'translate-x-0'
+                  }`}
+                />
+              </button>
+            </div>
+
+            <div className="flex items-center justify-between p-3.5 bg-white/2 border border-white/5 rounded-2xl mt-1 text-left">
+              <div className="flex flex-col gap-0.5">
+                <span className="text-xs font-bold text-white">Enable AI Attendance</span>
+                <span className="text-[10px] text-gray-500 font-semibold">Automatically calculate participant attendance using AI Face Detection</span>
+              </div>
+              <button
+                type="button"
+                onClick={() => setEnableAiAttendance(!enableAiAttendance)}
+                className={`w-10 h-6 rounded-full p-1 transition-all duration-300 focus:outline-none cursor-pointer shrink-0 ${
+                  enableAiAttendance ? 'bg-[#7c3aed]' : 'bg-slate-800'
+                }`}
+              >
+                <div
+                  className={`w-4 h-4 rounded-full bg-white transition-all duration-300 transform ${
+                    enableAiAttendance ? 'translate-x-4' : 'translate-x-0'
                   }`}
                 />
               </button>
