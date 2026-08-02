@@ -2,6 +2,7 @@ import crypto from 'crypto'
 import bcrypt from 'bcrypt'
 import { AccessToken } from 'livekit-server-sdk'
 import { supabase } from '../config/supabase.js'
+import { clearMeetingCounters } from '../services/aiChat.service.js'
 
 // UUID validation helper
 const isUuid = (val) => {
@@ -322,7 +323,8 @@ export const joinMeeting = async (req, res) => {
     }
 
     if (meeting.meeting_status === 'Ended') {
-      return res.status(400).json({ message: 'Meeting has ended.' })
+      console.log('[Meeting Validation] Join rejected. Meeting already ended.')
+      return res.status(410).json({ success: false, message: 'This meeting has already ended.' })
     }
 
     if (meeting.meeting_status === 'Locked') {
@@ -463,6 +465,11 @@ export const activateMeeting = async (req, res) => {
       return res.status(404).json({ message: 'Meeting not found.' })
     }
 
+    if (meeting.meeting_status === 'Ended') {
+      console.log('[Meeting Validation] Ignoring request because meeting has ended.')
+      return res.status(400).json({ message: 'This meeting has already ended.' })
+    }
+
     if (meeting.meeting_status === 'Waiting') {
       const now = new Date().toISOString()
       const { error: updateErr } = await supabase
@@ -591,6 +598,8 @@ export const endMeeting = async (req, res) => {
 
     if (updatePartsErr) throw updatePartsErr
 
+    clearMeetingCounters(meeting.meeting_id)
+
     console.log(`[End] Meeting ${meeting.meeting_id} ended by host ${req.user.id}. All participants marked as left.`)
 
     return res.status(200).json({ message: 'Meeting ended successfully.' })
@@ -610,8 +619,8 @@ export const lockMeeting = async (req, res) => {
     }
 
     const query = isUuid(meetingId)
-      ? supabase.from('meetings').select('meeting_id, host_id').eq('meeting_id', meetingId)
-      : supabase.from('meetings').select('meeting_id, host_id').eq('meeting_code', meetingId.trim().toUpperCase())
+      ? supabase.from('meetings').select('meeting_id, host_id, meeting_status').eq('meeting_id', meetingId)
+      : supabase.from('meetings').select('meeting_id, host_id, meeting_status').eq('meeting_code', meetingId.trim().toUpperCase())
 
     const { data: meeting, error: fetchErr } = await query.maybeSingle()
 
@@ -619,6 +628,11 @@ export const lockMeeting = async (req, res) => {
 
     if (!meeting) {
       return res.status(404).json({ message: 'Meeting not found.' })
+    }
+
+    if (meeting.meeting_status === 'Ended') {
+      console.log('[Meeting Validation] Ignoring request because meeting has ended.')
+      return res.status(400).json({ message: 'This meeting has already ended.' })
     }
 
     if (meeting.host_id !== req.user.id) {
@@ -792,6 +806,8 @@ export const deleteMeeting = async (req, res) => {
 
     if (deleteMtgErr) throw deleteMtgErr
 
+    clearMeetingCounters(meeting.meeting_id)
+
     console.log(`[Cleanup] Meeting ${meeting.meeting_id} deleted successfully.`)
 
     return res.status(200).json({ message: 'Meeting deleted successfully.' })
@@ -902,6 +918,28 @@ export const submitTranscriptChunk = async (req, res) => {
     if (!meetingId || !speakerName) {
       console.error('[Transcript Chunk Error] Missing meetingId or speakerName')
       return res.status(400).json({ message: 'Meeting ID and speaker name are required.' })
+    }
+
+    // Verify if the meeting exists and is active/waiting/locked
+    const { data: meeting, error: mtgErr } = await supabase
+      .from('meetings')
+      .select('meeting_status')
+      .eq('meeting_id', meetingId)
+      .maybeSingle()
+
+    if (mtgErr) {
+      console.error('[Transcript Chunk Error] Error checking meeting status:', mtgErr)
+      return res.status(500).json({ message: 'Failed to verify meeting status.' })
+    }
+
+    if (!meeting) {
+      console.log('[Meeting Validation] Ignoring request because meeting has ended.')
+      return res.status(400).json({ message: 'This meeting has already ended.' })
+    }
+
+    if (meeting.meeting_status === 'Ended') {
+      console.log('[Meeting Validation] Ignoring request because meeting has ended.')
+      return res.status(400).json({ message: 'This meeting has already ended.' })
     }
 
     if (!req.file) {
@@ -1132,6 +1170,7 @@ export const startRetentionCleanup = () => {
           console.error('[Cleanup Job Error] Failed to hard delete expired meetings:', deleteErr)
         } else {
           console.log('[Cleanup Job] Hard deleted expired meetings and their cascading records successfully.')
+          expiredIds.forEach(id => clearMeetingCounters(id))
         }
       }
     } catch (err) {

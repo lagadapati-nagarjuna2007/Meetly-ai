@@ -36,6 +36,8 @@ import {
   RefreshCw
 } from 'lucide-react'
 
+import AIChatPanel from '../components/AIChatPanel'
+
 // Error Boundary component to catch unhandled React errors in MeetingRoom
 class MeetingErrorBoundary extends React.Component {
   constructor(props) {
@@ -476,6 +478,7 @@ function MeetingRoomContent({
   const [camError, setCamError] = useState(null)
   const [camInitializing, setCamInitializing] = useState(false)
   const [attendanceCamError, setAttendanceCamError] = useState(false)
+  const [isShuttingDown, setIsShuttingDown] = useState(false)
 
   // Drawer Panel Toggles
   const [rightPanelOpen, setRightPanelOpen] = useState(true)
@@ -513,6 +516,11 @@ function MeetingRoomContent({
   const tempAbsenceIncidents = useRef(0)
   const videoRef = useRef(null)
   const attendanceCameraStreamRef = useRef(null)
+  const transcriptMediaRecorderRef = useRef(null)
+  const transcriptStreamRef = useRef(null)
+  const transcriptIntervalRef = useRef(null)
+  const isTranscriptActiveRef = useRef(false)
+  const activeTranscriptUploadsRef = useRef(0)
 
   // Get local camera video track from LiveKit
   const localVideoTrack = localParticipant?.getTrackPublication(Track.Source.Camera)?.videoTrack ||
@@ -629,8 +637,76 @@ function MeetingRoomContent({
     return false
   }
 
+  const stopTranscriptCapture = () => {
+    if (!isTranscriptActiveRef.current) return
+    isTranscriptActiveRef.current = false
+    console.log('[AI Analyzer] Stopping transcript capture (clean shutdown)...')
+
+    // 1. Stop MediaRecorder immediately
+    if (transcriptMediaRecorderRef.current && transcriptMediaRecorderRef.current.state !== 'inactive') {
+      try {
+        transcriptMediaRecorderRef.current.stop()
+      } catch (e) {
+        console.error('[AI Analyzer] Error stopping MediaRecorder:', e)
+      }
+      transcriptMediaRecorderRef.current = null
+    }
+
+    // 2. Stop microphone capture
+    if (transcriptStreamRef.current) {
+      try {
+        transcriptStreamRef.current.getTracks().forEach(track => track.stop())
+      } catch (e) {
+        console.error('[AI Analyzer] Error stopping mic stream tracks:', e)
+      }
+      transcriptStreamRef.current = null
+    }
+
+    // 3. Clear transcript intervals
+    if (transcriptIntervalRef.current) {
+      clearInterval(transcriptIntervalRef.current)
+      transcriptIntervalRef.current = null
+    }
+  }
+
+  const waitPendingTranscriptUploads = () => {
+    return new Promise((resolve) => {
+      if (activeTranscriptUploadsRef.current === 0) {
+        console.log('[Transcript Queue] All uploads finished.')
+        resolve()
+        return
+      }
+
+      console.log('[Transcript Queue] Waiting for uploads...')
+      let checks = 0
+      const checkInterval = setInterval(() => {
+        checks++
+        console.log(`[Transcript Queue] Active uploads: ${activeTranscriptUploadsRef.current}`)
+        if (activeTranscriptUploadsRef.current === 0) {
+          clearInterval(checkInterval)
+          console.log('[Transcript Queue] All uploads finished.')
+          resolve()
+        } else if (checks >= 600) { // 60 seconds safety timeout
+          clearInterval(checkInterval)
+          console.warn('[Transcript Queue Warning] Timeout reached while waiting for transcript uploads. Continuing shutdown safely.')
+          resolve()
+        }
+      }, 100)
+    })
+  }
+
   const cleanupResources = () => {
     console.log('[Attendance] Cleaning up attendance resources...')
+    stopTranscriptCapture()
+    if (socket.current) {
+      console.log('[Cleanup] Disconnecting Socket.IO immediately...')
+      try {
+        socket.current.disconnect()
+      } catch (e) {
+        console.error('[Cleanup Error] Error disconnecting socket:', e)
+      }
+      socket.current = null
+    }
     if (animationFrameIdRef.current) {
       cancelAnimationFrame(animationFrameIdRef.current)
       animationFrameIdRef.current = null
@@ -663,6 +739,9 @@ function MeetingRoomContent({
 
   const handleLeaveWithAttendance = async () => {
     console.log('[Attendance Finalize Trigger] leave-button')
+    setIsShuttingDown(true)
+    stopTranscriptCapture()
+    await waitPendingTranscriptUploads()
     if (meetingData?.enable_ai_attendance) {
       try {
         await uploadAttendance()
@@ -671,13 +750,23 @@ function MeetingRoomContent({
       } finally {
         cleanupResources()
       }
+    } else {
+      cleanupResources()
     }
-    handleLeave()
+    setIsShuttingDown(false)
+    await handleLeave()
   }
   handleLeaveWithAttendanceRef.current = handleLeaveWithAttendance
 
   const handleEndWithAttendance = async () => {
+    if (!meetingData) return
+    const confirmEnd = window.confirm('Are you sure you want to end this meeting for all participants?')
+    if (!confirmEnd) return
+
     console.log('[Attendance Finalize Trigger] host-ended-meeting')
+    setIsShuttingDown(true)
+    stopTranscriptCapture()
+    await waitPendingTranscriptUploads()
     if (meetingData?.enable_ai_attendance) {
       try {
         await uploadAttendance()
@@ -686,8 +775,19 @@ function MeetingRoomContent({
       } finally {
         cleanupResources()
       }
+    } else {
+      cleanupResources()
     }
-    handleEndMeeting()
+    setIsShuttingDown(false)
+
+    try {
+      console.log('[Frontend] Meeting ended. Redirecting user to dashboard.')
+      await endMeeting(meetingData.meeting_id)
+      showToast('Meeting ended successfully.', 'success')
+      navigate('/')
+    } catch (err) {
+      showToast(err.message || 'Failed to end meeting', 'error')
+    }
   }
 
   // 1. MediaPipe Detector Initialization Effect (runs once)
@@ -991,7 +1091,8 @@ function MeetingRoomContent({
   // Dedicated mount/unmount effect for AI Attendance finalization fallback
   useEffect(() => {
     return () => {
-      // On unmount, if it is a participant and has not uploaded yet, do background upload
+      // On unmount, stop transcript capture immediately
+      stopTranscriptCapture()
       const currentMeetingData = meetingDataRef.current
       const currentIsHost = isHostRef.current
       const currentConsent = attendanceConsentRef.current
@@ -1065,15 +1166,18 @@ function MeetingRoomContent({
     }
 
     console.log('[AI Analyzer] AI Analyzer started')
-    let mediaRecorder = null
-    let stream = null
-    let intervalId = null
+    isTranscriptActiveRef.current = true
 
     const startRecording = async () => {
       try {
         console.log('[AI Analyzer] Requesting microphone access stream...')
         // Request dedicated mic stream specifically for recording to prevent interfering with LiveKit
-        stream = await navigator.mediaDevices.getUserMedia({ audio: true })
+        const stream = await navigator.mediaDevices.getUserMedia({ audio: true })
+        if (!isTranscriptActiveRef.current) {
+          stream.getTracks().forEach(track => track.stop())
+          return
+        }
+        transcriptStreamRef.current = stream
         console.log('[AI Analyzer] Microphone access granted successfully.')
         
         // Choose supported mimeType
@@ -1090,10 +1194,12 @@ function MeetingRoomContent({
         console.log('[AI Analyzer] Using MediaRecorder mimeType:', mimeType)
 
         // Setup MediaRecorder
-        mediaRecorder = new MediaRecorder(stream, mimeType ? { mimeType } : undefined)
+        const mediaRecorder = new MediaRecorder(stream, mimeType ? { mimeType } : undefined)
+        transcriptMediaRecorderRef.current = mediaRecorder
         let chunks = []
 
         mediaRecorder.ondataavailable = (e) => {
+          if (!isTranscriptActiveRef.current) return
           if (e.data && e.data.size > 0) {
             chunks.push(e.data)
             console.log('[AI Analyzer] Audio data available:', e.data.size, 'bytes')
@@ -1106,6 +1212,12 @@ function MeetingRoomContent({
           chunks = [] // Reset chunks
 
           console.log('[AI Analyzer] Audio chunk created:', audioBlob.size, 'bytes')
+
+          // Issue 2: Validate audio chunk size (filter out small invalid header-only audio files)
+          if (!audioBlob || audioBlob.size < 1000) {
+            console.log(`[AI Analyzer] Audio chunk too small or invalid (${audioBlob?.size || 0} bytes). Discarding chunk.`)
+            return
+          }
 
           // Analyze simple volume/silence using Web Audio API to prevent empty API calls
           let isSilent = false
@@ -1135,6 +1247,12 @@ function MeetingRoomContent({
             return
           }
 
+          // Prevents new requests if transcript has deactivated
+          if (!isTranscriptActiveRef.current) {
+            console.log('[AI Analyzer] Transcript is deactivated. Skipping chunk upload.')
+            return
+          }
+
           // Send to backend via multipart/form-data
           const formData = new FormData()
           formData.append('file', audioBlob, 'audio.webm')
@@ -1143,6 +1261,8 @@ function MeetingRoomContent({
 
           try {
             console.log('[AI Analyzer] Uploading transcript chunk...')
+            activeTranscriptUploadsRef.current++
+            console.log(`[Transcript Queue] Active uploads: ${activeTranscriptUploadsRef.current}`)
             const apiUrl = import.meta.env.VITE_API_URL || 'http://localhost:5000'
             const res = await fetch(`${apiUrl}/api/meetings/transcript`, {
               method: 'POST',
@@ -1156,6 +1276,10 @@ function MeetingRoomContent({
             }
           } catch (uploadErr) {
             console.error('[AI Analyzer] Upload failed. Network error:', uploadErr)
+          } finally {
+            activeTranscriptUploadsRef.current = Math.max(0, activeTranscriptUploadsRef.current - 1)
+            console.log('[Transcript Queue] Upload completed.')
+            console.log(`[Transcript Queue] Active uploads: ${activeTranscriptUploadsRef.current}`)
           }
         }
 
@@ -1164,13 +1288,14 @@ function MeetingRoomContent({
         console.log('[AI Analyzer] MediaRecorder started')
 
         // Trigger recording slice every 30 seconds
-        intervalId = setInterval(() => {
-          if (mediaRecorder && mediaRecorder.state === 'recording') {
+        const intervalId = setInterval(() => {
+          if (isTranscriptActiveRef.current && mediaRecorder && mediaRecorder.state === 'recording') {
             console.log('[AI Analyzer] Slicing recorder chunk (30s interval)...')
             mediaRecorder.stop()
             mediaRecorder.start()
           }
         }, 30000) // 30 seconds chunks
+        transcriptIntervalRef.current = intervalId
 
       } catch (err) {
         console.error('[AI Analyzer Error] Failed to initialize mic recording:', err)
@@ -1181,16 +1306,7 @@ function MeetingRoomContent({
     startRecording()
 
     return () => {
-      console.log('[AI Analyzer] Stopping transcript capture...')
-      if (intervalId) clearInterval(intervalId)
-      if (mediaRecorder && mediaRecorder.state !== 'inactive') {
-        try {
-          mediaRecorder.stop()
-        } catch (e) {}
-      }
-      if (stream) {
-        stream.getTracks().forEach(track => track.stop())
-      }
+      stopTranscriptCapture()
     }
   }, [meetingData, roomState, user, showToast])
 
@@ -1284,19 +1400,19 @@ function MeetingRoomContent({
         setChatMessages((prev) => [...prev, msg])
       })
 
-      socket.current.on('meeting_ended', () => {
+      socket.current.on('meeting_ended', async () => {
         showToast('The host has ended this meeting.', 'info')
+        console.log('[Frontend] Meeting ended. Redirecting user to dashboard.')
         const currentMeetingData = meetingDataRef.current
         const currentIsHost = isHostRef.current
         if (currentMeetingData?.enable_ai_attendance && !currentIsHost) {
-          console.log('[Attendance Finalize Trigger] host-ended-meeting')
           if (handleLeaveWithAttendanceRef.current) {
-            handleLeaveWithAttendanceRef.current()
+            await handleLeaveWithAttendanceRef.current()
           } else {
-            handleLeaveRef.current()
+            await handleLeaveRef.current()
           }
         } else {
-          handleLeaveRef.current()
+          await handleLeaveRef.current()
         }
       })
 
@@ -1458,6 +1574,30 @@ function MeetingRoomContent({
 
   return (
     <div className="fixed inset-0 z-40 bg-[#04050b] flex flex-col items-stretch overflow-hidden text-left">
+      {(isShuttingDown || meetingData?.meeting_status === 'Ended') && (
+        <div className="absolute inset-0 z-50 bg-[#04050b]/90 backdrop-blur-md flex flex-col items-center justify-center gap-4 text-center">
+          {meetingData?.meeting_status === 'Ended' ? (
+            <>
+              <div className="w-16 h-16 rounded-full bg-red-500/10 border border-red-500/20 flex items-center justify-center text-red-500 text-2xl font-bold">!</div>
+              <div className="text-white text-lg font-semibold">This meeting has ended.</div>
+              <p className="text-gray-400 text-sm max-w-sm">
+                You cannot join, send chat messages, ask AI, or access controls for this meeting because it has already finished.
+              </p>
+              <Button onClick={handleLeave} className="mt-4 px-6 py-2">
+                Back to Dashboard
+              </Button>
+            </>
+          ) : (
+            <>
+              <div className="w-12 h-12 border-4 border-brand-purple border-t-transparent rounded-full animate-spin" />
+              <div className="text-white text-base font-semibold">Finalizing Meeting Details</div>
+              <div className="text-gray-400 text-sm max-w-md">
+                Please wait while the final transcript uploads and calculations complete. Do not close this window.
+              </div>
+            </>
+          )}
+        </div>
+      )}
       {/* Top Header Panel */}
       <header className="h-14 border-b border-white/5 bg-[#080913] px-6 flex items-center justify-between shrink-0 select-none">
         <div className="flex items-center gap-3">
@@ -1686,31 +1826,7 @@ function MeetingRoomContent({
 
               {/* TAB: AI ASSISTANT */}
               {activeTab === 'ai' && (
-                <div className="flex flex-col gap-3 h-full justify-between">
-                  <div className="flex-1 overflow-y-auto flex flex-col gap-3">
-                    {aiResponses.map((msg, idx) => (
-                      <div key={idx} className={`flex gap-2 max-w-[90%] ${msg.sender === 'user' ? 'self-end flex-row-reverse' : 'self-start'}`}>
-                        <div className={`w-6 h-6 rounded-full flex items-center justify-center shrink-0 border ${msg.sender === 'user' ? 'bg-brand-blue/10 border-brand-blue/20 text-brand-blue' : 'bg-brand-purple/10 border-brand-purple/20 text-brand-purple'}`}>
-                          {msg.sender === 'user' ? <Users size={12} /> : <Bot size={12} />}
-                        </div>
-                        <p className={`p-2.5 rounded-xl text-xs leading-normal ${msg.sender === 'user' ? 'bg-brand-blue text-white' : 'bg-white/3 text-gray-200 border border-white/5'}`}>{msg.text}</p>
-                      </div>
-                    ))}
-                  </div>
-
-                  <form onSubmit={handleAskAI} className="flex items-center gap-2 border-t border-white/5 pt-3">
-                    <input
-                      type="text"
-                      placeholder="Ask meeting bot..."
-                      value={aiInput}
-                      onChange={(e) => setAiInput(e.target.value)}
-                      className="flex-1 bg-slate-900/40 border border-white/10 rounded-xl px-3 py-2 text-xs text-white placeholder-gray-500 focus:outline-none focus:border-brand-purple transition-all duration-200"
-                    />
-                    <Button type="submit" className="px-3 py-2 shrink-0">
-                      <Sparkles size={12} />
-                    </Button>
-                  </form>
-                </div>
+                <AIChatPanel meetingId={meetingData.meeting_id} />
               )}
             </div>
           </div>

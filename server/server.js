@@ -7,8 +7,10 @@ import cookieParser from 'cookie-parser'
 import { Server } from 'socket.io'
 import authRoutes from './routes/auth.js'
 import meetingRoutes from './routes/meetings.js'
+import aiChatRoutes from './routes/aiChat.routes.js'
 import { supabase } from './config/supabase.js'
 import { startRetentionCleanup } from './controllers/meetingController.js'
+import { clearMeetingCounters } from './services/aiChat.service.js'
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url))
 dotenv.config({ path: path.resolve(__dirname, '../.env') })
@@ -45,6 +47,8 @@ app.use(cookieParser())
 app.use('/api/auth', authRoutes)
 app.use('/api/meeting', meetingRoutes)
 app.use('/api/meetings', meetingRoutes)
+app.use('/api/meetings', aiChatRoutes)
+app.use('/api/meeting', aiChatRoutes)
 
 // Server Health Check endpoint
 app.get('/health', (req, res) => {
@@ -143,6 +147,7 @@ io.on('connection', (socket) => {
                   .from('meetings')
                   .update({ meeting_status: 'Ended', ended_at: now, updated_at: now })
                   .eq('meeting_id', meeting.meeting_id)
+                clearMeetingCounters(meeting.meeting_id)
               }
             }
           } catch (err) {
