@@ -25,7 +25,8 @@ const allowedOrigins = [
   'http://localhost:5174',
   'http://127.0.0.1:5173',
   'http://127.0.0.1:5174',
-  'https://uneaten-unsheathe-waviness.ngrok-free.dev'
+  'https://uneaten-unsheathe-waviness.ngrok-free.dev',
+  'https://meetly-ai-platform.netlify.app'
 ]
 
 app.use(
