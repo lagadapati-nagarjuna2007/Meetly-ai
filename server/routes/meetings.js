@@ -19,6 +19,14 @@ import {
   getAttendanceReport,
   deleteAttendanceRecords
 } from '../controllers/meetingController.js'
+import {
+  getPendingRequests,
+  acceptJoinRequest,
+  rejectJoinRequest,
+  banDevice,
+  toggleAutoAdmit,
+  removeParticipant
+} from '../controllers/securityController.js'
 import { authenticateToken } from '../middleware/auth.js'
 
 const upload = multer({ storage: multer.memoryStorage() })
@@ -41,6 +49,14 @@ router.post('/summary/generate', generateSummary)
 router.post('/attendance', submitAttendance)
 router.get('/attendance/report/:meetingId', getAttendanceReport)
 router.delete('/attendance/report/:meetingId', deleteAttendanceRecords)
+
+// Meeting Security management routes
+router.get('/security/pending/:meetingCode', getPendingRequests)
+router.post('/security/accept', acceptJoinRequest)
+router.post('/security/reject', rejectJoinRequest)
+router.post('/security/ban-device', banDevice)
+router.post('/security/toggle-auto-admit', toggleAutoAdmit)
+router.post('/security/remove', removeParticipant)
 
 // Details and metadata endpoints
 router.get('/details/:meetingId', getMeetingDetails)

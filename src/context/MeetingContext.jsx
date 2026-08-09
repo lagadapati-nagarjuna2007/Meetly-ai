@@ -119,7 +119,7 @@ export function MeetingProvider({ children }) {
 
   // 3. JOIN MEETING
   // Idempotent join: returns LiveKit token and meeting state
-  const joinMeeting = async (code, password = '') => {
+  const joinMeeting = async (code, password = '', deviceFingerprint = '') => {
     if (joiningRef.current) {
       console.log('[MeetingContext] Join meeting already in-flight for code:', code)
       return currentMeeting
@@ -136,7 +136,8 @@ export function MeetingProvider({ children }) {
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
           meetingCode: code,
-          password
+          password,
+          deviceFingerprint
         }),
         credentials: 'include'
       })
@@ -144,6 +145,11 @@ export function MeetingProvider({ children }) {
       const data = await res.json()
       if (!res.ok) {
         throw new Error(data.message || 'Failed to join meeting')
+      }
+
+      if (data.status === 'waiting') {
+        console.log('[MeetingContext] Join pending. User placed in waiting room.')
+        return { status: 'waiting', message: data.message }
       }
 
       console.log('[MeetingContext] joinMeeting backend success. Setting currentMeeting and LiveKit token...')
@@ -427,6 +433,8 @@ export function MeetingProvider({ children }) {
         currentMeeting,
         livekitToken,
         livekitUrl,
+        setLivekitToken,
+        setLivekitUrl,
         roomName,
         isLoading,
         isCreatingMeeting,

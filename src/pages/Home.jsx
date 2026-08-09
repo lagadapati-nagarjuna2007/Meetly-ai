@@ -74,12 +74,31 @@ export default function Home() {
     }
 
     try {
-      const mtg = await joinMeeting(joinId.trim(), joinPassword)
-      showToast('Joined meeting successfully!', 'success')
+      let deviceFingerprint = ''
+      try {
+        console.log('[Security] Browser fingerprint generated.')
+        const FingerprintJS = (await import('@fingerprintjs/fingerprintjs')).default
+        const fp = await FingerprintJS.load()
+        const fpResult = await fp.get()
+        deviceFingerprint = fpResult.visitorId
+      } catch (fpErr) {
+        console.error('[Security Error] Failed to generate browser fingerprint:', fpErr)
+      }
+
+      const code = joinId.trim().toUpperCase()
+      const mtg = await joinMeeting(code, joinPassword, deviceFingerprint)
+      
       setIsJoinOpen(false)
       setJoinId('')
       setJoinPassword('')
-      navigate(`/meeting/${mtg.id}`)
+
+      if (mtg && mtg.status === 'waiting') {
+        showToast('Waiting for host approval.', 'info')
+        navigate(`/meeting/${code}`)
+      } else {
+        showToast('Joined meeting successfully!', 'success')
+        navigate(`/meeting/${mtg.id}`)
+      }
     } catch (err) {
       showToast(err.message || 'Failed to join meeting', 'error')
     }

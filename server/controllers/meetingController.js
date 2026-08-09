@@ -3,6 +3,8 @@ import bcrypt from 'bcrypt'
 import { AccessToken } from 'livekit-server-sdk'
 import { supabase } from '../config/supabase.js'
 import { clearMeetingCounters } from '../services/aiChat.service.js'
+import { scheduleCleanup, cancelCleanup } from '../services/meetingCleanup.js'
+import { authorizeHost } from '../utils/authHelper.js'
 
 // UUID validation helper
 const isUuid = (val) => {
@@ -104,13 +106,15 @@ const cleanupStaleMeetings = async (userId, isCreateIntent = false) => {
 
 // Check if a user is currently in an active meeting.
 // Returns meeting_id ONLY if participant_status='joined' AND meeting_status='Active'.
-const getUserActiveMeetingId = async (userId) => {
+const getUserActiveMeetingId = async (userId, excludeMeetingId = null) => {
   try {
     const { data: activeParticipants, error } = await supabase
       .from('participants')
-      .select('meeting_id, participant_id, meetings(meeting_status)')
+      .select('meeting_id, participant_id, meetings!inner(meeting_status, is_deleted)')
       .eq('user_id', userId)
       .eq('participant_status', 'joined')
+      .eq('meetings.meeting_status', 'Active')
+      .eq('meetings.is_deleted', false)
 
     if (error) {
       console.error('[Validation Error] Checking active meeting status failed:', error)
@@ -118,19 +122,20 @@ const getUserActiveMeetingId = async (userId) => {
     }
 
     if (!activeParticipants || activeParticipants.length === 0) {
-      console.log(`[Validation Debug] User ${userId}: no 'joined' participant records found. User is free.`)
+      console.log(`[Validation Debug] User ${userId}: no 'joined' participant records found in active meetings. User is free.`)
       return null
     }
 
-    // Only block if associated meeting_status is 'Active'
-    const active = activeParticipants.find(p => p.meetings?.meeting_status === 'Active')
-    if (active) {
-      console.log(`[Validation Block] User ${userId} IS in active meeting ${active.meeting_id}. Blocking.`)
-      return active.meeting_id
+    const active = activeParticipants[0]
+
+    // If the active meeting is the one we want to exclude (e.g. re-joining), do not block
+    if (excludeMeetingId && active.meeting_id === excludeMeetingId) {
+      console.log(`[Validation Debug] User ${userId} is already in the target meeting ${excludeMeetingId}. Re-join allowed.`)
+      return null
     }
 
-    console.log(`[Validation Pass] User ${userId} has joined records but none in 'Active' meetings. User is free.`)
-    return null
+    console.log(`[Validation Block] User ${userId} IS in active meeting ${active.meeting_id}. Blocking.`)
+    return active.meeting_id
   } catch (err) {
     console.error('[Validation Error] Unexpected error in getUserActiveMeetingId:', err)
     return null
@@ -271,6 +276,10 @@ export const createMeeting = async (req, res) => {
 
     console.log(`[Create Token Issued] Host ${req.user.id} issued LiveKit token for room ${roomName}`)
 
+    // Structured Audit Logging
+    const timestamp = new Date().toISOString()
+    console.log(`[Audit Log] Action: Meeting Created | Timestamp: ${timestamp} | MeetingCode: ${code} | HostId: ${req.user.id}`)
+
     return res.status(200).json({
       message: 'Meeting created successfully.',
       meetingId: createdMeetingId,
@@ -298,15 +307,16 @@ export const createMeeting = async (req, res) => {
 // Idempotent join: Upsert participant -> Issue LiveKit Token -> Return
 export const joinMeeting = async (req, res) => {
   try {
-    const { meetingCode, password } = req.body
+    const { meetingCode, password, deviceFingerprint } = req.body
 
     if (!meetingCode || !meetingCode.trim()) {
       return res.status(400).json({ message: 'Meeting code is required.' })
     }
 
     const uppercaseCode = meetingCode.trim().toUpperCase()
+    const fingerprint = (deviceFingerprint || '').trim()
 
-    console.log(`[Join Meeting] User ${req.user.id} joining code: ${uppercaseCode}`)
+    console.log(`[Join Meeting] User ${req.user.id} joining code: ${uppercaseCode} | fingerprint: ${fingerprint}`)
 
     // Fetch meeting by code
     const { data: meeting, error: fetchErr } = await supabase
@@ -331,12 +341,31 @@ export const joinMeeting = async (req, res) => {
       return res.status(400).json({ message: 'Meeting is locked by the host.' })
     }
 
+    // Step 0: Check Device Ban
+    if (fingerprint) {
+      const { data: banRecord, error: banCheckErr } = await supabase
+        .from('meeting_device_bans')
+        .select('*')
+        .eq('meeting_code', uppercaseCode)
+        .eq('device_fingerprint', fingerprint)
+        .maybeSingle()
+
+      if (banCheckErr) throw banCheckErr
+      if (banRecord) {
+        console.log(`[Security] Join rejected. Device is banned. fingerprint: ${fingerprint}`)
+        return res.status(403).json({
+          success: false,
+          message: 'This device has been blocked by the meeting host.'
+        })
+      }
+    }
+
     // Step 1: Clean up stale state before checking
     await cleanupStaleMeetings(req.user.id, false)
 
     // Step 2: Block only if user is in a DIFFERENT active meeting
-    const activeMeetingId = await getUserActiveMeetingId(req.user.id)
-    if (activeMeetingId && activeMeetingId !== meeting.meeting_id) {
+    const activeMeetingId = await getUserActiveMeetingId(req.user.id, meeting.meeting_id)
+    if (activeMeetingId) {
       console.log(`[Join Block] User ${req.user.id} blocked: active in meeting ${activeMeetingId}`)
       return res.status(400).json({ message: 'You are already in a meeting.' })
     }
@@ -352,10 +381,75 @@ export const joinMeeting = async (req, res) => {
       }
     }
 
-    // Step 4: Idempotent Participant Upsert
     const isHost = meeting.host_id === req.user.id
     const role = isHost ? 'host' : 'participant'
 
+    // Step 3.5: Handle Waiting Room / Auto Admit Setting
+    if (meeting.auto_admit === false && !isHost) {
+      // Check if user is already joined (to handle reconnects / refreshes)
+      const { data: currentPart } = await supabase
+        .from('participants')
+        .select('participant_status')
+        .eq('meeting_id', meeting.meeting_id)
+        .eq('user_id', req.user.id)
+        .maybeSingle()
+
+      // The rejoin exception satisfies: participant row exists and status is joined or left
+      const isApprovedRejoin = currentPart && (currentPart.participant_status === 'joined' || currentPart.participant_status === 'left')
+
+      if (!isApprovedRejoin) {
+        // Check if there is already a pending request
+        const { data: existingRequest, error: reqErr } = await supabase
+          .from('meeting_join_requests')
+          .select('*')
+          .eq('meeting_code', uppercaseCode)
+          .eq('user_id', req.user.id)
+          .maybeSingle()
+
+        if (reqErr) throw reqErr
+        if (existingRequest) {
+          console.log(`[Security] Duplicate join request blocked for user ${req.user.id}`)
+          return res.status(200).json({
+            success: true,
+            status: 'waiting',
+            message: 'Your join request is already waiting for host approval.'
+          })
+        }
+
+        // Create a new pending request
+        const { error: insertReqErr } = await supabase
+          .from('meeting_join_requests')
+          .insert([
+            {
+              meeting_code: uppercaseCode,
+              user_id: req.user.id,
+              device_fingerprint: fingerprint || 'unknown-fingerprint',
+              status: 'pending'
+            }
+          ])
+
+        if (insertReqErr) throw insertReqErr
+
+        // Structured Audit Logging
+        const reqTimestamp = new Date().toISOString()
+        console.log(`[Audit Log] Action: Waiting Request Created | Timestamp: ${reqTimestamp} | MeetingCode: ${uppercaseCode} | ParticipantId: ${req.user.id}`)
+
+        // Notify Host immediately using Socket.IO
+        const io = req.app.get('io')
+        if (io) {
+          console.log(`[Security] Emitting waiting_list_updated for request from user ${req.user.id}`)
+          io.to(meeting.room_name).emit('waiting_list_updated')
+        }
+
+        return res.status(200).json({
+          success: true,
+          status: 'waiting',
+          message: 'Waiting for host approval.'
+        })
+      }
+    }
+
+    // Step 4: Idempotent Participant Upsert
     const { data: existingParticipant } = await supabase
       .from('participants')
       .select('*')
@@ -369,7 +463,8 @@ export const joinMeeting = async (req, res) => {
         .update({
           participant_status: 'joined',
           joined_at: new Date().toISOString(),
-          left_at: null
+          left_at: null,
+          device_fingerprint: fingerprint
         })
         .eq('participant_id', existingParticipant.participant_id)
 
@@ -384,7 +479,8 @@ export const joinMeeting = async (req, res) => {
             user_id: req.user.id,
             role,
             participant_status: 'joined',
-            joined_at: new Date().toISOString()
+            joined_at: new Date().toISOString(),
+            device_fingerprint: fingerprint
           }
         ])
 
@@ -396,7 +492,8 @@ export const joinMeeting = async (req, res) => {
             .update({
               participant_status: 'joined',
               joined_at: new Date().toISOString(),
-              left_at: null
+              left_at: null,
+              device_fingerprint: fingerprint
             })
             .eq('meeting_id', meeting.meeting_id)
             .eq('user_id', req.user.id)
@@ -429,6 +526,8 @@ export const joinMeeting = async (req, res) => {
     })
 
     const token = await at.toJwt()
+
+    cancelCleanup(meeting.meeting_id)
 
     console.log(`[Join Success] User ${req.user.id} joined meeting ${meeting.meeting_code}`)
 
@@ -485,6 +584,8 @@ export const activateMeeting = async (req, res) => {
       console.log(`[Activate] Meeting ${meeting.meeting_id} transitioned from 'Waiting' -> 'Active'`)
     }
 
+    cancelCleanup(meeting.meeting_id)
+
     return res.status(200).json({ message: 'Meeting is now active.' })
   } catch (err) {
     console.error('Activate meeting error:', err)
@@ -535,11 +636,7 @@ export const leaveMeeting = async (req, res) => {
       .eq('participant_status', 'joined')
 
     if (!remaining || remaining.length === 0) {
-      console.log(`[Cleanup] Meeting ${meeting.meeting_id} ended because no active participants.`)
-      await supabase
-        .from('meetings')
-        .update({ meeting_status: 'Ended', ended_at: now, updated_at: now })
-        .eq('meeting_id', meeting.meeting_id)
+      scheduleCleanup(meeting.meeting_id, meeting.meeting_code, meeting.room_name)
     }
 
     return res.status(200).json({ message: 'Left meeting successfully.' })
@@ -554,25 +651,11 @@ export const endMeeting = async (req, res) => {
   try {
     const { meetingId } = req.body
 
-    if (!meetingId) {
-      return res.status(400).json({ message: 'Meeting identifier is required.' })
+    const auth = await authorizeHost(meetingId, req.user.id)
+    if (!auth.passed) {
+      return res.status(auth.status).json({ message: auth.message })
     }
-
-    const query = isUuid(meetingId)
-      ? supabase.from('meetings').select('meeting_id, host_id').eq('meeting_id', meetingId)
-      : supabase.from('meetings').select('meeting_id, host_id').eq('meeting_code', meetingId.trim().toUpperCase())
-
-    const { data: meeting, error: fetchErr } = await query.maybeSingle()
-
-    if (fetchErr) throw fetchErr
-
-    if (!meeting) {
-      return res.status(404).json({ message: 'Meeting not found.' })
-    }
-
-    if (meeting.host_id !== req.user.id) {
-      return res.status(403).json({ message: 'Unauthorized. Only the host can end the meeting.' })
-    }
+    const meeting = auth.meeting
 
     const now = new Date().toISOString()
 
@@ -598,6 +681,16 @@ export const endMeeting = async (req, res) => {
 
     if (updatePartsErr) throw updatePartsErr
 
+    // Clean up security records
+    if (meeting.meeting_code) {
+      await supabase.from('meeting_device_bans').delete().eq('meeting_code', meeting.meeting_code)
+      await supabase.from('meeting_join_requests').delete().eq('meeting_code', meeting.meeting_code)
+      console.log(`[Security] Waiting room and device bans cleaned for ended meeting ${meeting.meeting_code}`)
+
+      // Structured Audit Logging
+      console.log(`[Audit Log] Action: Meeting Ended | Timestamp: ${now} | MeetingCode: ${meeting.meeting_code} | HostId: ${req.user.id}`)
+    }
+
     clearMeetingCounters(meeting.meeting_id)
 
     console.log(`[End] Meeting ${meeting.meeting_id} ended by host ${req.user.id}. All participants marked as left.`)
@@ -614,29 +707,15 @@ export const lockMeeting = async (req, res) => {
   try {
     const { meetingId, isLocked } = req.body
 
-    if (!meetingId) {
-      return res.status(400).json({ message: 'Meeting identifier is required.' })
+    const auth = await authorizeHost(meetingId, req.user.id)
+    if (!auth.passed) {
+      return res.status(auth.status).json({ message: auth.message })
     }
-
-    const query = isUuid(meetingId)
-      ? supabase.from('meetings').select('meeting_id, host_id, meeting_status').eq('meeting_id', meetingId)
-      : supabase.from('meetings').select('meeting_id, host_id, meeting_status').eq('meeting_code', meetingId.trim().toUpperCase())
-
-    const { data: meeting, error: fetchErr } = await query.maybeSingle()
-
-    if (fetchErr) throw fetchErr
-
-    if (!meeting) {
-      return res.status(404).json({ message: 'Meeting not found.' })
-    }
+    const meeting = auth.meeting
 
     if (meeting.meeting_status === 'Ended') {
       console.log('[Meeting Validation] Ignoring request because meeting has ended.')
       return res.status(400).json({ message: 'This meeting has already ended.' })
-    }
-
-    if (meeting.host_id !== req.user.id) {
-      return res.status(403).json({ message: 'Unauthorized. Only the host can lock/unlock meetings.' })
     }
 
     const newStatus = isLocked ? 'Locked' : 'Active'
@@ -739,21 +818,11 @@ export const renameMeeting = async (req, res) => {
       return res.status(400).json({ message: 'Meeting title is required.' })
     }
 
-    const query = isUuid(id)
-      ? supabase.from('meetings').select('meeting_id, host_id').eq('meeting_id', id)
-      : supabase.from('meetings').select('meeting_id, host_id').eq('meeting_code', id.trim().toUpperCase())
-
-    const { data: meeting, error: fetchErr } = await query.maybeSingle()
-
-    if (fetchErr) throw fetchErr
-
-    if (!meeting) {
-      return res.status(404).json({ message: 'Meeting not found.' })
+    const auth = await authorizeHost(id, req.user.id)
+    if (!auth.passed) {
+      return res.status(auth.status).json({ message: auth.message })
     }
-
-    if (meeting.host_id !== req.user.id) {
-      return res.status(403).json({ message: 'Unauthorized. Only the host can rename the meeting.' })
-    }
+    const meeting = auth.meeting
 
     const { error: updateErr } = await supabase
       .from('meetings')
@@ -774,20 +843,17 @@ export const deleteMeeting = async (req, res) => {
   try {
     const { id } = req.params
 
-    const query = isUuid(id)
-      ? supabase.from('meetings').select('meeting_id, host_id').eq('meeting_id', id)
-      : supabase.from('meetings').select('meeting_id, host_id').eq('meeting_code', id.trim().toUpperCase())
-
-    const { data: meeting, error: fetchErr } = await query.maybeSingle()
-
-    if (fetchErr) throw fetchErr
-
-    if (!meeting) {
-      return res.status(404).json({ message: 'Meeting not found.' })
+    const auth = await authorizeHost(id, req.user.id)
+    if (!auth.passed) {
+      return res.status(auth.status).json({ message: auth.message })
     }
+    const meeting = auth.meeting
 
-    if (meeting.host_id !== req.user.id) {
-      return res.status(403).json({ message: 'Unauthorized. Only the host can delete the meeting.' })
+    // Clean up security records
+    if (meeting.meeting_code) {
+      await supabase.from('meeting_device_bans').delete().eq('meeting_code', meeting.meeting_code)
+      await supabase.from('meeting_join_requests').delete().eq('meeting_code', meeting.meeting_code)
+      console.log(`[Security] Waiting room and device bans cleaned for deleted meeting ${meeting.meeting_code}`)
     }
 
     // Delete related participants first to satisfy foreign key constraints

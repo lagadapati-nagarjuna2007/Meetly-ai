@@ -101,6 +101,8 @@ function MeetingRoomInner() {
     activateMeeting,
     livekitToken,
     livekitUrl,
+    setLivekitToken,
+    setLivekitUrl,
     joinMeeting
   } = useMeetings()
   const { showToast } = useToast()
@@ -108,10 +110,57 @@ function MeetingRoomInner() {
 
   const [meetingData, setMeetingData] = useState(null)
   const [isHost, setIsHost] = useState(false)
+  const isHostRef = useRef(isHost)
+  useEffect(() => {
+    isHostRef.current = isHost
+  }, [isHost])
+  const [isWaitingForApproval, setIsWaitingForApproval] = useState(false)
   const [isLoading, setIsLoading] = useState(true)
   const [roomError, setRoomError] = useState(null)
   const [attendanceConsent, setAttendanceConsent] = useState(null)
   const joinAttemptedRef = useRef(false)
+
+  const [chatMessages, setChatMessages] = useState([
+    { name: 'System', text: 'Welcome to the meeting room. Chat messages and AI queries are enabled.' }
+  ])
+  const [typingUsers, setTypingUsers] = useState({})
+  const socket = useRef(null)
+  const handleLeaveWithAttendanceRef = useRef(null)
+
+  const [waitingRequests, setWaitingRequests] = useState([])
+
+  const fetchWaitingRequests = useCallback(async () => {
+    if (!meetingData?.meeting_code) return
+    try {
+      const res = await fetch(`${import.meta.env.VITE_API_URL || 'http://localhost:5000'}/api/meetings/security/pending/${meetingData.meeting_code}`, {
+        credentials: 'include'
+      })
+      const data = await res.json()
+      if (res.ok && data.success) {
+        setWaitingRequests(data.requests || [])
+      }
+    } catch (err) {
+      console.error('[Security] Failed to fetch waiting requests:', err)
+    }
+  }, [meetingData?.meeting_code])
+
+  const fetchWaitingRequestsRef = useRef(fetchWaitingRequests)
+  useEffect(() => {
+    fetchWaitingRequestsRef.current = fetchWaitingRequests
+  }, [fetchWaitingRequests])
+
+  const handleLeaveRef = useRef(null)
+
+  const enableAiAttendanceRef = useRef(meetingData?.enable_ai_attendance)
+  useEffect(() => {
+    enableAiAttendanceRef.current = meetingData?.enable_ai_attendance
+  }, [meetingData?.enable_ai_attendance])
+
+  useEffect(() => {
+    if (meetingData && isHost) {
+      fetchWaitingRequests()
+    }
+  }, [meetingData, isHost, fetchWaitingRequests])
 
   console.log('[MeetingRoom Render] id:', id, 'isLoading:', isLoading, 'hasMeetingData:', !!meetingData, 'hasToken:', !!livekitToken, 'roomError:', roomError)
 
@@ -175,9 +224,27 @@ function MeetingRoomInner() {
           }
         }, 15000)
 
+        let fingerprint = ''
         try {
-          await joinMeeting(meetingData.meeting_code)
-          console.log('[MeetingRoom useEffect 2] joinMeeting succeeded')
+          console.log('[Security] Browser fingerprint generated.')
+          const FingerprintJS = (await import('@fingerprintjs/fingerprintjs')).default
+          const fp = await FingerprintJS.load()
+          const fpResult = await fp.get()
+          fingerprint = fpResult.visitorId
+        } catch (fpErr) {
+          console.error('[Security Error] Failed to generate browser fingerprint:', fpErr)
+        }
+
+        try {
+          const res = await joinMeeting(meetingData.meeting_code, '', fingerprint)
+          if (res && res.status === 'waiting') {
+            console.log('[MeetingRoom useEffect 2] Join pending approval, entering waiting room.')
+            if (timeoutId) clearTimeout(timeoutId)
+            setIsWaitingForApproval(true)
+            setIsLoading(false)
+          } else {
+            console.log('[MeetingRoom useEffect 2] joinMeeting succeeded')
+          }
         } catch (err) {
           console.error('[MeetingRoom useEffect 2] Session recovery/join failed:', err)
           joinAttemptedRef.current = false
@@ -185,7 +252,7 @@ function MeetingRoomInner() {
           setRoomError(msg)
           showToast(msg, 'error')
         } finally {
-          if (timeoutId) clearTimeout(timeoutId)
+          if (timeoutId && !isWaitingForApproval) clearTimeout(timeoutId)
         }
       }
     }
@@ -195,14 +262,14 @@ function MeetingRoomInner() {
     return () => {
       if (timeoutId) clearTimeout(timeoutId)
     }
-  }, [meetingData, livekitToken, joinMeeting, showToast, attendanceConsent])
+  }, [meetingData, livekitToken, joinMeeting, showToast, attendanceConsent, isWaitingForApproval])
 
   // 3. Browser Tab Close & Refresh Handling (sendBeacon)
   useEffect(() => {
     const handleBeforeUnload = () => {
       if (meetingData?.meeting_id) {
         console.log('[Unload] Sending beacon for leaveMeeting:', meetingData.meeting_id)
-        const apiUrl = `${import.meta.env.VITE_API_URL || 'http://localhost:5000'}/api/meeting/leave?meetingId=${meetingData.meeting_id}`
+        const apiUrl = `${import.meta.env.VITE_API_URL || 'http://localhost:5000'}/api/meetings/leave?meetingId=${meetingData.meeting_id}`
         navigator.sendBeacon(apiUrl)
       }
     }
@@ -225,6 +292,10 @@ function MeetingRoomInner() {
     showToast('You left the meeting.', 'info')
     navigate('/')
   }, [meetingData, leaveMeeting, navigate, showToast])
+
+  useEffect(() => {
+    handleLeaveRef.current = handleLeave
+  }, [handleLeave])
 
   const handleEndMeeting = useCallback(async () => {
     if (!meetingData) return
@@ -280,6 +351,136 @@ function MeetingRoomInner() {
     navigator.clipboard.writeText(link)
     showToast('Meeting link copied!', 'success')
   }, [meetingData, showToast])
+
+
+
+  // Configure Socket.IO connection
+  useEffect(() => {
+    if (!meetingData?.room_name) return
+    console.log('[MeetingRoomInner useEffect socket] Initializing Socket.IO for room:', meetingData.room_name)
+    const socketUrl = import.meta.env.VITE_API_URL || 'http://localhost:5000'
+
+    try {
+      socket.current = io(socketUrl, {
+        withCredentials: true
+      })
+
+      // Register room
+      socket.current.emit('join_room', meetingData.room_name)
+
+      // WebSocket listeners
+      socket.current.on('receive_message', (msg) => {
+        setChatMessages((prev) => [...prev, msg])
+      })
+
+      socket.current.on('participant_accepted', ({ userId, token, livekitUrl }) => {
+        const currentUserId = user?.id
+        console.log('[Security Socket] participant_accepted received for user:', userId, 'current user:', currentUserId)
+        if (currentUserId && userId === currentUserId) {
+          showToast('Admitted to meeting by host!', 'success')
+          setLivekitToken(token)
+          setLivekitUrl(livekitUrl)
+          setIsWaitingForApproval(false)
+        }
+      })
+
+      socket.current.on('participant_rejected', ({ userId }) => {
+        const currentUserId = user?.id
+        console.log('[Security Socket] participant_rejected received for user:', userId, 'current user:', currentUserId)
+        if (currentUserId && userId === currentUserId) {
+          showToast('Host rejected your join request.', 'error')
+          if (socket.current) {
+            socket.current.disconnect()
+            socket.current = null
+          }
+          navigate('/')
+        }
+      })
+
+      socket.current.on('participant_banned', ({ userId }) => {
+        const currentUserId = user?.id
+        console.log('[Security Socket] participant_banned received for user:', userId, 'current user:', currentUserId)
+        if (currentUserId && userId === currentUserId) {
+          showToast('This device has been blocked by the meeting host.', 'error')
+          if (socket.current) {
+            socket.current.disconnect()
+            socket.current = null
+          }
+          setLivekitToken(null)
+          setLivekitUrl(null)
+          navigate('/')
+        }
+      })
+
+      socket.current.on('participant_removed', ({ userId }) => {
+        const currentUserId = user?.id
+        console.log('[Security Socket] participant_removed received for user:', userId, 'current user:', currentUserId)
+        if (currentUserId && userId === currentUserId) {
+          showToast('You have been removed from the meeting.', 'info')
+          if (socket.current) {
+            socket.current.disconnect()
+            socket.current = null
+          }
+          setLivekitToken(null)
+          setLivekitUrl(null)
+          navigate('/')
+        }
+      })
+
+      socket.current.on('waiting_list_updated', () => {
+        console.log('[Security Socket] waiting_list_updated received.')
+        if (isHostRef.current) {
+          if (fetchWaitingRequestsRef.current) {
+            fetchWaitingRequestsRef.current()
+          }
+        }
+      })
+
+      socket.current.on('meeting_ended', async () => {
+        showToast('The host has ended this meeting.', 'info')
+        console.log('[Frontend] Meeting ended. Redirecting user to dashboard.')
+        if (enableAiAttendanceRef.current && !isHostRef.current) {
+          if (handleLeaveWithAttendanceRef.current) {
+            await handleLeaveWithAttendanceRef.current()
+          } else {
+            if (handleLeaveRef.current) {
+              await handleLeaveRef.current()
+            }
+          }
+        } else {
+          if (handleLeaveRef.current) {
+            await handleLeaveRef.current()
+          }
+        }
+      })
+
+      socket.current.on('meeting_locked', ({ isLocked }) => {
+        showToast(isLocked ? 'The meeting is now locked by the host.' : 'The meeting is now unlocked by the host.', 'info')
+        setMeetingData((prev) => (prev ? { ...prev, meeting_status: isLocked ? 'Locked' : 'Active' } : null))
+      })
+
+      socket.current.on('typing', ({ name, isTyping }) => {
+        setTypingUsers((prev) => {
+          const next = { ...prev }
+          if (isTyping) {
+            next[name] = true
+          } else {
+            delete next[name]
+          }
+          return next
+        })
+      })
+    } catch (socketErr) {
+      console.error('[MeetingRoomInner useEffect socket] Socket.IO initialization error:', socketErr)
+    }
+
+    return () => {
+      if (socket.current) {
+        console.log('[MeetingRoomInner useEffect socket] Disconnecting socket...')
+        socket.current.disconnect()
+      }
+    }
+  }, [meetingData?.room_name])
 
   // Error UI
   if (roomError) {
@@ -371,6 +572,31 @@ function MeetingRoomInner() {
     )
   }
 
+  // Waiting Room UI
+  if (isWaitingForApproval) {
+    return (
+      <div className="fixed inset-0 z-50 bg-[#04050b] flex flex-col items-center justify-center p-6 text-center select-none">
+        <div className="max-w-md w-full bg-slate-900 border border-white/10 rounded-2xl p-8 flex flex-col items-center gap-6 shadow-2xl">
+          <div className="w-16 h-16 rounded-full bg-purple-500/10 border border-purple-500/20 flex items-center justify-center text-purple-400 text-3xl font-bold animate-pulse">
+            ⏳
+          </div>
+          <div className="flex flex-col gap-2">
+            <h2 className="text-base font-bold text-white">Waiting for Host Approval</h2>
+            <p className="text-xs text-gray-400 max-w-xs mx-auto">
+              You will join the meeting automatically once the host accepts your request.
+            </p>
+          </div>
+          <button
+            onClick={handleLeave}
+            className="px-6 py-2 bg-slate-800 hover:bg-slate-700 text-gray-300 rounded-xl text-xs font-bold transition-all cursor-pointer"
+          >
+            Cancel and Return
+          </button>
+        </div>
+      </div>
+    )
+  }
+
   // Loading UI
   if (isLoading || !livekitToken || !meetingData) {
     return (
@@ -417,6 +643,15 @@ function MeetingRoomInner() {
         showToast={showToast}
         user={user}
         attendanceConsent={attendanceConsent}
+        endMeeting={endMeeting}
+        socket={socket}
+        chatMessages={chatMessages}
+        setChatMessages={setChatMessages}
+        typingUsers={typingUsers}
+        setTypingUsers={setTypingUsers}
+        handleLeaveWithAttendanceRef={handleLeaveWithAttendanceRef}
+        waitingRequests={waitingRequests}
+        fetchWaitingRequests={fetchWaitingRequests}
       />
       <RoomAudioRenderer />
     </LiveKitRoom>
@@ -463,8 +698,18 @@ function MeetingRoomContent({
   activateMeeting,
   showToast,
   user,
-  attendanceConsent
+  attendanceConsent,
+  endMeeting,
+  socket,
+  chatMessages,
+  setChatMessages,
+  typingUsers,
+  setTypingUsers,
+  handleLeaveWithAttendanceRef,
+  waitingRequests,
+  fetchWaitingRequests
 }) {
+  const navigate = useNavigate()
   const room = useMaybeRoomContext()
   const { localParticipant } = useLocalParticipant()
   const participants = useParticipants()
@@ -485,18 +730,11 @@ function MeetingRoomContent({
   const [activeTab, setActiveTab] = useState('chat') // chat | participants | ai
 
   // Local Chat / AI States
-  const [chatMessages, setChatMessages] = useState([
-    { name: 'System', text: 'Welcome to the meeting room. Chat messages and AI queries are enabled.' }
-  ])
   const [chatInput, setChatInput] = useState('')
   const [aiInput, setAiInput] = useState('')
   const [aiResponses, setAiResponses] = useState([
     { sender: 'bot', text: 'I am tracking the meeting. You can ask me to summarize the current discussion.' }
   ])
-  const [typingUsers, setTypingUsers] = useState({})
-
-  // Socket.IO Ref
-  const socket = useRef(null)
 
   const roomState = room?.state
   console.log('[MeetingRoomContent Render] roomState:', roomState, 'localParticipant:', !!localParticipant, 'participants count:', participants?.length || 0)
@@ -534,7 +772,6 @@ function MeetingRoomContent({
   const attendanceConsentRef = useRef(attendanceConsent)
   const userRef = useRef(user)
   const handleLeaveRef = useRef(handleLeave)
-  const handleLeaveWithAttendanceRef = useRef(null)
 
   useEffect(() => {
     meetingDataRef.current = meetingData
@@ -555,6 +792,8 @@ function MeetingRoomContent({
   useEffect(() => {
     handleLeaveRef.current = handleLeave
   }, [handleLeave])
+
+
 
   // Track when the participant successfully joins the LiveKit room
   useEffect(() => {
@@ -734,6 +973,61 @@ function MeetingRoomContent({
         console.error('[Attendance Error] Error stopping attendance camera tracks:', e)
       }
       attendanceCameraStreamRef.current = null
+    }
+  }
+
+  const handleMuteParticipant = (pName) => {
+    showToast(`Mute request sent for ${pName}.`, 'info')
+  }
+
+  const handleRemoveParticipant = async (pName, pUserId) => {
+    const confirmRemove = window.confirm(`Are you sure you want to remove ${pName} from the meeting?`)
+    if (!confirmRemove) return
+
+    try {
+      console.log('[Security] Requesting backend to remove participant:', pUserId)
+      const res = await fetch(`${import.meta.env.VITE_API_URL || 'http://localhost:5000'}/api/meetings/security/remove`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ meetingCode: meetingData.meeting_code, userId: pUserId }),
+        credentials: 'include'
+      })
+      if (res.ok) {
+        showToast(`Participant ${pName} has been removed.`, 'success')
+      } else {
+        const data = await res.json()
+        showToast(data.message || 'Failed to remove participant.', 'error')
+      }
+    } catch (err) {
+      console.error(err)
+      showToast('Error removing participant.', 'error')
+    }
+  }
+
+  const handleBanDevice = async (pName, pUserId) => {
+    if (!meetingData) return
+    const confirmBan = window.confirm(
+      `This participant (${pName}) will be removed immediately.\nThis browser/device will not be able to rejoin this meeting.\n\nContinue?`
+    )
+    if (!confirmBan) return
+
+    try {
+      console.log('[Security] Sending ban device request for userId:', pUserId)
+      const res = await fetch(`${import.meta.env.VITE_API_URL || 'http://localhost:5000'}/api/meetings/security/ban-device`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ meetingCode: meetingData.meeting_code, userId: pUserId }),
+        credentials: 'include'
+      })
+      if (res.ok) {
+        showToast(`Participant ${pName} has been banned successfully.`, 'success')
+      } else {
+        const data = await res.json()
+        showToast(data.message || 'Failed to ban participant.', 'error')
+      }
+    } catch (err) {
+      console.error(err)
+      showToast('Error banning participant.', 'error')
     }
   }
 
@@ -1381,68 +1675,7 @@ function MeetingRoomContent({
     initRoomSession()
   }, [room, roomState, localParticipant, meetingData?.meeting_id, activateMeeting, showToast])
 
-  // Configure Socket.IO connection
-  useEffect(() => {
-    if (!meetingData?.room_name) return
-    console.log('[MeetingRoomContent useEffect socket] Initializing Socket.IO for room:', meetingData.room_name)
-    const socketUrl = import.meta.env.VITE_API_URL || 'http://localhost:5000'
 
-    try {
-      socket.current = io(socketUrl, {
-        withCredentials: true
-      })
-
-      // Register room
-      socket.current.emit('join_room', meetingData.room_name)
-
-      // WebSocket listeners
-      socket.current.on('receive_message', (msg) => {
-        setChatMessages((prev) => [...prev, msg])
-      })
-
-      socket.current.on('meeting_ended', async () => {
-        showToast('The host has ended this meeting.', 'info')
-        console.log('[Frontend] Meeting ended. Redirecting user to dashboard.')
-        const currentMeetingData = meetingDataRef.current
-        const currentIsHost = isHostRef.current
-        if (currentMeetingData?.enable_ai_attendance && !currentIsHost) {
-          if (handleLeaveWithAttendanceRef.current) {
-            await handleLeaveWithAttendanceRef.current()
-          } else {
-            await handleLeaveRef.current()
-          }
-        } else {
-          await handleLeaveRef.current()
-        }
-      })
-
-      socket.current.on('meeting_locked', ({ isLocked }) => {
-        showToast(isLocked ? 'The meeting is now locked by the host.' : 'The meeting is now unlocked by the host.', 'info')
-        setMeetingData((prev) => (prev ? { ...prev, meeting_status: isLocked ? 'Locked' : 'Active' } : null))
-      })
-
-      socket.current.on('typing', ({ name, isTyping }) => {
-        setTypingUsers((prev) => {
-          const next = { ...prev }
-          if (isTyping) {
-            next[name] = true
-          } else {
-            delete next[name]
-          }
-          return next
-        })
-      })
-    } catch (socketErr) {
-      console.error('[MeetingRoomContent useEffect socket] Socket.IO initialization error:', socketErr)
-    }
-
-    return () => {
-      if (socket.current) {
-        console.log('[MeetingRoomContent useEffect socket] Disconnecting socket...')
-        socket.current.disconnect()
-      }
-    }
-  }, [meetingData?.room_name, showToast, setMeetingData])
 
   const formatTimer = (sec) => {
     const m = Math.floor(sec / 60).toString().padStart(2, '0')
@@ -1760,6 +1993,18 @@ function MeetingRoomContent({
               >
                 AI Assistant
               </button>
+              {isHost && (
+                <button
+                  onClick={() => setActiveTab('security')}
+                  className={`flex-1 py-3 text-xs font-semibold border-b-2 transition-all duration-200 cursor-pointer ${
+                    activeTab === 'security'
+                      ? 'border-brand-purple text-white'
+                      : 'border-transparent text-gray-500 hover:text-gray-300'
+                  }`}
+                >
+                  Security {waitingRequests.length > 0 && `(${waitingRequests.length})`}
+                </button>
+              )}
             </div>
 
             {/* Drawer Contents */}
@@ -1802,25 +2047,157 @@ function MeetingRoomContent({
                 <div className="flex flex-col gap-3 overflow-y-auto">
                   {allParticipants.map((p) => {
                     let role = 'participant'
+                    let pUserId = p.identity
                     try {
                       const meta = JSON.parse(p?.metadata || '{}')
                       role = meta.role || 'participant'
+                      pUserId = meta.userId || p.identity
                     } catch (e) {}
 
                     return (
-                      <div key={p.sid || p.identity} className="flex items-center gap-3 p-2 bg-white/2 border border-white/5 rounded-xl">
-                        <div className="w-8 h-8 rounded-full bg-white/5 flex items-center justify-center text-xs font-bold text-gray-300">
-                          {p.name?.charAt(0).toUpperCase() || 'P'}
+                      <div key={p.sid || p.identity} className="flex items-center gap-3 p-2 bg-white/2 border border-white/5 rounded-xl justify-between">
+                        <div className="flex items-center gap-3 flex-1 min-w-0">
+                          <div className="w-8 h-8 rounded-full bg-white/5 flex items-center justify-center text-xs font-bold text-gray-300 shrink-0">
+                            {p.name?.charAt(0).toUpperCase() || 'P'}
+                          </div>
+                          <div className="flex flex-col text-left min-w-0">
+                            <span className="text-xs font-semibold text-white truncate">
+                              {p.name} {p.identity === localParticipant?.identity && ' (You)'}
+                            </span>
+                            <span className="text-[10px] text-gray-400 font-bold uppercase tracking-wider mt-0.5">{role}</span>
+                          </div>
                         </div>
-                        <div className="flex flex-col text-left flex-1">
-                          <span className="text-xs font-semibold text-white">
-                            {p.name} {p.identity === localParticipant?.identity && ' (You)'}
-                          </span>
-                          <span className="text-[10px] text-gray-400 font-bold uppercase tracking-wider mt-0.5">{role}</span>
-                        </div>
+
+                        {isHost && role !== 'host' && p.identity !== localParticipant?.identity && (
+                          <div className="flex items-center gap-1 shrink-0 select-none">
+                            <button
+                              onClick={() => handleMuteParticipant(p.name)}
+                              className="p-1.5 bg-slate-800 hover:bg-slate-700 text-gray-400 hover:text-white rounded-lg transition-all cursor-pointer"
+                              title="Mute Participant"
+                            >
+                              🎤
+                            </button>
+                            <button
+                              onClick={() => handleRemoveParticipant(p.name, pUserId)}
+                              className="p-1.5 bg-slate-800 hover:bg-slate-700 text-amber-500 hover:text-amber-400 rounded-lg transition-all cursor-pointer"
+                              title="Remove Participant"
+                            >
+                              👢
+                            </button>
+                            <button
+                              onClick={() => handleBanDevice(p.name, pUserId)}
+                              className="p-1.5 bg-red-950/40 hover:bg-red-900/40 border border-red-500/10 text-red-500 hover:text-red-400 rounded-lg transition-all cursor-pointer"
+                              title="Ban Device"
+                            >
+                              🚫
+                            </button>
+                          </div>
+                        )}
                       </div>
                     )
                   })}
+                </div>
+              )}
+
+              {/* TAB: SECURITY */}
+              {activeTab === 'security' && isHost && (
+                <div className="flex flex-col gap-4 h-full justify-start text-left">
+                  <div className="flex items-center justify-between p-3 bg-white/2 border border-white/5 rounded-xl">
+                    <span className="text-xs font-semibold text-white">Auto Admit Participants</span>
+                    <input
+                      type="checkbox"
+                      checked={meetingData?.auto_admit !== false}
+                      onChange={async (e) => {
+                        const checked = e.target.checked
+                        try {
+                          const res = await fetch(`${import.meta.env.VITE_API_URL || 'http://localhost:5000'}/api/meetings/security/toggle-auto-admit`, {
+                            method: 'POST',
+                            headers: { 'Content-Type': 'application/json' },
+                            body: JSON.stringify({ meetingId: meetingData.meeting_id, autoAdmit: checked }),
+                            credentials: 'include'
+                          })
+                          if (res.ok) {
+                            setMeetingData(prev => prev ? { ...prev, auto_admit: checked } : null)
+                            showToast(`Auto Admit toggled ${checked ? 'ON' : 'OFF'}`, 'success')
+                          } else {
+                            showToast('Failed to toggle Auto Admit', 'error')
+                          }
+                        } catch (err) {
+                          console.error(err)
+                          showToast('Error toggling Auto Admit', 'error')
+                        }
+                      }}
+                      className="accent-brand-purple cursor-pointer h-4 w-4"
+                    />
+                  </div>
+
+                  <div className="flex flex-col gap-2">
+                    <h3 className="text-xs font-bold text-gray-400 select-none">
+                      Waiting Participants ({waitingRequests.length})
+                    </h3>
+                    <div className="flex flex-col gap-2 overflow-y-auto max-h-[300px]">
+                      {waitingRequests.length === 0 ? (
+                        <p className="text-[11px] text-gray-500 italic py-2">No pending join requests.</p>
+                      ) : (
+                        waitingRequests.map((req) => (
+                          <div key={req.id} className="flex flex-col gap-2 p-3 bg-slate-900/40 border border-white/5 rounded-xl">
+                            <div className="flex flex-col">
+                              <span className="text-xs font-semibold text-white">{req.fullName}</span>
+                              <span className="text-[10px] text-gray-500">{req.email}</span>
+                            </div>
+                            <div className="flex gap-2 justify-end">
+                              <button
+                                onClick={async () => {
+                                  try {
+                                    const res = await fetch(`${import.meta.env.VITE_API_URL || 'http://localhost:5000'}/api/meetings/security/accept`, {
+                                      method: 'POST',
+                                      headers: { 'Content-Type': 'application/json' },
+                                      body: JSON.stringify({ meetingCode: meetingData.meeting_code, userId: req.userId }),
+                                      credentials: 'include'
+                                    })
+                                    if (res.ok) {
+                                      showToast('User accepted.', 'success')
+                                      fetchWaitingRequests()
+                                    } else {
+                                      showToast('Failed to accept request', 'error')
+                                    }
+                                  } catch (err) {
+                                    showToast('Error accepting request', 'error')
+                                  }
+                                }}
+                                className="px-2.5 py-1 bg-emerald-600 hover:bg-emerald-500 text-white rounded text-[10px] font-bold cursor-pointer transition-all"
+                              >
+                                ✔ Accept
+                              </button>
+                              <button
+                                onClick={async () => {
+                                  try {
+                                    const res = await fetch(`${import.meta.env.VITE_API_URL || 'http://localhost:5000'}/api/meetings/security/reject`, {
+                                      method: 'POST',
+                                      headers: { 'Content-Type': 'application/json' },
+                                      body: JSON.stringify({ meetingCode: meetingData.meeting_code, userId: req.userId }),
+                                      credentials: 'include'
+                                    })
+                                    if (res.ok) {
+                                      showToast('User rejected.', 'info')
+                                      fetchWaitingRequests()
+                                    } else {
+                                      showToast('Failed to reject request', 'error')
+                                    }
+                                  } catch (err) {
+                                    showToast('Error rejecting request', 'error')
+                                  }
+                                }}
+                                className="px-2.5 py-1 bg-red-600 hover:bg-red-500 text-white rounded text-[10px] font-bold cursor-pointer transition-all"
+                              >
+                                ✗ Reject
+                              </button>
+                            </div>
+                          </div>
+                        ))
+                      )}
+                    </div>
+                  </div>
                 </div>
               )}
 

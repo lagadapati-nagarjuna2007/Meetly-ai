@@ -11,6 +11,7 @@ import aiChatRoutes from './routes/aiChat.routes.js'
 import { supabase } from './config/supabase.js'
 import { startRetentionCleanup } from './controllers/meetingController.js'
 import { clearMeetingCounters } from './services/aiChat.service.js'
+import { scheduleCleanup, cancelCleanup } from './services/meetingCleanup.js'
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url))
 dotenv.config({ path: path.resolve(__dirname, '../.env') })
@@ -67,6 +68,7 @@ const io = new Server(httpServer, {
     credentials: true
   }
 })
+app.set('io', io)
 
 // Active socket room tracking map: roomName -> Set of socket IDs
 const roomSockets = new Map()
@@ -84,6 +86,21 @@ io.on('connection', (socket) => {
     }
     roomSockets.get(roomName).add(socket.id)
     console.log(`[Socket Connected] Socket ${socket.id} joined room ${roomName}. Total sockets: ${roomSockets.get(roomName).size}`)
+
+    // Cancel pending cleanup for this room if any participant joins
+    supabase
+      .from('meetings')
+      .select('meeting_id')
+      .eq('room_name', roomName)
+      .maybeSingle()
+      .then(({ data }) => {
+        if (data) {
+          cancelCleanup(data.meeting_id)
+        }
+      })
+      .catch((err) => {
+        console.error('[Socket Join Cleanup Error]:', err)
+      })
   })
 
   // Chat message broadcasting
@@ -109,6 +126,13 @@ io.on('connection', (socket) => {
     io.to(data.roomName).emit('meeting_locked', { isLocked: data.isLocked })
   })
 
+  // Remove participant trigger
+  socket.on('remove_participant_from_meeting', (data) => {
+    const timestamp = new Date().toISOString()
+    console.log(`[Audit Log] Action: Participant Removed | Timestamp: ${timestamp} | MeetingCode: ${data.roomName} | HostId: ${socket.id} | ParticipantId: ${data.userId}`)
+    io.to(data.roomName).emit('participant_removed', { userId: data.userId })
+  })
+
   // Host ended room trigger
   socket.on('end_meeting', (roomName) => {
     io.to(roomName).emit('meeting_ended')
@@ -121,39 +145,24 @@ io.on('connection', (socket) => {
       sockets.delete(socket.id)
       console.log(`[Socket Disconnected] Socket ${socket.id} left room ${currentRoom}. Remaining sockets: ${sockets.size}`)
 
-      // If room is now empty of socket connections, schedule a 30s check to clean up meeting if no participants remain
+      // If room is now empty of socket connections, schedule check to clean up meeting if no participants remain
       if (sockets.size === 0) {
         roomSockets.delete(currentRoom)
         const roomToClean = currentRoom
-        setTimeout(async () => {
-          try {
-            const { data: meeting } = await supabase
-              .from('meetings')
-              .select('meeting_id, meeting_status')
-              .eq('room_name', roomToClean)
-              .maybeSingle()
-
+        
+        supabase
+          .from('meetings')
+          .select('meeting_id, meeting_code, meeting_status')
+          .eq('room_name', roomToClean)
+          .maybeSingle()
+          .then(({ data: meeting }) => {
             if (meeting && (meeting.meeting_status === 'Active' || meeting.meeting_status === 'Waiting')) {
-              const { data: activeParts } = await supabase
-                .from('participants')
-                .select('participant_id')
-                .eq('meeting_id', meeting.meeting_id)
-                .eq('participant_status', 'joined')
-
-              if (!activeParts || activeParts.length === 0) {
-                const now = new Date().toISOString()
-                console.log(`[Cleanup] Meeting ${meeting.meeting_id} ended because no active participants remaining after socket disconnect timeout.`)
-                await supabase
-                  .from('meetings')
-                  .update({ meeting_status: 'Ended', ended_at: now, updated_at: now })
-                  .eq('meeting_id', meeting.meeting_id)
-                clearMeetingCounters(meeting.meeting_id)
-              }
+              scheduleCleanup(meeting.meeting_id, meeting.meeting_code, roomToClean)
             }
-          } catch (err) {
-            console.error('[Socket Cleanup Error]:', err)
-          }
-        }, 30000)
+          })
+          .catch((err) => {
+            console.error('[Socket Cleanup Query Error]:', err)
+          })
       }
     }
   })
