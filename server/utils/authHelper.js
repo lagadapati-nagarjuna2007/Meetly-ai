@@ -71,7 +71,7 @@ export const authorizeHost = async (meetingIdOrCode, userId) => {
       return {
         passed: false,
         status: 403,
-        message: 'Unauthorized. Only the meeting host can perform this action.',
+        message: `Unauthorized. Only the meeting host can perform this action. (Host: ${hostIdStr}, User: ${userIdStr})`,
         meeting
       }
     }
