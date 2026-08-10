@@ -61,6 +61,7 @@ export const authorizeHost = async (meetingIdOrCode, userId) => {
     const passed = hostIdStr === userIdStr
 
     console.log(`\n==================================================`)
+    console.log(`[HOST AUTH DEBUG]\naction: host_authorization_check\nauthenticatedUserId: ${userId}\nmeetingId: ${meeting.meeting_id}\nmeetingHostId: ${meeting.host_id}\nisHost: ${passed}`)
     console.log(`Meeting Host ID: ${meeting.host_id}`)
     console.log(`Authenticated User ID: ${userId}`)
     console.log(`Meeting Code: ${meeting.meeting_code}`)

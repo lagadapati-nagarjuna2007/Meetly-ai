@@ -14,7 +14,8 @@ const getCookieConfig = () => {
     secure: isProduction,
     // sameSite: "none" is required in production for cross-site cookie usage, "lax" for dev
     sameSite: isProduction ? 'none' : 'lax',
-    maxAge: JWT_EXPIRATION
+    maxAge: JWT_EXPIRATION,
+    path: '/'
   }
 }
 
@@ -260,10 +261,13 @@ export const login = async (req, res) => {
       { expiresIn: '24h' }
     )
 
+    console.log(`[AUTH DEBUG] Login success. User ID: ${user.id}, Email: ${user.email}`)
+
     // Set secure HTTP-only cookie
     res.cookie('meetly_token', token, getCookieConfig())
 
     return res.status(200).json({
+      token,
       user: {
         id: user.id,
         name: user.full_name,
@@ -409,10 +413,12 @@ export const resetPassword = async (req, res) => {
 // 7. LOGOUT
 export const logout = async (req, res) => {
   const isProduction = process.env.NODE_ENV === 'production'
+  console.log(`[AUTH DEBUG] Logout request for User ID: ${req.user?.id || 'unknown'}`)
   res.clearCookie('meetly_token', {
     httpOnly: true,
     secure: isProduction,
-    sameSite: isProduction ? 'none' : 'lax'
+    sameSite: isProduction ? 'none' : 'lax',
+    path: '/'
   })
   return res.status(200).json({ message: 'Logged out successfully.' })
 }
@@ -420,6 +426,7 @@ export const logout = async (req, res) => {
 // 8. GET ME
 export const getMe = async (req, res) => {
   try {
+    console.log(`[AUTH DEBUG] GET /me request for User ID: ${req.user?.id}`)
     const { data: user, error: fetchErr } = await supabase
       .from('users')
       .select('id, full_name, email')

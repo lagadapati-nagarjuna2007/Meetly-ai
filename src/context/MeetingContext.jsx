@@ -4,6 +4,15 @@ import { useAuth } from './AuthContext'
 const MeetingContext = createContext(null)
 const API_URL = `${import.meta.env.VITE_API_URL || 'http://localhost:5000'}/api/meeting`
 
+const getAuthHeaders = () => {
+  const token = typeof window !== 'undefined' ? sessionStorage.getItem('meetly_auth_token') : null
+  const headers = { 'Content-Type': 'application/json' }
+  if (token) {
+    headers['Authorization'] = `Bearer ${token}`
+  }
+  return headers
+}
+
 export function MeetingProvider({ children }) {
   const { user } = useAuth()
   const [meetings, setMeetings] = useState([])
@@ -33,7 +42,7 @@ export function MeetingProvider({ children }) {
     try {
       const res = await fetch(API_URL, {
         method: 'GET',
-        headers: { 'Content-Type': 'application/json' },
+        headers: getAuthHeaders(),
         credentials: 'include'
       })
       if (res.ok) {
@@ -47,10 +56,18 @@ export function MeetingProvider({ children }) {
     }
   }, [user])
 
-  // Reload meetings list when user changes
+  // Reload/Reset meeting state when user changes or logs out
   useEffect(() => {
-    refreshMeetings()
-  }, [refreshMeetings])
+    if (!user) {
+      setCurrentMeeting(null)
+      setLivekitToken(null)
+      setLivekitUrl(null)
+      setRoomName(null)
+      setMeetings([])
+    } else {
+      refreshMeetings()
+    }
+  }, [user, refreshMeetings])
 
   // 2. CREATE MEETING
   // Atomic creation: stores meeting details AND LiveKit token immediately in state
@@ -68,7 +85,7 @@ export function MeetingProvider({ children }) {
       console.log('[MeetingContext] Requesting createMeeting backend API...')
       const res = await fetch(`${API_URL}/create`, {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers: getAuthHeaders(),
         body: JSON.stringify({
           meetingTitle: title,
           meetingType: type,
@@ -91,6 +108,7 @@ export function MeetingProvider({ children }) {
         dbId: data.meetingId || data.meeting.meeting_id,
         name: data.meeting.meeting_title,
         hostId: data.meeting.host_id,
+        host_id: data.meeting.host_id,
         status: data.meeting.meeting_status,
         type: data.meeting.meeting_type,
         roomName: data.roomName || data.meeting.room_name,
@@ -133,7 +151,7 @@ export function MeetingProvider({ children }) {
       console.log('[MeetingContext] Requesting joinMeeting backend API for code:', code)
       const res = await fetch(`${API_URL}/join`, {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers: getAuthHeaders(),
         body: JSON.stringify({
           meetingCode: code,
           password,
@@ -159,6 +177,7 @@ export function MeetingProvider({ children }) {
         dbId: data.meeting.meeting_id,
         name: data.meeting.meeting_title,
         hostId: data.meeting.host_id,
+        host_id: data.meeting.host_id,
         status: data.meeting.meeting_status,
         type: data.meeting.meeting_type,
         roomName: data.roomName || data.meeting.room_name,
@@ -192,7 +211,7 @@ export function MeetingProvider({ children }) {
       console.log('[MeetingContext] Notifying backend activateMeeting for:', meetingId)
       await fetch(`${API_URL}/activate`, {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers: getAuthHeaders(),
         body: JSON.stringify({ meetingId }),
         credentials: 'include'
       })
@@ -214,7 +233,7 @@ export function MeetingProvider({ children }) {
       console.log('[MeetingContext] Leaving meeting:', meetingId)
       await fetch(`${API_URL}/leave`, {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers: getAuthHeaders(),
         body: JSON.stringify({ meetingId }),
         credentials: 'include'
       })
@@ -237,7 +256,7 @@ export function MeetingProvider({ children }) {
       console.log('[MeetingContext] Ending meeting:', meetingId)
       const res = await fetch(`${API_URL}/end`, {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers: getAuthHeaders(),
         body: JSON.stringify({ meetingId }),
         credentials: 'include'
       })
@@ -265,7 +284,7 @@ export function MeetingProvider({ children }) {
   const lockMeeting = async (meetingId, isLocked) => {
     const res = await fetch(`${API_URL}/lock`, {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
+      headers: getAuthHeaders(),
       body: JSON.stringify({ meetingId, isLocked }),
       credentials: 'include'
     })
@@ -286,7 +305,7 @@ export function MeetingProvider({ children }) {
   const deleteMeeting = async (idOrCode) => {
     const res = await fetch(`${API_URL}/${idOrCode}`, {
       method: 'DELETE',
-      headers: { 'Content-Type': 'application/json' },
+      headers: getAuthHeaders(),
       credentials: 'include'
     })
 
@@ -309,7 +328,7 @@ export function MeetingProvider({ children }) {
   const renameMeeting = async (idOrCode, newTitle) => {
     const res = await fetch(`${API_URL}/${idOrCode}`, {
       method: 'PUT',
-      headers: { 'Content-Type': 'application/json' },
+      headers: getAuthHeaders(),
       body: JSON.stringify({ meetingTitle: newTitle }),
       credentials: 'include'
     })
@@ -330,7 +349,7 @@ export function MeetingProvider({ children }) {
   const fetchHistory = async () => {
     const res = await fetch(`${API_URL}/history`, {
       method: 'GET',
-      headers: { 'Content-Type': 'application/json' },
+      headers: getAuthHeaders(),
       credentials: 'include'
     })
     if (!res.ok) {
@@ -344,7 +363,7 @@ export function MeetingProvider({ children }) {
   const fetchMeetingDetails = async (idOrCode) => {
     const res = await fetch(`${API_URL}/details/${idOrCode}`, {
       method: 'GET',
-      headers: { 'Content-Type': 'application/json' },
+      headers: getAuthHeaders(),
       credentials: 'include'
     })
     if (!res.ok) {
@@ -358,7 +377,7 @@ export function MeetingProvider({ children }) {
   const fetchMeetingParticipants = async (idOrCode) => {
     const res = await fetch(`${API_URL}/participants/${idOrCode}`, {
       method: 'GET',
-      headers: { 'Content-Type': 'application/json' },
+      headers: getAuthHeaders(),
       credentials: 'include'
     })
     if (!res.ok) {
@@ -372,7 +391,7 @@ export function MeetingProvider({ children }) {
   const generateMeetingSummary = async (meetingId) => {
     const res = await fetch(`${API_URL}/summary/generate`, {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
+      headers: getAuthHeaders(),
       body: JSON.stringify({ meetingId }),
       credentials: 'include'
     })
@@ -387,7 +406,7 @@ export function MeetingProvider({ children }) {
   const submitAttendanceRecord = async (record) => {
     const res = await fetch(`${API_URL}/attendance`, {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
+      headers: getAuthHeaders(),
       body: JSON.stringify(record),
       credentials: 'include'
     })
@@ -402,7 +421,7 @@ export function MeetingProvider({ children }) {
   const getAttendanceReport = async (meetingId) => {
     const res = await fetch(`${API_URL}/attendance/report/${meetingId}`, {
       method: 'GET',
-      headers: { 'Content-Type': 'application/json' },
+      headers: getAuthHeaders(),
       credentials: 'include'
     })
     const data = await res.json()
@@ -416,7 +435,7 @@ export function MeetingProvider({ children }) {
   const clearAttendanceRecords = async (meetingId) => {
     const res = await fetch(`${API_URL}/attendance/report/${meetingId}`, {
       method: 'DELETE',
-      headers: { 'Content-Type': 'application/json' },
+      headers: getAuthHeaders(),
       credentials: 'include'
     })
     const data = await res.json()

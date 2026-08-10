@@ -45,6 +45,15 @@ const optimizeTranscript = (fullTranscript, question) => {
   return optimizedText
 }
 
+const getAuthHeaders = () => {
+  const token = typeof window !== 'undefined' ? sessionStorage.getItem('meetly_auth_token') : null
+  const headers = { 'Content-Type': 'application/json' }
+  if (token) {
+    headers['Authorization'] = `Bearer ${token}`
+  }
+  return headers
+}
+
 const useAIChat = () => {
   const [messages, setMessages] = useState([])
   const [isLoading, setIsLoading] = useState(false)
@@ -57,7 +66,7 @@ const useAIChat = () => {
     try {
       const res = await fetch(`${apiUrl}/api/meetings/${meetingId}/ai-chat/remaining`, {
         method: 'GET',
-        headers: { 'Content-Type': 'application/json' },
+        headers: getAuthHeaders(),
         credentials: 'include'
       })
       if (res.ok) {
@@ -90,7 +99,7 @@ const useAIChat = () => {
       console.log('[AI Chat] Fetching current meeting transcript...')
       const transcriptRes = await fetch(`${apiUrl}/api/meetings/${meetingId}/transcript`, {
         method: 'GET',
-        headers: { 'Content-Type': 'application/json' },
+        headers: getAuthHeaders(),
         credentials: 'include'
       })
 
@@ -120,7 +129,7 @@ const useAIChat = () => {
       console.log('[AI Chat] Sending optimized transcript and question to backend...')
       const chatRes = await fetch(`${apiUrl}/api/meetings/${meetingId}/ai-chat`, {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers: getAuthHeaders(),
         body: JSON.stringify({
           meetingId,
           transcript: optimizedTranscript,

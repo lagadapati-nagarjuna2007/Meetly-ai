@@ -3,17 +3,26 @@ import { createContext, useContext, useState, useEffect } from 'react'
 const AuthContext = createContext(null)
 const API_URL = `${import.meta.env.VITE_API_URL}/api/auth`
 
+const getAuthHeaders = () => {
+  const token = typeof window !== 'undefined' ? sessionStorage.getItem('meetly_auth_token') : null
+  const headers = { 'Content-Type': 'application/json' }
+  if (token) {
+    headers['Authorization'] = `Bearer ${token}`
+  }
+  return headers
+}
+
 export function AuthProvider({ children }) {
   const [user, setUser] = useState(null)
   const [isLoading, setIsLoading] = useState(true)
 
-  // 1. Restore session on mount using cookie credentials
+  // 1. Restore session on mount using cookie or bearer credentials
   useEffect(() => {
     const checkSession = async () => {
       try {
         const res = await fetch(`${API_URL}/me`, {
           method: 'GET',
-          headers: { 'Content-Type': 'application/json' },
+          headers: getAuthHeaders(),
           credentials: 'include'
         })
         if (res.ok) {
@@ -47,6 +56,10 @@ export function AuthProvider({ children }) {
       
       if (!res.ok) {
         throw new Error(data.message || 'Invalid Email or Password')
+      }
+
+      if (data.token) {
+        sessionStorage.setItem('meetly_auth_token', data.token)
       }
 
       setUser(data.user)
@@ -181,12 +194,13 @@ export function AuthProvider({ children }) {
     try {
       await fetch(`${API_URL}/logout`, {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers: getAuthHeaders(),
         credentials: 'include'
       })
     } catch (err) {
       console.error('Logout request error:', err)
     } finally {
+      sessionStorage.removeItem('meetly_auth_token')
       setUser(null)
     }
   }

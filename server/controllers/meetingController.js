@@ -415,8 +415,10 @@ export const joinMeeting = async (req, res) => {
       }
     }
 
-    const isHost = meeting.host_id === req.user.id
+    const isHost = String(meeting.host_id).trim().toLowerCase() === String(req.user.id).trim().toLowerCase()
     const role = isHost ? 'host' : 'participant'
+
+    console.log(`[AUTH DEBUG]\nemail: ${req.user.email}\nuserId: ${req.user.id}\nmeetingCode: ${uppercaseCode}\nisHost: ${isHost}`)
 
     // Step 3.5: Handle Waiting Room / Auto Admit Setting
     if (meeting.auto_admit === false && !isHost) {

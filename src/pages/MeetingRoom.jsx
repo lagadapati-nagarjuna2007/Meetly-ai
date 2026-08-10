@@ -10,7 +10,7 @@ import {
   RoomAudioRenderer,
   useMaybeRoomContext
 } from '@livekit/components-react'
-import { Track } from 'livekit-client'
+import { Track, RoomEvent } from 'livekit-client'
 import { useMeetings } from '../context/MeetingContext'
 import { useAuth } from '../context/AuthContext'
 import { useToast } from '../components/Toast'
@@ -109,10 +109,16 @@ function MeetingRoomInner() {
   const navigate = useNavigate()
 
   const [meetingData, setMeetingData] = useState(null)
-  const [isHost, setIsHost] = useState(false)
+  const meetingHostId = meetingData?.host_id || meetingData?.hostId
+  const currentUserId = user?.id
+  const isHost = Boolean(currentUserId) && Boolean(meetingHostId) && String(currentUserId).trim().toLowerCase() === String(meetingHostId).trim().toLowerCase()
+
   const isHostRef = useRef(isHost)
   useEffect(() => {
     isHostRef.current = isHost
+    if (isHost) {
+      setAttendanceConsent('Granted')
+    }
   }, [isHost])
   const [isWaitingForApproval, setIsWaitingForApproval] = useState(false)
   const [isLoading, setIsLoading] = useState(true)
@@ -133,7 +139,10 @@ function MeetingRoomInner() {
   const fetchWaitingRequests = useCallback(async () => {
     if (!meetingData?.meeting_code) return
     try {
+      const token = typeof window !== 'undefined' ? sessionStorage.getItem('meetly_auth_token') : null
+      const headers = token ? { Authorization: `Bearer ${token}` } : {}
       const res = await fetch(`${import.meta.env.VITE_API_URL || 'http://localhost:5000'}/api/meetings/security/pending/${meetingData.meeting_code}`, {
+        headers,
         credentials: 'include'
       })
       const data = await res.json()
@@ -176,13 +185,6 @@ function MeetingRoomInner() {
         const data = await fetchMeetingDetails(id)
         if (!isMounted) return
         setMeetingData(data.meeting)
-        if (data.meeting && user) {
-          const host = data.meeting.host_id === user.id
-          setIsHost(host)
-          if (host) {
-            setAttendanceConsent('Granted')
-          }
-        }
       } catch (err) {
         if (!isMounted) return
         console.error('[MeetingRoom useEffect 1] Failed to load meeting details:', err)
@@ -198,7 +200,14 @@ function MeetingRoomInner() {
     return () => {
       isMounted = false
     }
-  }, [id, user, fetchMeetingDetails, showToast])
+  }, [id, fetchMeetingDetails, showToast])
+
+  // Synced host verification
+  useEffect(() => {
+    if (isHost) {
+      setAttendanceConsent('Granted')
+    }
+  }, [isHost])
 
   // 2. Auto-join meeting room if Token is missing (e.g. on F5 Refresh)
   useEffect(() => {
@@ -600,7 +609,10 @@ function MeetingRoomInner() {
   }, [livekitToken, serverUrl])
 
   // Loading UI
-  if (isLoading || !livekitToken || !meetingData) {
+  if (isLoading || !livekitToken || !meetingData || isIntentionalLeaveRef.current) {
+    if (isIntentionalLeaveRef.current) {
+      return null
+    }
     return (
       <div className="fixed inset-0 z-40 bg-[#04050b] flex flex-col items-center justify-center text-xs font-semibold text-gray-500 select-none">
         <div className="flex flex-col items-center gap-3">
@@ -628,7 +640,20 @@ function MeetingRoomInner() {
       }}
       onError={(err) => {
         console.error('[LiveKit Connection] Event onError triggered:', err)
-        showToast('LiveKit connection error: ' + (err?.message || 'Check your credentials.'), 'error')
+        if (isIntentionalLeaveRef.current) {
+          console.log('[LiveKit Connection] Bypassing onError toast for intentional disconnect.')
+          return
+        }
+        const errMsg = err?.message || ''
+        if (
+          errMsg.toLowerCase().includes('client initiated disconnect') ||
+          errMsg.toLowerCase().includes('user initiated') ||
+          errMsg.toLowerCase().includes('client initiated')
+        ) {
+          console.log('[LiveKit Connection] Bypassing error toast for expected client disconnect:', errMsg)
+          return
+        }
+        showToast('LiveKit connection error: ' + (errMsg || 'Check your credentials.'), 'error')
       }}
     >
       <MeetingRoomContent
@@ -691,7 +716,7 @@ function getCameraErrorMessage(err) {
 function MeetingRoomContent({
   meetingData,
   setMeetingData,
-  isHost,
+  isHost: isHostProp,
   handleLeave,
   handleEndMeeting,
   handleDeleteMeeting,
@@ -740,6 +765,12 @@ function MeetingRoomContent({
   const [aiResponses, setAiResponses] = useState([
     { sender: 'bot', text: 'I am tracking the meeting. You can ask me to summarize the current discussion.' }
   ])
+
+  const meetingHostId = meetingData?.host_id || meetingData?.hostId
+  const currentUserId = user?.id
+  const isHost = Boolean(currentUserId) && Boolean(meetingHostId) && String(currentUserId).trim().toLowerCase() === String(meetingHostId).trim().toLowerCase()
+
+  console.log(`[HOST UI DEBUG]\nuserId: ${currentUserId}\nmeetingHostId: ${meetingHostId}\nisHost: ${isHost}\nsecurityTabVisible: ${isHost}`)
 
   const roomState = room?.state
   console.log('[MeetingRoomContent Render] roomState:', roomState, 'localParticipant:', !!localParticipant, 'participants count:', participants?.length || 0)
@@ -810,6 +841,42 @@ function MeetingRoomContent({
     }
   }, [meetingData, isHost, roomState])
 
+  // LiveKit Identity & Remote Participant Debugging
+  useEffect(() => {
+    if (!room || roomState !== 'connected') return
+
+    if (localParticipant) {
+      console.log(`[LIVEKIT IDENTITY DEBUG]\nlocal participant identity: ${localParticipant.identity || 'N/A'}\nlocal participant sid: ${localParticipant.sid || 'N/A'}\nroom name: ${room.name || 'N/A'}`)
+    }
+
+    const onParticipantConnected = (p) => {
+      console.log(`[REMOTE PARTICIPANT DEBUG]\nparticipant connected: ${p.identity}\nidentity: ${p.identity}\nsid: ${p.sid}\nisLocal: ${p.isLocal}`)
+    }
+
+    const onTrackPublished = (pub, p) => {
+      console.log(`[REMOTE TRACK DEBUG]\ntrack published: ${pub.trackSid || pub.sid}\nparticipant identity: ${p?.identity || 'N/A'}\ntrack kind: ${pub.kind}\ntrack source: ${pub.source}`)
+    }
+
+    const onTrackSubscribed = (track, pub, p) => {
+      console.log(`[TRACK SUBSCRIBED DEBUG]\nparticipant identity: ${p?.identity || 'N/A'}\ntrack kind: ${track.kind}\ntrack source: ${pub?.source || 'N/A'}`)
+    }
+
+    room.on(RoomEvent.ParticipantConnected, onParticipantConnected)
+    room.on(RoomEvent.TrackPublished, onTrackPublished)
+    room.on(RoomEvent.TrackSubscribed, onTrackSubscribed)
+
+    // Log existing remote participants
+    room.remoteParticipants.forEach((p) => {
+      console.log(`[REMOTE PARTICIPANT DEBUG]\nparticipant connected: ${p.identity}\nidentity: ${p.identity}\nsid: ${p.sid}\nisLocal: false`)
+    })
+
+    return () => {
+      room.off(RoomEvent.ParticipantConnected, onParticipantConnected)
+      room.off(RoomEvent.TrackPublished, onTrackPublished)
+      room.off(RoomEvent.TrackSubscribed, onTrackSubscribed)
+    }
+  }, [room, roomState, localParticipant])
+
   const uploadAttendance = async () => {
     if (isHost) {
       console.log('[Attendance] Bypassing upload: User is the meeting host.')
@@ -858,10 +925,14 @@ function MeetingRoomContent({
 
     while (attempt < maxRetries) {
       try {
+        const token = typeof window !== 'undefined' ? sessionStorage.getItem('meetly_auth_token') : null
+        const headers = { 'Content-Type': 'application/json' }
+        if (token) headers['Authorization'] = `Bearer ${token}`
+
         const apiUrl = import.meta.env.VITE_API_URL || 'http://localhost:5000'
         const res = await fetch(`${apiUrl}/api/meetings/attendance`, {
           method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
+          headers,
           body: JSON.stringify(payload),
           credentials: 'include'
         })
@@ -982,18 +1053,34 @@ function MeetingRoomContent({
   }
 
   const handleMuteParticipant = (pName) => {
+    console.log(`[Participant Controls]\nuserId: ${user?.id}\nhostId: ${meetingData?.host_id || meetingData?.hostId}\nisHost: ${isHost}`)
+    if (!isHost) {
+      showToast('Only the meeting host can mute participants.', 'error')
+      return
+    }
     showToast(`Mute request sent for ${pName}.`, 'info')
   }
 
   const handleRemoveParticipant = async (pName, pUserId) => {
+    console.log(`[HOST ACTION DEBUG]\naction: remove_participant\nmeetingId: ${meetingData?.meeting_id}\ncurrentUserId: ${user?.id}\nisHost: ${isHost}\ntargetParticipantId: ${pUserId}`)
+    console.log(`[Participant Controls]\nuserId: ${user?.id}\nhostId: ${meetingData?.host_id || meetingData?.hostId}\nisHost: ${isHost}`)
+    if (!isHost) {
+      showToast('Only the meeting host can remove participants.', 'error')
+      return
+    }
+
     const confirmRemove = window.confirm(`Are you sure you want to remove ${pName} from the meeting?`)
     if (!confirmRemove) return
 
     try {
       console.log('[Security] Requesting backend to remove participant:', pUserId)
+      const token = typeof window !== 'undefined' ? sessionStorage.getItem('meetly_auth_token') : null
+      const headers = { 'Content-Type': 'application/json' }
+      if (token) headers['Authorization'] = `Bearer ${token}`
+
       const res = await fetch(`${import.meta.env.VITE_API_URL || 'http://localhost:5000'}/api/meetings/security/remove`, {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers,
         body: JSON.stringify({ meetingCode: meetingData.meeting_code, userId: pUserId }),
         credentials: 'include'
       })
@@ -1011,6 +1098,13 @@ function MeetingRoomContent({
 
   const handleBanDevice = async (pName, pUserId) => {
     if (!meetingData) return
+    console.log(`[HOST ACTION DEBUG]\naction: ban_device\nmeetingId: ${meetingData?.meeting_id}\ncurrentUserId: ${user?.id}\nisHost: ${isHost}\ntargetParticipantId: ${pUserId}`)
+    console.log(`[Participant Controls]\nuserId: ${user?.id}\nhostId: ${meetingData?.host_id || meetingData?.hostId}\nisHost: ${isHost}`)
+    if (!isHost) {
+      showToast('Only the meeting host can ban devices.', 'error')
+      return
+    }
+
     const confirmBan = window.confirm(
       `This participant (${pName}) will be removed immediately.\nThis browser/device will not be able to rejoin this meeting.\n\nContinue?`
     )
@@ -1018,9 +1112,13 @@ function MeetingRoomContent({
 
     try {
       console.log('[Security] Sending ban device request for userId:', pUserId)
+      const token = typeof window !== 'undefined' ? sessionStorage.getItem('meetly_auth_token') : null
+      const headers = { 'Content-Type': 'application/json' }
+      if (token) headers['Authorization'] = `Bearer ${token}`
+
       const res = await fetch(`${import.meta.env.VITE_API_URL || 'http://localhost:5000'}/api/meetings/security/ban-device`, {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers,
         body: JSON.stringify({ meetingCode: meetingData.meeting_code, userId: pUserId }),
         credentials: 'include'
       })
@@ -1062,6 +1160,10 @@ function MeetingRoomContent({
 
   const handleEndWithAttendance = async () => {
     if (!meetingData) return
+    if (!isHostRef.current) {
+      console.error('[Security Guard] Non-host attempted to call handleEndWithAttendance. Bypassing host end.')
+      return handleLeaveWithAttendance()
+    }
     const confirmEnd = window.confirm('Are you sure you want to end this meeting for all participants?')
     if (!confirmEnd) return
 
@@ -1444,9 +1546,13 @@ function MeetingRoomContent({
           const blob = new Blob([JSON.stringify(payload)], { type: 'application/json' })
           navigator.sendBeacon(apiUrl, blob)
         } else {
+          const token = typeof window !== 'undefined' ? sessionStorage.getItem('meetly_auth_token') : null
+          const headers = { 'Content-Type': 'application/json' }
+          if (token) headers['Authorization'] = `Bearer ${token}`
+
           fetch(apiUrl, {
             method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
+            headers,
             body: JSON.stringify(payload),
             keepalive: true,
             credentials: 'include'
@@ -1568,9 +1674,14 @@ function MeetingRoomContent({
             console.log('[AI Analyzer] Uploading transcript chunk...')
             activeTranscriptUploadsRef.current++
             console.log(`[Transcript Queue] Active uploads: ${activeTranscriptUploadsRef.current}`)
+            const token = typeof window !== 'undefined' ? sessionStorage.getItem('meetly_auth_token') : null
+            const headers = {}
+            if (token) headers['Authorization'] = `Bearer ${token}`
+
             const apiUrl = import.meta.env.VITE_API_URL || 'http://localhost:5000'
             const res = await fetch(`${apiUrl}/api/meetings/transcript`, {
               method: 'POST',
+              headers,
               body: formData,
               credentials: 'include' // Sent with session auth cookies
             })
@@ -2121,9 +2232,13 @@ function MeetingRoomContent({
                       onChange={async (e) => {
                         const checked = e.target.checked
                         try {
+                          const token = typeof window !== 'undefined' ? sessionStorage.getItem('meetly_auth_token') : null
+                          const headers = { 'Content-Type': 'application/json' }
+                          if (token) headers['Authorization'] = `Bearer ${token}`
+
                           const res = await fetch(`${import.meta.env.VITE_API_URL || 'http://localhost:5000'}/api/meetings/security/toggle-auto-admit`, {
                             method: 'POST',
-                            headers: { 'Content-Type': 'application/json' },
+                            headers,
                             body: JSON.stringify({ meetingId: meetingData.meeting_id, autoAdmit: checked }),
                             credentials: 'include'
                           })
@@ -2160,9 +2275,13 @@ function MeetingRoomContent({
                               <button
                                 onClick={async () => {
                                   try {
+                                    const token = typeof window !== 'undefined' ? sessionStorage.getItem('meetly_auth_token') : null
+                                    const headers = { 'Content-Type': 'application/json' }
+                                    if (token) headers['Authorization'] = `Bearer ${token}`
+
                                     const res = await fetch(`${import.meta.env.VITE_API_URL || 'http://localhost:5000'}/api/meetings/security/accept`, {
                                       method: 'POST',
-                                      headers: { 'Content-Type': 'application/json' },
+                                      headers,
                                       body: JSON.stringify({ meetingCode: meetingData.meeting_code, userId: req.userId }),
                                       credentials: 'include'
                                     })
@@ -2183,9 +2302,13 @@ function MeetingRoomContent({
                               <button
                                 onClick={async () => {
                                   try {
+                                    const token = typeof window !== 'undefined' ? sessionStorage.getItem('meetly_auth_token') : null
+                                    const headers = { 'Content-Type': 'application/json' }
+                                    if (token) headers['Authorization'] = `Bearer ${token}`
+
                                     const res = await fetch(`${import.meta.env.VITE_API_URL || 'http://localhost:5000'}/api/meetings/security/reject`, {
                                       method: 'POST',
-                                      headers: { 'Content-Type': 'application/json' },
+                                      headers,
                                       body: JSON.stringify({ meetingCode: meetingData.meeting_code, userId: req.userId }),
                                       credentials: 'include'
                                     })
