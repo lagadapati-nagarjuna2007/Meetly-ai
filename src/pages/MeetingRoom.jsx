@@ -367,6 +367,14 @@ function MeetingRoomInner() {
 
 
 
+  const serverUrl = livekitUrl || import.meta.env.VITE_LIVEKIT_URL
+
+  useEffect(() => {
+    if (livekitToken && serverUrl) {
+      console.log('[LiveKit Connection] Connecting LiveKitRoom to serverUrl:', serverUrl)
+    }
+  }, [livekitToken, serverUrl])
+
   // Configure Socket.IO connection
   useEffect(() => {
     if (!meetingData?.room_name) return
@@ -623,13 +631,7 @@ function MeetingRoomInner() {
     )
   }
 
-  const serverUrl = livekitUrl || import.meta.env.VITE_LIVEKIT_URL
 
-  useEffect(() => {
-    if (livekitToken && serverUrl) {
-      console.log('[LiveKit Connection] Connecting LiveKitRoom to serverUrl:', serverUrl)
-    }
-  }, [livekitToken, serverUrl])
 
   // Loading UI
   if (isLoading || !livekitToken || !meetingData || isIntentionalLeaveRef.current) {
