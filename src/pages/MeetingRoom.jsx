@@ -184,6 +184,15 @@ function MeetingRoomInner() {
         setRoomError(null)
         const data = await fetchMeetingDetails(id)
         if (!isMounted) return
+        // REFRESH GUARD: If meeting is already Ended (e.g. participant refreshes after host ended it),
+        // do not allow re-entry. Show clear error and redirect after a short delay.
+        if (data.meeting?.meeting_status === 'Ended') {
+          console.log('[MeetingRoom] Meeting is already ended. Blocking re-entry.')
+          setRoomError('This meeting has ended.')
+          setIsLoading(false)
+          setTimeout(() => { if (isMounted) navigate('/') }, 3000)
+          return
+        }
         setMeetingData(data.meeting)
       } catch (err) {
         if (!isMounted) return
@@ -200,7 +209,8 @@ function MeetingRoomInner() {
     return () => {
       isMounted = false
     }
-  }, [id, fetchMeetingDetails, showToast])
+  }, [id, fetchMeetingDetails, showToast, navigate])
+
 
   // Synced host verification
   useEffect(() => {
@@ -485,36 +495,49 @@ function MeetingRoomInner() {
     }
   }, [meetingData?.room_name])
 
-  // Error UI
+  // Error UI — differentiate "meeting ended" from other errors
   if (roomError) {
+    const isMeetingEnded = roomError === 'This meeting has ended.'
     return (
       <div className="fixed inset-0 z-40 bg-[#04050b] flex flex-col items-center justify-center p-6 text-center select-none">
-        <div className="max-w-md w-full bg-slate-900/90 border border-red-500/20 rounded-2xl p-6 flex flex-col items-center gap-4 shadow-2xl">
-          <div className="w-12 h-12 rounded-full bg-red-500/10 border border-red-500/20 flex items-center justify-center text-red-400">
-            <AlertTriangle size={24} />
+        <div className={`max-w-md w-full bg-slate-900/90 border ${
+          isMeetingEnded ? 'border-purple-500/20' : 'border-red-500/20'
+        } rounded-2xl p-6 flex flex-col items-center gap-4 shadow-2xl`}>
+          <div className={`w-12 h-12 rounded-full flex items-center justify-center text-2xl ${
+            isMeetingEnded
+              ? 'bg-purple-500/10 border border-purple-500/20'
+              : 'bg-red-500/10 border border-red-500/20'
+          }`}>
+            {isMeetingEnded ? <span>🏁</span> : <AlertTriangle size={24} className="text-red-400" />}
           </div>
-          <h2 className="text-base font-bold text-white">Unable to Join Meeting</h2>
+          <h2 className="text-base font-bold text-white">
+            {isMeetingEnded ? 'Meeting Ended' : 'Unable to Join Meeting'}
+          </h2>
           <p className="text-xs text-gray-400 bg-black/40 border border-white/5 p-3 rounded-xl w-full text-center">
-            {roomError}
+            {isMeetingEnded
+              ? 'This meeting has been ended by the host. Redirecting you to the dashboard…'
+              : roomError}
           </p>
           <div className="flex items-center gap-3 w-full mt-2">
-            <button
-              onClick={() => {
-                setRoomError(null)
-                setIsLoading(true)
-                joinAttemptedRef.current = false
-                window.location.reload()
-              }}
-              className="flex-1 px-4 py-2.5 bg-slate-800 hover:bg-slate-700 text-white rounded-xl text-xs font-bold transition-all cursor-pointer flex items-center justify-center gap-2"
-            >
-              <RefreshCw size={14} />
-              <span>Retry</span>
-            </button>
+            {!isMeetingEnded && (
+              <button
+                onClick={() => {
+                  setRoomError(null)
+                  setIsLoading(true)
+                  joinAttemptedRef.current = false
+                  window.location.reload()
+                }}
+                className="flex-1 px-4 py-2.5 bg-slate-800 hover:bg-slate-700 text-white rounded-xl text-xs font-bold transition-all cursor-pointer flex items-center justify-center gap-2"
+              >
+                <RefreshCw size={14} />
+                <span>Retry</span>
+              </button>
+            )}
             <button
               onClick={() => navigate('/')}
               className="flex-1 px-4 py-2.5 bg-purple-600 hover:bg-purple-500 text-white rounded-xl text-xs font-bold transition-all cursor-pointer"
             >
-              Back to Home
+              {isMeetingEnded ? 'Go to Dashboard' : 'Back to Home'}
             </button>
           </div>
         </div>
@@ -1188,8 +1211,13 @@ function MeetingRoomContent({
     setIsShuttingDown(false)
 
     try {
-      console.log('[Frontend] Meeting ended. Redirecting user to dashboard.')
+      console.log('[Frontend] Calling endMeeting API...')
       await endMeeting(meetingData.meeting_id)
+      // The server already emits meeting_ended to all room members via the REST handler.
+      // Also emit from host socket as a secondary safety net.
+      if (socket?.current && meetingData.room_name) {
+        socket.current.emit('end_meeting', meetingData.room_name)
+      }
       showToast('Meeting ended successfully.', 'success')
       navigate('/')
     } catch (err) {

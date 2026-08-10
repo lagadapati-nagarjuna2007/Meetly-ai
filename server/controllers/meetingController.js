@@ -248,7 +248,10 @@ export const createMeeting = async (req, res) => {
           meeting_password_hash: passwordHash,
           meeting_type: type,
           enable_ai_analyzer: !!enableAiAnalyzer,
-          enable_ai_attendance: !!enableAiAttendance
+          enable_ai_attendance: !!enableAiAttendance,
+          // Explicitly set auto_admit=true so joinMeeting never gets NULL and
+          // can't accidentally route participants to the waiting room
+          auto_admit: true
         }
       ])
       .select()
@@ -421,7 +424,9 @@ export const joinMeeting = async (req, res) => {
     console.log(`[AUTH DEBUG]\nemail: ${req.user.email}\nuserId: ${req.user.id}\nmeetingCode: ${uppercaseCode}\nisHost: ${isHost}`)
 
     // Step 3.5: Handle Waiting Room / Auto Admit Setting
-    if (meeting.auto_admit === false && !isHost) {
+    // Use !== true so that null/undefined (DB default) is also treated as "waiting room required"
+    // Only skip the waiting room when auto_admit is explicitly true
+    if (meeting.auto_admit !== true && !isHost) {
       // Check if user is already joined (to handle reconnects / refreshes)
       const { data: currentPart } = await supabase
         .from('participants')
@@ -745,6 +750,17 @@ Stack/Caller: endMeeting inside meetingController.js
     }
 
     clearMeetingCounters(meeting.meeting_id)
+
+    // BUG 2 FIX: Emit meeting_ended to ALL connected participants via Socket.IO.
+    // This must happen server-side so participants are notified even before
+    // the host's browser socket disconnects on navigation.
+    const io = req.app.get('io')
+    if (io && meeting.room_name) {
+      io.to(meeting.room_name).emit('meeting_ended')
+      console.log(`[End] Emitted 'meeting_ended' to Socket.IO room: ${meeting.room_name}`)
+    } else {
+      console.warn(`[End] io or room_name not available, participants may not receive meeting_ended event.`)
+    }
 
     console.log(`[End] Meeting ${meeting.meeting_id} ended by host ${req.user.id}. All participants marked as left.`)
 
