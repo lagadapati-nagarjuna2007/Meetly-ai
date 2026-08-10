@@ -778,6 +778,9 @@ function MeetingRoomContent({
   const [attendanceCamError, setAttendanceCamError] = useState(false)
   const [isShuttingDown, setIsShuttingDown] = useState(false)
 
+  // Timer state — must live here with all other useState calls to avoid hook-order violations
+  const [seconds, setSeconds] = useState(0)
+
   // Drawer Panel Toggles
   const [rightPanelOpen, setRightPanelOpen] = useState(true)
   const [activeTab, setActiveTab] = useState('chat') // chat | participants | ai
@@ -1754,8 +1757,7 @@ function MeetingRoomContent({
     }
   }, [meetingData, roomState, user, showToast])
 
-  // Timer simulation
-  const [seconds, setSeconds] = useState(0)
+  // Timer simulation — effect only; state is declared at the top of this component
   useEffect(() => {
     console.log('[MeetingRoomContent useEffect timer] Starting timer...')
     const timer = setInterval(() => {
