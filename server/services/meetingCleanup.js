@@ -12,6 +12,7 @@ const GRACE_PERIOD_MS = parseInt(process.env.CLEANUP_GRACE_PERIOD_MS || '45000',
  */
 export const scheduleCleanup = (meetingId, meetingCode, roomName) => {
   if (!meetingId) return
+  console.log(`[Cleanup Function Call] scheduleCleanup called for meetingId: ${meetingId}, meetingCode: ${meetingCode}`)
   if (activeCleanupTimers.has(meetingId)) {
     console.log(`[Cleanup] Cleanup timer already active for meeting ${meetingId}.`)
     return
@@ -26,14 +27,35 @@ export const scheduleCleanup = (meetingId, meetingCode, roomName) => {
       // Double-check if there are still 0 active participants in the database
       const { data: activeParts, error: partErr } = await supabase
         .from('participants')
-        .select('participant_id')
+        .select('participant_id, role, participant_status')
         .eq('meeting_id', meetingId)
         .eq('participant_status', 'joined')
 
       if (partErr) throw partErr
 
-      if (!activeParts || activeParts.length === 0) {
+      const activeCount = activeParts ? activeParts.length : 0
+
+      if (activeCount === 0) {
         const now = new Date().toISOString()
+        
+        // Fetch meeting details for debug info
+        const { data: mtgData } = await supabase.from('meetings').select('*').eq('meeting_id', meetingId).maybeSingle()
+
+        console.log(`
+[Meeting End Debug]
+MeetingId: ${meetingId}
+MeetingCode: ${meetingCode}
+AuthenticatedUserId: SYSTEM_CLEANUP
+HostId: ${mtgData?.host_id}
+Trigger: scheduleCleanup Timer Expiry
+ActiveSocketCount: N/A
+HostSocketPresent: N/A
+ActiveParticipantCount: 0
+HostParticipantStatus: N/A
+MeetingStatus: ${mtgData?.meeting_status}
+Stack/Caller: setTimeout inside meetingCleanup.js
+`)
+
         console.log(`[Cleanup] Grace period expired. Ending meeting ${meetingId} permanently.`)
 
         // 1. Update meeting status to Ended
@@ -61,7 +83,7 @@ export const scheduleCleanup = (meetingId, meetingCode, roomName) => {
         // 3. Clear meeting counters
         clearMeetingCounters(meetingId)
       } else {
-        console.log(`[Cleanup] Grace period expired for meeting ${meetingId}, but active participants exist. Skipping cleanup.`)
+        console.log(`[Cleanup] Grace period expired for meeting ${meetingId}, but active participants exist (count: ${activeCount}). Skipping cleanup.`)
       }
     } catch (err) {
       console.error(`[Cleanup Error] Failed to execute cleanup for meeting ${meetingId}:`, err)
@@ -76,6 +98,7 @@ export const scheduleCleanup = (meetingId, meetingCode, roomName) => {
  */
 export const cancelCleanup = (meetingId) => {
   if (!meetingId) return
+  console.log(`[Cleanup Function Call] cancelCleanup called for meetingId: ${meetingId}`)
   if (activeCleanupTimers.has(meetingId)) {
     console.log(`[Cleanup] Participant rejoined meeting ${meetingId}. Cancelling pending cleanup timer.`)
     clearTimeout(activeCleanupTimers.get(meetingId))

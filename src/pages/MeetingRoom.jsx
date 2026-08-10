@@ -119,6 +119,7 @@ function MeetingRoomInner() {
   const [roomError, setRoomError] = useState(null)
   const [attendanceConsent, setAttendanceConsent] = useState(null)
   const joinAttemptedRef = useRef(false)
+  const isIntentionalLeaveRef = useRef(false)
 
   const [chatMessages, setChatMessages] = useState([
     { name: 'System', text: 'Welcome to the meeting room. Chat messages and AI queries are enabled.' }
@@ -205,6 +206,10 @@ function MeetingRoomInner() {
 
     let timeoutId = null
     const ensureToken = async () => {
+      if (isIntentionalLeaveRef.current) {
+        console.log('[MeetingRoom useEffect 2] Intentional leave in progress, skipping auto-join.')
+        return
+      }
       if (meetingData && !livekitToken && !joinAttemptedRef.current) {
         // If AI Attendance is enabled, wait until consent is resolved before joining
         if (meetingData.enable_ai_attendance && attendanceConsent === null) {
@@ -264,24 +269,11 @@ function MeetingRoomInner() {
     }
   }, [meetingData, livekitToken, joinMeeting, showToast, attendanceConsent, isWaitingForApproval])
 
-  // 3. Browser Tab Close & Refresh Handling (sendBeacon)
-  useEffect(() => {
-    const handleBeforeUnload = () => {
-      if (meetingData?.meeting_id) {
-        console.log('[Unload] Sending beacon for leaveMeeting:', meetingData.meeting_id)
-        const apiUrl = `${import.meta.env.VITE_API_URL || 'http://localhost:5000'}/api/meetings/leave?meetingId=${meetingData.meeting_id}`
-        navigator.sendBeacon(apiUrl)
-      }
-    }
 
-    window.addEventListener('beforeunload', handleBeforeUnload)
-    return () => {
-      window.removeEventListener('beforeunload', handleBeforeUnload)
-    }
-  }, [meetingData?.meeting_id])
 
   const handleLeave = useCallback(async () => {
     console.log('[MeetingRoom] handleLeave triggered')
+    isIntentionalLeaveRef.current = true
     if (meetingData) {
       try {
         await leaveMeeting(meetingData.meeting_id)
@@ -302,6 +294,7 @@ function MeetingRoomInner() {
     const confirmEnd = window.confirm('Are you sure you want to end this meeting for all participants?')
     if (!confirmEnd) return
 
+    isIntentionalLeaveRef.current = true
     try {
       await endMeeting(meetingData.meeting_id)
       showToast('Meeting ended successfully.', 'success')
@@ -316,6 +309,7 @@ function MeetingRoomInner() {
     const confirmDel = window.confirm('Are you sure you want to delete this meeting?')
     if (!confirmDel) return
 
+    isIntentionalLeaveRef.current = true
     try {
       await deleteMeeting(meetingData.meeting_id)
       showToast('Meeting deleted successfully.', 'success')
@@ -597,6 +591,14 @@ function MeetingRoomInner() {
     )
   }
 
+  const serverUrl = livekitUrl || import.meta.env.VITE_LIVEKIT_URL
+
+  useEffect(() => {
+    if (livekitToken && serverUrl) {
+      console.log('[LiveKit Connection] Connecting LiveKitRoom to serverUrl:', serverUrl)
+    }
+  }, [livekitToken, serverUrl])
+
   // Loading UI
   if (isLoading || !livekitToken || !meetingData) {
     return (
@@ -609,9 +611,6 @@ function MeetingRoomInner() {
     )
   }
 
-  const serverUrl = livekitUrl || import.meta.env.VITE_LIVEKIT_URL
-  console.log('[LiveKit Connection] Connecting LiveKitRoom to serverUrl:', serverUrl)
-
   return (
     <LiveKitRoom
       token={livekitToken}
@@ -621,7 +620,11 @@ function MeetingRoomInner() {
       audio={false}
       onDisconnected={() => {
         console.log('[LiveKit Connection] Event onDisconnected triggered')
-        handleLeave()
+        if (isIntentionalLeaveRef.current) {
+          console.log('[LiveKit Connection] Intentional disconnect, leave already handled.')
+        } else {
+          console.log('[LiveKit Connection] Temporary/automatic disconnect. Allowing reconnect lifecycle to operate.')
+        }
       }}
       onError={(err) => {
         console.error('[LiveKit Connection] Event onError triggered:', err)
@@ -652,6 +655,7 @@ function MeetingRoomInner() {
         handleLeaveWithAttendanceRef={handleLeaveWithAttendanceRef}
         waitingRequests={waitingRequests}
         fetchWaitingRequests={fetchWaitingRequests}
+        isIntentionalLeaveRef={isIntentionalLeaveRef}
       />
       <RoomAudioRenderer />
     </LiveKitRoom>
@@ -707,7 +711,8 @@ function MeetingRoomContent({
   setTypingUsers,
   handleLeaveWithAttendanceRef,
   waitingRequests,
-  fetchWaitingRequests
+  fetchWaitingRequests,
+  isIntentionalLeaveRef
 }) {
   const navigate = useNavigate()
   const room = useMaybeRoomContext()
@@ -1033,6 +1038,9 @@ function MeetingRoomContent({
 
   const handleLeaveWithAttendance = async () => {
     console.log('[Attendance Finalize Trigger] leave-button')
+    if (isIntentionalLeaveRef) {
+      isIntentionalLeaveRef.current = true
+    }
     setIsShuttingDown(true)
     stopTranscriptCapture()
     await waitPendingTranscriptUploads()
@@ -1058,6 +1066,9 @@ function MeetingRoomContent({
     if (!confirmEnd) return
 
     console.log('[Attendance Finalize Trigger] host-ended-meeting')
+    if (isIntentionalLeaveRef) {
+      isIntentionalLeaveRef.current = true
+    }
     setIsShuttingDown(true)
     stopTranscriptCapture()
     await waitPendingTranscriptUploads()

@@ -14,7 +14,7 @@ const isUuid = (val) => {
 
 // Clean up stale meetings and orphaned participant records for a user.
 // This ensures that abandoned meetings never permanently block meeting creation.
-const cleanupStaleMeetings = async (userId, isCreateIntent = false) => {
+const cleanupStaleMeetings = async (userId, isCreateIntent = false, targetMeetingId = null) => {
   const now = new Date()
   const threeMinutesAgo = new Date(now.getTime() - 3 * 60 * 1000).toISOString()
 
@@ -30,6 +30,20 @@ const cleanupStaleMeetings = async (userId, isCreateIntent = false) => {
 
     if (expiredWaiting && expiredWaiting.length > 0) {
       for (const m of expiredWaiting) {
+        console.log(`
+[Meeting End Debug]
+MeetingId: ${m.meeting_id}
+MeetingCode: N/A (Expired Waiting)
+AuthenticatedUserId: ${userId}
+HostId: ${userId}
+Trigger: cleanupStaleMeetings Expire Waiting (>3 mins)
+ActiveSocketCount: N/A
+HostSocketPresent: N/A
+ActiveParticipantCount: 0
+HostParticipantStatus: N/A
+MeetingStatus: Waiting
+Stack/Caller: cleanupStaleMeetings Part 1
+`)
         console.log(`[Cleanup] Waiting meeting ${m.meeting_id} expired.`)
         await supabase
           .from('meetings')
@@ -63,19 +77,25 @@ const cleanupStaleMeetings = async (userId, isCreateIntent = false) => {
       }
     }
 
-    // 3. If user has intent to create a NEW meeting from Dashboard (isCreateIntent = true),
-    // clean up any abandoned joined participant records in existing Active/Waiting meetings.
-    if (isCreateIntent) {
+    // 3. Clean up any abandoned joined participant records in existing Active/Waiting meetings.
+    // If the user has isCreateIntent = true (creating a new meeting) OR they are joining a DIFFERENT meeting (targetMeetingId is set),
+    // we release their seat in other active meetings.
+    if (isCreateIntent || targetMeetingId) {
       const { data: activeJoined } = await supabase
         .from('participants')
-        .select('participant_id, meeting_id, meetings(meeting_id, host_id, meeting_status)')
+        .select('participant_id, meeting_id, meetings(meeting_id, host_id, meeting_status, meeting_code)')
         .eq('user_id', userId)
         .in('participant_status', ['joined', 'disconnected'])
 
       if (activeJoined && activeJoined.length > 0) {
         for (const p of activeJoined) {
+          // If we are joining a specific meeting, do not clear the participant record for that meeting
+          if (targetMeetingId && p.meeting_id === targetMeetingId) {
+            continue
+          }
+
           if (p.meetings && (p.meetings.meeting_status === 'Active' || p.meetings.meeting_status === 'Waiting')) {
-            console.log(`[Cleanup] User ${userId} creating new meeting from dashboard. Marking participant ${p.participant_id} in meeting ${p.meeting_id} as left.`)
+            console.log(`[Cleanup] Releasing seat for user ${userId} in meeting ${p.meeting_id} (Code: ${p.meetings.meeting_code}). Marking as left.`)
             await supabase
               .from('participants')
               .update({ participant_status: 'left', left_at: now.toISOString() })
@@ -89,6 +109,20 @@ const cleanupStaleMeetings = async (userId, isCreateIntent = false) => {
               .eq('participant_status', 'joined')
 
             if (!remaining || remaining.length === 0) {
+              console.log(`
+[Meeting End Debug]
+MeetingId: ${p.meeting_id}
+MeetingCode: ${p.meetings?.meeting_code || 'N/A'}
+AuthenticatedUserId: ${userId}
+HostId: ${p.meetings?.host_id}
+Trigger: cleanupStaleMeetings release seat (No active participants)
+ActiveSocketCount: N/A
+HostSocketPresent: N/A
+ActiveParticipantCount: 0
+HostParticipantStatus: N/A
+MeetingStatus: ${p.meetings?.meeting_status}
+Stack/Caller: cleanupStaleMeetings Part 3 (release seat)
+`)
               console.log(`[Cleanup] Meeting ${p.meeting_id} ended because no active participants.`)
               await supabase
                 .from('meetings')
@@ -361,7 +395,7 @@ export const joinMeeting = async (req, res) => {
     }
 
     // Step 1: Clean up stale state before checking
-    await cleanupStaleMeetings(req.user.id, false)
+    await cleanupStaleMeetings(req.user.id, false, meeting.meeting_id)
 
     // Step 2: Block only if user is in a DIFFERENT active meeting
     const activeMeetingId = await getUserActiveMeetingId(req.user.id, meeting.meeting_id)
@@ -394,8 +428,8 @@ export const joinMeeting = async (req, res) => {
         .eq('user_id', req.user.id)
         .maybeSingle()
 
-      // The rejoin exception satisfies: participant row exists and status is joined or left
-      const isApprovedRejoin = currentPart && (currentPart.participant_status === 'joined' || currentPart.participant_status === 'left')
+      // The rejoin exception satisfies: participant row exists and status is joined or disconnected
+      const isApprovedRejoin = currentPart && (currentPart.participant_status === 'joined' || currentPart.participant_status === 'disconnected')
 
       if (!isApprovedRejoin) {
         // Check if there is already a pending request
@@ -597,6 +631,7 @@ export const activateMeeting = async (req, res) => {
 export const leaveMeeting = async (req, res) => {
   try {
     const meetingId = req.body?.meetingId || req.query?.meetingId
+    console.log(`[Leave Function Call] leaveMeeting called for meetingId: ${meetingId}, user: ${req.user?.id}`)
 
     if (!meetingId) {
       return res.status(400).json({ message: 'Meeting identifier is required.' })
@@ -650,6 +685,7 @@ export const leaveMeeting = async (req, res) => {
 export const endMeeting = async (req, res) => {
   try {
     const { meetingId } = req.body
+    console.log(`[End Function Call] endMeeting called for meetingId: ${meetingId}, user: ${req.user?.id}`)
 
     const auth = await authorizeHost(meetingId, req.user.id)
     if (!auth.passed) {
@@ -658,6 +694,21 @@ export const endMeeting = async (req, res) => {
     const meeting = auth.meeting
 
     const now = new Date().toISOString()
+
+    console.log(`
+[Meeting End Debug]
+MeetingId: ${meeting.meeting_id}
+MeetingCode: ${meeting.meeting_code}
+AuthenticatedUserId: ${req.user.id}
+HostId: ${meeting.host_id}
+Trigger: endMeeting API call (Host Initiated)
+ActiveSocketCount: N/A
+HostSocketPresent: N/A
+ActiveParticipantCount: N/A
+HostParticipantStatus: N/A
+MeetingStatus: ${meeting.meeting_status}
+Stack/Caller: endMeeting inside meetingController.js
+`)
 
     const { error: updateMtgErr } = await supabase
       .from('meetings')
