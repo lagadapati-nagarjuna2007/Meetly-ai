@@ -26,3 +26,9 @@ dist
 *.njsproj
 *.sln
 *.sw?
+
+# OAuth and Secrets
+credentials.json
+token.json
+*credentials*.json
+*token*.json

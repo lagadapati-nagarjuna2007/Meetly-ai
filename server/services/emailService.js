@@ -1,4 +1,4 @@
-import { Resend } from 'resend'
+import { google } from 'googleapis'
 import dotenv from 'dotenv'
 import path from 'path'
 import { fileURLToPath } from 'url'
@@ -6,17 +6,52 @@ import { fileURLToPath } from 'url'
 const __dirname = path.dirname(fileURLToPath(import.meta.url))
 dotenv.config({ path: path.resolve(__dirname, '../../.env') })
 
-export const sendOtpEmail = async (email, name, otp, isPasswordReset = false) => {
-  const apiKey = process.env.RESEND_API_KEY
-  if (!apiKey) {
-    console.error('[Resend Error] RESEND_API_KEY environment variable is missing.')
-    throw new Error('Email service configuration error: RESEND_API_KEY is not set on the server.')
+/**
+ * Creates and configures the Google OAuth2 client and Gmail API instance.
+ */
+const getGmailClient = () => {
+  const clientId = process.env.GMAIL_CLIENT_ID
+  const clientSecret = process.env.GMAIL_CLIENT_SECRET
+  const refreshToken = process.env.GMAIL_REFRESH_TOKEN
+
+  if (!clientId || !clientSecret || !refreshToken) {
+    const missing = []
+    if (!clientId) missing.push('GMAIL_CLIENT_ID')
+    if (!clientSecret) missing.push('GMAIL_CLIENT_SECRET')
+    if (!refreshToken) missing.push('GMAIL_REFRESH_TOKEN')
+    console.error(`[Email Service Error] Missing required Gmail OAuth credentials: ${missing.join(', ')}`)
+    throw new Error(`Email service configuration error: Missing environment variables (${missing.join(', ')}).`)
   }
 
-  const resend = new Resend(apiKey)
+  const oauth2Client = new google.auth.OAuth2(clientId, clientSecret)
+  oauth2Client.setCredentials({ refresh_token: refreshToken })
 
+  return google.gmail({ version: 'v1', auth: oauth2Client })
+}
+
+/**
+ * Helper to encode raw RFC 2822 email text into URL-safe Base64 (base64url) format.
+ */
+const encodeBase64Url = (str) => {
+  return Buffer.from(str)
+    .toString('base64')
+    .replace(/\+/g, '-')
+    .replace(/\//g, '_')
+    .replace(/=+$/, '')
+}
+
+/**
+ * Sends an OTP email to the specified recipient via Gmail API.
+ * 
+ * @param {string} email - Recipient email address
+ * @param {string} name - Recipient full name
+ * @param {string} otp - 6-digit OTP code
+ * @param {boolean} isPasswordReset - True if for forgot-password, false for signup/resend
+ */
+export const sendOtpEmail = async (email, name, otp, isPasswordReset = false) => {
+  const senderEmail = process.env.GMAIL_SENDER_EMAIL || 'me'
   const subject = isPasswordReset ? 'Reset your Meetly AI Password' : 'Verify your Meetly AI Account'
-  
+
   const htmlContent = `
     <div style="font-family: 'Segoe UI', Roboto, sans-serif; background-color: #070814; color: #f3f4f6; padding: 40px; border-radius: 20px; max-width: 480px; margin: auto; border: 1px solid rgba(255, 255, 255, 0.08); box-shadow: 0 10px 30px rgba(0,0,0,0.5);">
       <div style="text-align: center; margin-bottom: 24px;">
@@ -37,25 +72,36 @@ export const sendOtpEmail = async (email, name, otp, isPasswordReset = false) =>
     </div>
   `
 
-  const fromAddress = process.env.EMAIL_FROM || 'Meetly AI <onboarding@resend.dev>'
+  // Build standard RFC 2822 message string
+  const rfc2822Message = [
+    `From: Meetly AI <${senderEmail}>`,
+    `To: ${email}`,
+    `Subject: ${subject}`,
+    'MIME-Version: 1.0',
+    'Content-Type: text/html; charset=utf-8',
+    '',
+    htmlContent
+  ].join('\r\n')
 
   try {
-    const { data, error } = await resend.emails.send({
-      from: fromAddress,
-      to: [email],
-      subject,
-      html: htmlContent
+    console.log(`[Email Service] Preparing Gmail API request for recipient: ${email}...`)
+    const gmail = getGmailClient()
+    const rawEncoded = encodeBase64Url(rfc2822Message)
+
+    const response = await gmail.users.messages.send({
+      userId: 'me',
+      requestBody: {
+        raw: rawEncoded
+      }
     })
 
-    if (error) {
-      console.error('[Resend Error] Failed to send email:', error.message || error)
-      throw new Error(error.message || 'Failed to send verification email via Resend.')
-    }
-
-    console.log(`[Resend Success] Email sent successfully to ${email} (Message ID: ${data?.id})`)
-    return data
+    console.log(`[Email Service] Gmail API email sent successfully to ${email} (Message ID: ${response.data.id})`)
+    return response.data
   } catch (err) {
-    console.error('[Email Service Error] Failed to send OTP email:', err.message || err)
-    throw err
+    console.error(`[Email Service Error] Failed to send OTP email to ${email}:`, err.message || err)
+    if (err.response && err.response.data) {
+      console.error('[Email Service Error Details]', err.response.data.error || err.response.data)
+    }
+    throw new Error(err.message || 'Failed to send verification email via Gmail API.')
   }
 }
