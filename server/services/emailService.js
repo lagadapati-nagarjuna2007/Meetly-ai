@@ -1,4 +1,4 @@
-import nodemailer from 'nodemailer'
+import { Resend } from 'resend'
 import dotenv from 'dotenv'
 import path from 'path'
 import { fileURLToPath } from 'url'
@@ -6,15 +6,15 @@ import { fileURLToPath } from 'url'
 const __dirname = path.dirname(fileURLToPath(import.meta.url))
 dotenv.config({ path: path.resolve(__dirname, '../../.env') })
 
-const transporter = nodemailer.createTransport({
-  service: 'gmail',
-  auth: {
-    user: process.env.EMAIL_USER,
-    pass: process.env.EMAIL_PASS
-  }
-})
-
 export const sendOtpEmail = async (email, name, otp, isPasswordReset = false) => {
+  const apiKey = process.env.RESEND_API_KEY
+  if (!apiKey) {
+    console.error('[Resend Error] RESEND_API_KEY environment variable is missing.')
+    throw new Error('Email service configuration error: RESEND_API_KEY is not set on the server.')
+  }
+
+  const resend = new Resend(apiKey)
+
   const subject = isPasswordReset ? 'Reset your Meetly AI Password' : 'Verify your Meetly AI Account'
   
   const htmlContent = `
@@ -37,12 +37,25 @@ export const sendOtpEmail = async (email, name, otp, isPasswordReset = false) =>
     </div>
   `
 
-  const mailOptions = {
-    from: `"Meetly AI" <${process.env.EMAIL_USER}>`,
-    to: email,
-    subject,
-    html: htmlContent
-  }
+  const fromAddress = process.env.EMAIL_FROM || 'Meetly AI <onboarding@resend.dev>'
 
-  return transporter.sendMail(mailOptions)
+  try {
+    const { data, error } = await resend.emails.send({
+      from: fromAddress,
+      to: [email],
+      subject,
+      html: htmlContent
+    })
+
+    if (error) {
+      console.error('[Resend Error] Failed to send email:', error.message || error)
+      throw new Error(error.message || 'Failed to send verification email via Resend.')
+    }
+
+    console.log(`[Resend Success] Email sent successfully to ${email} (Message ID: ${data?.id})`)
+    return data
+  } catch (err) {
+    console.error('[Email Service Error] Failed to send OTP email:', err.message || err)
+    throw err
+  }
 }
