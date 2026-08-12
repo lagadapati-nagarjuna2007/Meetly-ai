@@ -448,34 +448,6 @@ function MeetingRoomInner() {
         }
       })
 
-      socket.current.on('host_mute_toggle', async ({ userId, participantIdentity, mute }) => {
-        const currentUserId = user?.id
-        const localIdentity = localParticipant?.identity
-        const isMe = (currentUserId && userId === currentUserId) || (localIdentity && participantIdentity === localIdentity)
-
-        if (isMe && localParticipant) {
-          if (mute) {
-            try {
-              await localParticipant.setMicrophoneEnabled(false)
-              console.log('[Security Socket] Host muted your microphone.')
-              showToast('The host has muted your microphone.', 'info')
-            } catch (err) {
-              console.error('[Host Remote Mute Error]', err)
-            }
-          } else {
-            const confirmUnmute = window.confirm('The host has requested you to unmute your microphone. Would you like to unmute now?')
-            if (confirmUnmute) {
-              try {
-                await localParticipant.setMicrophoneEnabled(true)
-                showToast('Microphone unmuted.', 'success')
-              } catch (err) {
-                console.error('[Host Remote Unmute Error]', err)
-              }
-            }
-          }
-        }
-      })
-
       socket.current.on('waiting_list_updated', () => {
         console.log('[Security Socket] waiting_list_updated received.')
         if (isHostRef.current) {
@@ -933,6 +905,9 @@ function MeetingRoomContent({
     }
   }, [room, roomState, localParticipant])
 
+  // Track whether local microphone was muted by host
+  const wasMutedByHostRef = useRef(false)
+
   // Track state change listener to force re-render when remote participants mute/unmute
   const [, setTrackTick] = useState(0)
   const forceTrackUpdate = useCallback(() => setTrackTick((t) => t + 1), [])
@@ -953,6 +928,56 @@ function MeetingRoomContent({
       room.off(RoomEvent.ParticipantAttributesChanged, forceTrackUpdate)
     }
   }, [room, forceTrackUpdate])
+
+  // Socket.IO listener for host_mute_toggle to synchronize local LiveKit microphone state
+  useEffect(() => {
+    const currentSocket = socket?.current
+    if (!currentSocket) return
+
+    const handleHostMuteToggle = async ({ userId, participantIdentity, mute }) => {
+      const currentUserId = user?.id
+      const localIdentity = localParticipant?.identity
+      const isMe = (currentUserId && userId === currentUserId) ||
+                   (localIdentity && participantIdentity === localIdentity) ||
+                   (currentUserId && participantIdentity === currentUserId)
+
+      console.log(`[Host Mute Event] Received host_mute_toggle for isMe=${isMe}, mute=${mute}, localIdentity=${localIdentity}, participantIdentity=${participantIdentity}`)
+
+      if (isMe && localParticipant) {
+        if (mute) {
+          try {
+            wasMutedByHostRef.current = true
+            console.log('[Host Remote Mute] Disabling local microphone via setMicrophoneEnabled(false)...')
+            await localParticipant.setMicrophoneEnabled(false)
+            setMicActive(false)
+            showToast('The host muted your microphone.', 'info')
+          } catch (err) {
+            console.error('[Host Remote Mute Error] Failed to disable microphone:', err)
+          }
+        } else {
+          if (wasMutedByHostRef.current) {
+            try {
+              wasMutedByHostRef.current = false
+              console.log('[Host Remote Unmute] Restoring local microphone via setMicrophoneEnabled(true)...')
+              await localParticipant.setMicrophoneEnabled(true)
+              setMicActive(true)
+              showToast('Microphone unmuted.', 'success')
+            } catch (err) {
+              console.error('[Host Remote Unmute Error] Failed to enable microphone:', err)
+            }
+          } else {
+            console.log('[Host Remote Unmute] Ignoring host unmute because microphone was not muted by host.')
+          }
+        }
+      }
+    }
+
+    currentSocket.on('host_mute_toggle', handleHostMuteToggle)
+
+    return () => {
+      currentSocket.off('host_mute_toggle', handleHostMuteToggle)
+    }
+  }, [socket, user, localParticipant, showToast])
 
   const uploadAttendance = async () => {
     if (isHost) {
@@ -1934,6 +1959,7 @@ function MeetingRoomContent({
     try {
       const nextState = !micActive
       console.log(`[Microphone Toggle] Setting microphone to ${nextState ? 'ON' : 'OFF'}...`)
+      wasMutedByHostRef.current = false
       await localParticipant.setMicrophoneEnabled(nextState)
       setMicActive(nextState)
       showToast(nextState ? 'Microphone unmuted' : 'Microphone muted', 'info')
