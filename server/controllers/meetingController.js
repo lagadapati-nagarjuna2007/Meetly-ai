@@ -1330,15 +1330,15 @@ export const submitAttendance = async (req, res) => {
       return res.status(400).json({ message: 'Meeting ID is required.' })
     }
 
-    // Fetch the meeting to check if current user is the host
+    // Fetch the meeting to check host_id and meeting timestamps (started_at, ended_at, created_at)
     const { data: meetingCheck, error: mErrCheck } = await supabase
       .from('meetings')
-      .select('host_id')
+      .select('host_id, started_at, ended_at, created_at')
       .eq('meeting_id', meetingId)
       .maybeSingle()
 
     if (mErrCheck) {
-      console.error('[Attendance Error] Failed to fetch meeting host_id:', mErrCheck)
+      console.error('[Attendance Error] Failed to fetch meeting details:', mErrCheck)
     } else if (meetingCheck && meetingCheck.host_id === req.user.id) {
       console.log('[Attendance] Bypassing attendance submission: User is the meeting host.')
       return res.status(200).json({ message: 'Host attendance bypassed.' })
@@ -1379,12 +1379,29 @@ export const submitAttendance = async (req, res) => {
       console.log('[Attendance] Attendance INSERT (First Join): Initializing metrics')
     }
 
-    const finalPercentage = finalDuration > 0 ? (finalPresence / finalDuration) * 100 : 0
+    // Determine actual participant attendance duration (fallback to session duration if presence is 0)
+    const participantAttendanceSec = finalPresence > 0 ? finalPresence : finalDuration
+
+    // Calculate total meeting duration (from started_at to ended_at/now)
+    let totalMeetingSec = finalDuration
+    if (meetingCheck) {
+      const start = meetingCheck.started_at || meetingCheck.created_at
+      const end = meetingCheck.ended_at || new Date().toISOString()
+      if (start) {
+        const diffSec = Math.max(1, Math.round((new Date(end) - new Date(start)) / 1000))
+        totalMeetingSec = Math.max(diffSec, participantAttendanceSec)
+      }
+    }
+
+    const rawPercentage = totalMeetingSec > 0 ? (participantAttendanceSec / totalMeetingSec) * 100 : 0
+    const finalPercentage = Math.min(100, Number(rawPercentage.toFixed(2)))
     const finalStatus = finalPercentage >= 75 ? 'Present' : 'Absent'
 
     console.log('[Attendance Backend Mapped Values to Write]', {
       meetingId,
       userId: req.user.id,
+      participantAttendanceSec,
+      totalMeetingSec,
       finalDuration,
       finalPresence,
       finalPercentage: finalPercentage.toFixed(2),
@@ -1401,7 +1418,7 @@ export const submitAttendance = async (req, res) => {
           user_id: req.user.id,
           meeting_duration_seconds: finalDuration,
           presence_seconds: finalPresence,
-          attendance_percentage: Number(finalPercentage.toFixed(2)),
+          attendance_percentage: finalPercentage,
           status: finalStatus,
           camera_permission: finalCameraPermission
         },
@@ -1432,14 +1449,19 @@ export const getAttendanceReport = async (req, res) => {
       return res.status(400).json({ message: 'Meeting ID is required.' })
     }
 
-    // Fetch the meeting to find host_id
+    // Fetch the meeting to find host_id and timestamps
     const { data: meeting, error: mErr } = await supabase
       .from('meetings')
-      .select('host_id')
+      .select('host_id, started_at, ended_at, created_at')
       .eq('meeting_id', meetingId)
       .maybeSingle()
 
     const hostId = meeting?.host_id
+
+    // Compute total meeting duration in seconds
+    const start = meeting?.started_at ? new Date(meeting.started_at) : (meeting?.created_at ? new Date(meeting.created_at) : null)
+    const end = meeting?.ended_at ? new Date(meeting.ended_at) : new Date()
+    const totalMtgSec = start ? Math.max(1, Math.round((end - start) / 1000)) : 0
 
     // Join users table to get the user's full_name dynamically
     console.log(`[Attendance] Attendance SELECT running for report meetingId=${meetingId}`)
@@ -1462,18 +1484,25 @@ export const getAttendanceReport = async (req, res) => {
     const rowCount = records?.length || 0
     console.log(`[Attendance] Attendance SELECT returned ${rowCount} rows`)
 
-    // Map records to match frontend expected fields
-    const mapped = (records || []).map((rec) => ({
-      id: rec.id,
-      meeting_id: rec.meeting_id,
-      user_id: rec.user_id,
-      participant_name: rec.user?.full_name || 'Anonymous User',
-      meeting_duration_seconds: rec.meeting_duration_seconds,
-      presence_seconds: rec.presence_seconds,
-      attendance_percentage: rec.attendance_percentage,
-      status: rec.status,
-      camera_permission: rec.camera_permission
-    }))
+    // Map records to match frontend expected fields with accurate percentage calculation
+    const mapped = (records || []).map((rec) => {
+      const pAttendanceSec = rec.presence_seconds > 0 ? rec.presence_seconds : rec.meeting_duration_seconds
+      const totalSec = totalMtgSec > 0 ? Math.max(totalMtgSec, pAttendanceSec) : rec.meeting_duration_seconds
+      const calcPercentage = totalSec > 0 ? Math.min(100, Number(((pAttendanceSec / totalSec) * 100).toFixed(2))) : rec.attendance_percentage
+      const calcStatus = calcPercentage >= 75 ? 'Present' : 'Absent'
+
+      return {
+        id: rec.id,
+        meeting_id: rec.meeting_id,
+        user_id: rec.user_id,
+        participant_name: rec.user?.full_name || 'Anonymous User',
+        meeting_duration_seconds: rec.meeting_duration_seconds,
+        presence_seconds: rec.presence_seconds,
+        attendance_percentage: calcPercentage,
+        status: calcStatus,
+        camera_permission: rec.camera_permission
+      }
+    })
 
     // Sort by name in memory
     mapped.sort((a, b) => a.participant_name.localeCompare(b.participant_name))

@@ -248,7 +248,10 @@ export default function MeetingCard({ meeting, index = 0, onDeleted }) {
         doc.setTextColor(51, 65, 85) // Reset color to slate-700
         doc.text(rec.participant_name || 'Anonymous', margin, cursorY)
         doc.text(durationFormatted, margin + 60, cursorY)
-        doc.text(`${rec.attendance_percentage}%`, margin + 110, cursorY)
+        const formattedPct = typeof rec.attendance_percentage === 'number'
+          ? (rec.attendance_percentage % 1 === 0 ? `${rec.attendance_percentage}%` : `${Number(rec.attendance_percentage).toFixed(2)}%`)
+          : `${rec.attendance_percentage}%`
+        doc.text(formattedPct, margin + 110, cursorY)
         
         if (isPresent) {
           doc.setTextColor(16, 185, 129) // emerald-500 #10b981

@@ -448,6 +448,34 @@ function MeetingRoomInner() {
         }
       })
 
+      socket.current.on('host_mute_toggle', async ({ userId, participantIdentity, mute }) => {
+        const currentUserId = user?.id
+        const localIdentity = localParticipant?.identity
+        const isMe = (currentUserId && userId === currentUserId) || (localIdentity && participantIdentity === localIdentity)
+
+        if (isMe && localParticipant) {
+          if (mute) {
+            try {
+              await localParticipant.setMicrophoneEnabled(false)
+              console.log('[Security Socket] Host muted your microphone.')
+              showToast('The host has muted your microphone.', 'info')
+            } catch (err) {
+              console.error('[Host Remote Mute Error]', err)
+            }
+          } else {
+            const confirmUnmute = window.confirm('The host has requested you to unmute your microphone. Would you like to unmute now?')
+            if (confirmUnmute) {
+              try {
+                await localParticipant.setMicrophoneEnabled(true)
+                showToast('Microphone unmuted.', 'success')
+              } catch (err) {
+                console.error('[Host Remote Unmute Error]', err)
+              }
+            }
+          }
+        }
+      })
+
       socket.current.on('waiting_list_updated', () => {
         console.log('[Security Socket] waiting_list_updated received.')
         if (isHostRef.current) {
@@ -905,6 +933,27 @@ function MeetingRoomContent({
     }
   }, [room, roomState, localParticipant])
 
+  // Track state change listener to force re-render when remote participants mute/unmute
+  const [, setTrackTick] = useState(0)
+  const forceTrackUpdate = useCallback(() => setTrackTick((t) => t + 1), [])
+
+  useEffect(() => {
+    if (!room) return
+    room.on(RoomEvent.TrackMuted, forceTrackUpdate)
+    room.on(RoomEvent.TrackUnmuted, forceTrackUpdate)
+    room.on(RoomEvent.TrackPublished, forceTrackUpdate)
+    room.on(RoomEvent.TrackUnpublished, forceTrackUpdate)
+    room.on(RoomEvent.ParticipantAttributesChanged, forceTrackUpdate)
+
+    return () => {
+      room.off(RoomEvent.TrackMuted, forceTrackUpdate)
+      room.off(RoomEvent.TrackUnmuted, forceTrackUpdate)
+      room.off(RoomEvent.TrackPublished, forceTrackUpdate)
+      room.off(RoomEvent.TrackUnpublished, forceTrackUpdate)
+      room.off(RoomEvent.ParticipantAttributesChanged, forceTrackUpdate)
+    }
+  }, [room, forceTrackUpdate])
+
   const uploadAttendance = async () => {
     if (isHost) {
       console.log('[Attendance] Bypassing upload: User is the meeting host.')
@@ -923,13 +972,14 @@ function MeetingRoomContent({
     if (hasUploaded.current) return true
     hasUploaded.current = true
 
-    const percentage = duration > 0 ? (presenceSeconds.current / duration) * 100 : 0
+    const effectivePresence = presenceSeconds.current > 0 ? presenceSeconds.current : duration
+    const percentage = duration > 0 ? (effectivePresence / duration) * 100 : 0
     const status = percentage >= 75 ? 'Present' : 'Absent'
     const camPermission = attendanceConsent === 'Granted'
 
     const payload = {
       meetingId: meetingData.meeting_id,
-      presenceSeconds: presenceSeconds.current,
+      presenceSeconds: effectivePresence,
       meetingDurationSeconds: duration,
       attendancePercentage: Number(percentage.toFixed(2)),
       status,
@@ -1080,13 +1130,52 @@ function MeetingRoomContent({
     }
   }
 
-  const handleMuteParticipant = (pName) => {
+  const handleMuteParticipant = async (p) => {
     console.log(`[Participant Controls]\nuserId: ${user?.id}\nhostId: ${meetingData?.host_id || meetingData?.hostId}\nisHost: ${isHost}`)
     if (!isHost) {
-      showToast('Only the meeting host can mute participants.', 'error')
+      showToast('Only the meeting host can control participant microphones.', 'error')
       return
     }
-    showToast(`Mute request sent for ${pName}.`, 'info')
+
+    const micPub = p.getTrackPublication ? p.getTrackPublication(Track.Source.Microphone) : null
+    const trackSid = micPub?.trackSid || micPub?.sid
+
+    if (!trackSid) {
+      console.warn('[Host Mic Toggle] Participant has no active microphone track SID:', p.name || p.identity)
+      showToast(`${p.name || 'Participant'} has no active microphone track.`, 'warning')
+      return
+    }
+
+    const isCurrentlyMuted = p.isMicrophoneEnabled === false || (micPub && micPub.isMuted === true)
+    const shouldMute = !isCurrentlyMuted
+
+    console.log(`[Host Mic Toggle]\ntargetParticipant: ${p.name || p.identity}\ntrackSid: ${trackSid}\nisCurrentlyMuted: ${isCurrentlyMuted}\nshouldMute: ${shouldMute}`)
+
+    try {
+      const token = typeof window !== 'undefined' ? sessionStorage.getItem('meetly_auth_token') : null
+      const headers = { 'Content-Type': 'application/json' }
+      if (token) headers['Authorization'] = `Bearer ${token}`
+
+      const res = await fetch(`${import.meta.env.VITE_API_URL || 'http://localhost:5000'}/api/meetings/security/mute-participant`, {
+        method: 'POST',
+        headers,
+        body: JSON.stringify({
+          meetingCode: meetingData.meeting_code,
+          participantIdentity: p.identity,
+          trackSid: trackSid,
+          mute: shouldMute
+        }),
+        credentials: 'include'
+      })
+
+      if (!res.ok) {
+        const data = await res.json()
+        showToast(data.message || 'Failed to toggle participant microphone.', 'error')
+      }
+    } catch (err) {
+      console.error('[Host Mic Toggle Error]', err)
+      showToast('Error changing participant microphone state.', 'error')
+    }
   }
 
   const handleRemoveParticipant = async (pName, pUserId) => {
@@ -1491,13 +1580,14 @@ function MeetingRoomContent({
 
         hasUploaded.current = true
 
-        const percentage = duration > 0 ? (presenceSeconds.current / duration) * 100 : 0
+        const effectivePresence = presenceSeconds.current > 0 ? presenceSeconds.current : duration
+        const percentage = duration > 0 ? (effectivePresence / duration) * 100 : 0
         const status = percentage >= 75 ? 'Present' : 'Absent'
         const camPermission = currentConsent === 'Granted'
 
         const payload = {
           meetingId: currentMeetingData.meeting_id,
-          presenceSeconds: presenceSeconds.current,
+          presenceSeconds: effectivePresence,
           meetingDurationSeconds: duration,
           attendancePercentage: Number(percentage.toFixed(2)),
           status,
@@ -1511,7 +1601,7 @@ function MeetingRoomContent({
           isHost: currentIsHost,
           sessionStart: sessionStartTimeRef.current ? new Date(sessionStartTimeRef.current).toISOString() : null,
           sessionDurationSeconds: duration,
-          presenceSeconds: presenceSeconds.current,
+          presenceSeconds: effectivePresence,
           cameraPermission: camPermission
         })
         console.log('[Attendance Upload Payload]', payload)
@@ -1549,13 +1639,14 @@ function MeetingRoomContent({
 
         hasUploaded.current = true
         
-        const percentage = duration > 0 ? (presenceSeconds.current / duration) * 100 : 0
+        const effectivePresence = presenceSeconds.current > 0 ? presenceSeconds.current : duration
+        const percentage = duration > 0 ? (effectivePresence / duration) * 100 : 0
         const status = percentage >= 75 ? 'Present' : 'Absent'
         const camPermission = currentConsent === 'Granted'
 
         const payload = {
           meetingId: currentMeetingData.meeting_id,
-          presenceSeconds: presenceSeconds.current,
+          presenceSeconds: effectivePresence,
           meetingDurationSeconds: duration,
           attendancePercentage: Number(percentage.toFixed(2)),
           status,
@@ -2222,31 +2313,40 @@ function MeetingRoomContent({
                           </div>
                         </div>
 
-                        {isHost && role !== 'host' && p.identity !== localParticipant?.identity && (
-                          <div className="flex items-center gap-1 shrink-0 select-none">
-                            <button
-                              onClick={() => handleMuteParticipant(p.name)}
-                              className="p-1.5 bg-slate-800 hover:bg-slate-700 text-gray-400 hover:text-white rounded-lg transition-all cursor-pointer"
-                              title="Mute Participant"
-                            >
-                              🎤
-                            </button>
-                            <button
-                              onClick={() => handleRemoveParticipant(p.name, pUserId)}
-                              className="p-1.5 bg-slate-800 hover:bg-slate-700 text-amber-500 hover:text-amber-400 rounded-lg transition-all cursor-pointer"
-                              title="Remove Participant"
-                            >
-                              👢
-                            </button>
-                            <button
-                              onClick={() => handleBanDevice(p.name, pUserId)}
-                              className="p-1.5 bg-red-950/40 hover:bg-red-900/40 border border-red-500/10 text-red-500 hover:text-red-400 rounded-lg transition-all cursor-pointer"
-                              title="Ban Device"
-                            >
-                              🚫
-                            </button>
-                          </div>
-                        )}
+                        {isHost && role !== 'host' && p.identity !== localParticipant?.identity && (() => {
+                          const micPub = p.getTrackPublication ? p.getTrackPublication(Track.Source.Microphone) : null
+                          const isMuted = p.isMicrophoneEnabled === false || (micPub && micPub.isMuted === true)
+
+                          return (
+                            <div className="flex items-center gap-1 shrink-0 select-none">
+                              <button
+                                onClick={() => handleMuteParticipant(p)}
+                                className={`p-1.5 rounded-lg transition-all cursor-pointer ${
+                                  isMuted
+                                    ? 'bg-red-950/50 hover:bg-red-900/50 border border-red-500/20 text-red-400 hover:text-red-300'
+                                    : 'bg-slate-800 hover:bg-slate-700 text-emerald-400 hover:text-emerald-300'
+                                }`}
+                                title={isMuted ? 'Request Unmute' : 'Mute Participant'}
+                              >
+                                {isMuted ? '🚫' : '🎤'}
+                              </button>
+                              <button
+                                onClick={() => handleRemoveParticipant(p.name, pUserId)}
+                                className="p-1.5 bg-slate-800 hover:bg-slate-700 text-amber-500 hover:text-amber-400 rounded-lg transition-all cursor-pointer"
+                                title="Remove Participant"
+                              >
+                                👢
+                              </button>
+                              <button
+                                onClick={() => handleBanDevice(p.name, pUserId)}
+                                className="p-1.5 bg-red-950/40 hover:bg-red-900/40 border border-red-500/10 text-red-500 hover:text-red-400 rounded-lg transition-all cursor-pointer"
+                                title="Ban Device"
+                              >
+                                🚫
+                              </button>
+                            </div>
+                          )
+                        })()}
                       </div>
                     )
                   })}

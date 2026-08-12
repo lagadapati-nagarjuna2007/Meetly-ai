@@ -25,7 +25,8 @@ import {
   rejectJoinRequest,
   banDevice,
   toggleAutoAdmit,
-  removeParticipant
+  removeParticipant,
+  muteParticipant
 } from '../controllers/securityController.js'
 import { authenticateToken } from '../middleware/auth.js'
 
@@ -57,6 +58,7 @@ router.post('/security/reject', rejectJoinRequest)
 router.post('/security/ban-device', banDevice)
 router.post('/security/toggle-auto-admit', toggleAutoAdmit)
 router.post('/security/remove', removeParticipant)
+router.post('/security/mute-participant', muteParticipant)
 
 // Details and metadata endpoints
 router.get('/details/:meetingId', getMeetingDetails)

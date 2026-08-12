@@ -1,5 +1,5 @@
 import { supabase } from '../config/supabase.js'
-import { AccessToken } from 'livekit-server-sdk'
+import { AccessToken, RoomServiceClient } from 'livekit-server-sdk'
 import { cancelCleanup } from '../services/meetingCleanup.js'
 import { authorizeHost } from '../utils/authHelper.js'
 
@@ -579,6 +579,137 @@ export const removeParticipant = async (req, res) => {
       success: false,
       code: 'SERVER_ERROR',
       message: 'Server error removing participant.'
+    })
+  }
+}
+
+/**
+ * Helper to get LiveKit RoomServiceClient if environment variables exist
+ */
+const getRoomServiceClient = () => {
+  const apiKey = process.env.LIVEKIT_API_KEY
+  const apiSecret = process.env.LIVEKIT_API_SECRET
+  const livekitUrl = process.env.LIVEKIT_URL
+  if (!apiKey || !apiSecret || !livekitUrl) return null
+  const httpUrl = livekitUrl.replace(/^wss:/, 'https:').replace(/^ws:/, 'http:')
+  return new RoomServiceClient(httpUrl, apiKey, apiSecret)
+}
+
+/**
+ * POST /api/meetings/security/mute-participant
+ * Host moderator mutes or unmutes a participant's microphone via LiveKit RoomServiceClient.mutePublishedTrack
+ */
+export const muteParticipant = async (req, res) => {
+  try {
+    const { meetingCode, participantIdentity, trackSid, mute } = req.body
+
+    if (!meetingCode || !meetingCode.trim()) {
+      return res.status(400).json({
+        success: false,
+        code: 'BAD_REQUEST',
+        message: 'Required parameter meetingCode is missing.'
+      })
+    }
+    if (!participantIdentity || !participantIdentity.trim()) {
+      return res.status(400).json({
+        success: false,
+        code: 'BAD_REQUEST',
+        message: 'Required parameter participantIdentity is missing.'
+      })
+    }
+    if (!trackSid || !trackSid.trim()) {
+      return res.status(400).json({
+        success: false,
+        code: 'BAD_REQUEST',
+        message: 'Participant microphone track SID is missing or participant has no active microphone track.'
+      })
+    }
+    if (mute === undefined || mute === null) {
+      return res.status(400).json({
+        success: false,
+        code: 'BAD_REQUEST',
+        message: 'Required parameter mute (boolean) is missing.'
+      })
+    }
+
+    const uppercaseCode = meetingCode.trim().toUpperCase()
+
+    // 1. Check host authorization (must be meeting host)
+    const auth = await authorizeHost(uppercaseCode, req.user.id)
+    if (!auth.passed) {
+      if (auth.status === 403) {
+        logAudit({
+          action: 'MUTE_UNAUTHORIZED',
+          meetingCode: uppercaseCode,
+          hostId: auth.meeting?.host_id,
+          participantId: participantIdentity
+        })
+      }
+      return res.status(auth.status).json({
+        success: false,
+        code: auth.status === 403 ? 'FORBIDDEN' : (auth.status === 404 ? 'NOT_FOUND' : 'ERROR'),
+        message: auth.message
+      })
+    }
+    const meeting = auth.meeting
+    const roomName = meeting.room_name
+
+    // 2. Call LiveKit RoomServiceClient.mutePublishedTrack for BOTH mute=true and mute=false
+    const roomService = getRoomServiceClient()
+    if (!roomService) {
+      console.error('[Security Error] LiveKit server credentials missing in process.env')
+      return res.status(500).json({
+        success: false,
+        code: 'SERVER_ERROR',
+        message: 'LiveKit server credentials missing on server.'
+      })
+    }
+
+    console.log(`[Security LiveKit Mute] Calling mutePublishedTrack(room=${roomName}, identity=${participantIdentity}, trackSid=${trackSid}, muted=${!!mute})`)
+
+    try {
+      await roomService.mutePublishedTrack(roomName, participantIdentity, trackSid.trim(), !!mute)
+      console.log(`[Security LiveKit Mute] Successfully set mutePublishedTrack to ${!!mute} for track ${trackSid}`)
+    } catch (lkErr) {
+      console.error('[Security LiveKit Error] mutePublishedTrack failed:', lkErr)
+      const lkMsg = lkErr.message || String(lkErr)
+      return res.status(400).json({
+        success: false,
+        code: 'LIVEKIT_ERROR',
+        message: `LiveKit rejected remote mute operation: ${lkMsg}`
+      })
+    }
+
+    // 3. Emit Socket.IO event to room so participant client executes local setMicrophoneEnabled
+    const io = req.app.get('io')
+    if (io) {
+      io.to(roomName).emit('host_mute_toggle', {
+        participantIdentity,
+        trackSid,
+        mute: !!mute
+      })
+      console.log(`[Security Socket] Emitted 'host_mute_toggle' (mute=${!!mute}) to room ${roomName} for ${participantIdentity}`)
+    }
+
+    // 4. Structured audit log
+    logAudit({
+      action: mute ? 'Host Muted Participant' : 'Host Unmuted Participant',
+      meetingCode: uppercaseCode,
+      hostId: req.user.id,
+      participantId: participantIdentity
+    })
+
+    return res.status(200).json({
+      success: true,
+      muted: !!mute,
+      message: mute ? 'Participant microphone muted.' : 'Participant microphone unmuted.'
+    })
+  } catch (err) {
+    console.error('[Security Error] muteParticipant unexpected error:', err)
+    return res.status(500).json({
+      success: false,
+      code: 'SERVER_ERROR',
+      message: err.message || 'Server error toggling participant microphone.'
     })
   }
 }
