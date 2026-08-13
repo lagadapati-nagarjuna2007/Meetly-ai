@@ -11,6 +11,14 @@ const logAudit = ({ action, meetingCode, hostId, participantId, value }) => {
   )
 }
 
+// In-memory store for meeting-wide Mute All / Microphone Lock state keyed by meeting_id / room_name
+export const meetingMuteAllStore = new Map()
+
+export const isMuteAllEnabled = (meetingId) => {
+  if (!meetingId) return false
+  return !!meetingMuteAllStore.get(String(meetingId))
+}
+
 // UUID validation helper
 const isUuid = (val) => {
   if (!val) return false
@@ -710,6 +718,121 @@ export const muteParticipant = async (req, res) => {
       success: false,
       code: 'SERVER_ERROR',
       message: err.message || 'Server error toggling participant microphone.'
+    })
+  }
+}
+
+/**
+ * POST /api/meetings/security/toggle-mute-all
+ * Meeting-wide Microphone Lock toggle (Host only).
+ * When muteAllEnabled=true, mutes all currently published participant tracks and locks microphones.
+ * When muteAllEnabled=false, unlocks microphone controls without blindly unmuting everyone.
+ */
+export const toggleMuteAll = async (req, res) => {
+  try {
+    const { meetingCode, muteAllEnabled } = req.body
+    if (!meetingCode || !meetingCode.trim()) {
+      return res.status(400).json({
+        success: false,
+        code: 'BAD_REQUEST',
+        message: 'Required parameter meetingCode is missing.'
+      })
+    }
+    if (muteAllEnabled === undefined || muteAllEnabled === null) {
+      return res.status(400).json({
+        success: false,
+        code: 'BAD_REQUEST',
+        message: 'Required parameter muteAllEnabled (boolean) is missing.'
+      })
+    }
+
+    const uppercaseCode = meetingCode.trim().toUpperCase()
+
+    // 1. Authorize host
+    const auth = await authorizeHost(uppercaseCode, req.user.id)
+    if (!auth.passed) {
+      if (auth.status === 403) {
+        logAudit({
+          action: 'TOGGLE_MUTE_ALL_UNAUTHORIZED',
+          meetingCode: uppercaseCode,
+          hostId: auth.meeting?.host_id,
+          participantId: req.user.id
+        })
+      }
+      return res.status(auth.status).json({
+        success: false,
+        code: auth.status === 403 ? 'FORBIDDEN' : (auth.status === 404 ? 'NOT_FOUND' : 'ERROR'),
+        message: auth.message
+      })
+    }
+    const meeting = auth.meeting
+    const roomName = meeting.room_name
+    const isMuteAll = !!muteAllEnabled
+
+    // 2. Update meeting mute_all_enabled state in memory store
+    meetingMuteAllStore.set(String(meeting.meeting_id), isMuteAll)
+    meetingMuteAllStore.set(String(uppercaseCode), isMuteAll)
+
+    console.log(`[Security Mute All] Meeting ${meeting.meeting_id} (${uppercaseCode}) Mute All toggled to ${isMuteAll}`)
+
+    // 3. If turning Mute All ON, iterate through connected LiveKit participants and mute active audio tracks
+    if (isMuteAll) {
+      const roomService = getRoomServiceClient()
+      if (roomService) {
+        try {
+          const participantsList = await roomService.listParticipants(roomName)
+          if (participantsList && participantsList.length > 0) {
+            for (const p of participantsList) {
+              // Skip host participant
+              if (p.identity === req.user.id || p.identity === req.user.email) continue
+
+              const audioTrack = p.tracks?.find(
+                (t) => t.type === 'AUDIO' || t.source === 'MICROPHONE' || t.kind === 'audio'
+              )
+              if (audioTrack && audioTrack.sid && !audioTrack.muted) {
+                try {
+                  await roomService.mutePublishedTrack(roomName, p.identity, audioTrack.sid, true)
+                  console.log(`[Security Mute All] Muted track ${audioTrack.sid} for participant ${p.identity}`)
+                } catch (tErr) {
+                  console.warn(`[Security Mute All Note] Failed to mute track for ${p.identity}:`, tErr.message)
+                }
+              }
+            }
+          }
+        } catch (lkErr) {
+          console.warn('[Security Mute All Note] LiveKit listParticipants/mute error:', lkErr.message || lkErr)
+        }
+      }
+    }
+
+    // 4. Emit Socket.IO event to room so all clients update local muteAllEnabled state
+    const io = req.app.get('io')
+    if (io) {
+      io.to(roomName).emit('meeting_mute_all_changed', {
+        muteAllEnabled: isMuteAll
+      })
+      console.log(`[Security Socket] Emitted 'meeting_mute_all_changed' (${isMuteAll}) to room ${roomName}`)
+    }
+
+    // 5. Audit log
+    logAudit({
+      action: isMuteAll ? 'Mute All / Lock Microphones Enabled' : 'Mute All / Lock Microphones Disabled',
+      meetingCode: uppercaseCode,
+      hostId: req.user.id,
+      value: isMuteAll
+    })
+
+    return res.status(200).json({
+      success: true,
+      muteAllEnabled: isMuteAll,
+      message: isMuteAll ? 'Mute All / Microphone Lock enabled.' : 'Mute All / Microphone Lock disabled.'
+    })
+  } catch (err) {
+    console.error('[Security Error] toggleMuteAll unexpected error:', err)
+    return res.status(500).json({
+      success: false,
+      code: 'SERVER_ERROR',
+      message: err.message || 'Server error toggling Mute All status.'
     })
   }
 }

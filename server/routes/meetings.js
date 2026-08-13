@@ -26,7 +26,8 @@ import {
   banDevice,
   toggleAutoAdmit,
   removeParticipant,
-  muteParticipant
+  muteParticipant,
+  toggleMuteAll
 } from '../controllers/securityController.js'
 import { authenticateToken } from '../middleware/auth.js'
 
@@ -59,6 +60,7 @@ router.post('/security/ban-device', banDevice)
 router.post('/security/toggle-auto-admit', toggleAutoAdmit)
 router.post('/security/remove', removeParticipant)
 router.post('/security/mute-participant', muteParticipant)
+router.post('/security/toggle-mute-all', toggleMuteAll)
 
 // Details and metadata endpoints
 router.get('/details/:meetingId', getMeetingDetails)

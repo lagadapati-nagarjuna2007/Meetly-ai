@@ -979,6 +979,37 @@ function MeetingRoomContent({
     }
   }, [socket, user, localParticipant, showToast])
 
+  // Socket.IO listener for meeting_mute_all_changed to lock/unlock participant microphones
+  useEffect(() => {
+    const currentSocket = socket?.current
+    if (!currentSocket) return
+
+    const handleMuteAllChanged = async ({ muteAllEnabled }) => {
+      console.log('[Security Socket] meeting_mute_all_changed received:', muteAllEnabled)
+      setMeetingData((prev) => (prev ? { ...prev, mute_all_enabled: !!muteAllEnabled } : null))
+
+      if (muteAllEnabled && !isHost && localParticipant) {
+        try {
+          wasMutedByHostRef.current = true
+          console.log('[Mute All Socket] Host enabled Mute All. Disabling local microphone...')
+          await localParticipant.setMicrophoneEnabled(false)
+          setMicActive(false)
+          showToast('The host has locked all participant microphones.', 'info')
+        } catch (err) {
+          console.error('[Mute All Socket Error] Failed to disable microphone:', err)
+        }
+      } else if (!muteAllEnabled && !isHost) {
+        showToast('Microphones are no longer locked by the host.', 'info')
+      }
+    }
+
+    currentSocket.on('meeting_mute_all_changed', handleMuteAllChanged)
+
+    return () => {
+      currentSocket.off('meeting_mute_all_changed', handleMuteAllChanged)
+    }
+  }, [socket, isHost, localParticipant, setMeetingData, showToast])
+
   const uploadAttendance = async () => {
     if (isHost) {
       console.log('[Attendance] Bypassing upload: User is the meeting host.')
@@ -1928,14 +1959,25 @@ function MeetingRoomContent({
         }
 
         // Initialize microphone
-        try {
-          console.log('[Microphone Init] Requesting microphone access via setMicrophoneEnabled(true)...')
-          await localParticipant.setMicrophoneEnabled(true)
-          setMicActive(true)
-          console.log('[Microphone Init] Microphone enabled successfully!')
-        } catch (err) {
-          console.error('[Microphone Init] Failed to enable microphone:', err)
-          showToast('Microphone permission denied or unavailable.', 'error')
+        if (meetingData?.mute_all_enabled && !isHost) {
+          console.log('[Microphone Init] Meeting has Mute All ON. Keeping microphone muted for participant...')
+          wasMutedByHostRef.current = true
+          try {
+            await localParticipant.setMicrophoneEnabled(false)
+            setMicActive(false)
+          } catch (err) {
+            console.error('[Microphone Init] Error keeping microphone muted:', err)
+          }
+        } else {
+          try {
+            console.log('[Microphone Init] Requesting microphone access via setMicrophoneEnabled(true)...')
+            await localParticipant.setMicrophoneEnabled(true)
+            setMicActive(true)
+            console.log('[Microphone Init] Microphone enabled successfully!')
+          } catch (err) {
+            console.error('[Microphone Init] Failed to enable microphone:', err)
+            showToast('Microphone permission denied or unavailable.', 'error')
+          }
         }
       } catch (globalErr) {
         console.error('[Media Init] Unhandled error during media initialization:', globalErr)
@@ -1953,9 +1995,46 @@ function MeetingRoomContent({
     return `${m}:${s}`
   }
 
+  // Handle Mute All / Microphone Lock Toggle (Host Only)
+  const handleToggleMuteAll = async () => {
+    if (!isHost || !meetingData) return
+    const nextState = !meetingData.mute_all_enabled
+
+    try {
+      const token = typeof window !== 'undefined' ? sessionStorage.getItem('meetly_auth_token') : null
+      const headers = { 'Content-Type': 'application/json' }
+      if (token) headers['Authorization'] = `Bearer ${token}`
+
+      const res = await fetch(`${import.meta.env.VITE_API_URL || 'http://localhost:5000'}/api/meetings/security/toggle-mute-all`, {
+        method: 'POST',
+        headers,
+        body: JSON.stringify({
+          meetingCode: meetingData.meeting_code,
+          muteAllEnabled: nextState
+        }),
+        credentials: 'include'
+      })
+
+      if (res.ok) {
+        setMeetingData((prev) => (prev ? { ...prev, mute_all_enabled: nextState } : null))
+        showToast(nextState ? 'Mute All / Microphone Lock enabled.' : 'Mute All / Microphone Lock disabled.', 'success')
+      } else {
+        const data = await res.json()
+        showToast(data.message || 'Failed to toggle Mute All state.', 'error')
+      }
+    } catch (err) {
+      console.error('[Toggle Mute All Error]', err)
+      showToast('Error toggling Mute All status.', 'error')
+    }
+  }
+
   // Handle control actions
   const handleToggleMic = async () => {
     if (!localParticipant) return
+    if (!isHost && meetingData?.mute_all_enabled) {
+      showToast('Microphones are currently locked by the host.', 'warning')
+      return
+    }
     try {
       const nextState = !micActive
       console.log(`[Microphone Toggle] Setting microphone to ${nextState ? 'ON' : 'OFF'}...`)
@@ -2382,6 +2461,27 @@ function MeetingRoomContent({
               {/* TAB: SECURITY */}
               {activeTab === 'security' && isHost && (
                 <div className="flex flex-col gap-4 h-full justify-start text-left">
+                  {/* Mute All / Microphone Lock Toggle */}
+                  <div className="flex items-center justify-between p-3 bg-red-950/20 border border-red-500/20 rounded-xl">
+                    <div className="flex flex-col text-left pr-2">
+                      <span className="text-xs font-semibold text-white flex items-center gap-1.5">
+                        <span>🔒 Mute All Participants</span>
+                      </span>
+                      <span className="text-[10px] text-gray-400">Lock all participant microphones</span>
+                    </div>
+                    <button
+                      onClick={handleToggleMuteAll}
+                      className={`relative inline-flex h-6 w-11 shrink-0 items-center rounded-full transition-colors cursor-pointer ${
+                        meetingData?.mute_all_enabled ? 'bg-red-600' : 'bg-slate-700'
+                      }`}
+                      title={meetingData?.mute_all_enabled ? "Disable Mute All Lock" : "Enable Mute All Lock"}
+                    >
+                      <span className={`inline-block h-4 w-4 transform rounded-full bg-white transition-transform ${
+                        meetingData?.mute_all_enabled ? 'translate-x-6' : 'translate-x-1'
+                      }`} />
+                    </button>
+                  </div>
+
                   <div className="flex items-center justify-between p-3 bg-white/2 border border-white/5 rounded-xl">
                     <span className="text-xs font-semibold text-white">Auto Admit Participants</span>
                     <input
@@ -2548,11 +2648,24 @@ function MeetingRoomContent({
           {/* Microphone */}
           <button
             onClick={handleToggleMic}
+            title={!isHost && meetingData?.mute_all_enabled ? "Microphones locked by host" : (micActive ? "Mute Microphone" : "Unmute Microphone")}
             className={`w-11 h-11 rounded-xl flex items-center justify-center border transition-all duration-200 cursor-pointer ${
-              micActive ? 'bg-[#0f1122]/60 hover:bg-[#141629] border-white/10 text-white' : 'bg-red-600 hover:bg-red-500 border-transparent text-white'
+              !isHost && meetingData?.mute_all_enabled
+                ? 'bg-red-950/50 hover:bg-red-900/50 border-red-500/30 text-red-400'
+                : micActive
+                ? 'bg-[#0f1122]/60 hover:bg-[#141629] border-white/10 text-white'
+                : 'bg-red-600 hover:bg-red-500 border-transparent text-white'
             }`}
           >
-            {micActive ? <Mic size={18} /> : <MicOff size={18} />}
+            {!isHost && meetingData?.mute_all_enabled ? (
+              <span className="flex items-center text-xs font-bold gap-0.5 select-none">
+                🔒 <MicOff size={14} />
+              </span>
+            ) : micActive ? (
+              <Mic size={18} />
+            ) : (
+              <MicOff size={18} />
+            )}
           </button>
 
           {/* Camera */}

@@ -5,6 +5,7 @@ import { supabase } from '../config/supabase.js'
 import { clearMeetingCounters } from '../services/aiChat.service.js'
 import { scheduleCleanup, cancelCleanup } from '../services/meetingCleanup.js'
 import { authorizeHost } from '../utils/authHelper.js'
+import { isMuteAllEnabled } from './securityController.js'
 
 // UUID validation helper
 const isUuid = (val) => {
@@ -572,12 +573,17 @@ export const joinMeeting = async (req, res) => {
 
     console.log(`[Join Success] User ${req.user.id} joined meeting ${meeting.meeting_code}`)
 
+    const muteAllEnabled = isMuteAllEnabled(meeting.meeting_id) || isMuteAllEnabled(meeting.meeting_code)
+
     return res.status(200).json({
       message: 'Joined meeting successfully.',
       token,
       roomName: meeting.room_name,
       livekitUrl: livekitUrl || 'ws://localhost:7880',
-      meeting
+      meeting: {
+        ...meeting,
+        mute_all_enabled: muteAllEnabled
+      }
     })
   } catch (err) {
     console.error('Join meeting error:', err)
@@ -833,8 +839,13 @@ export const getMeetingDetails = async (req, res) => {
 
     if (partErr) throw partErr
 
+    const muteAllEnabled = isMuteAllEnabled(meeting.meeting_id) || isMuteAllEnabled(meeting.meeting_code)
+
     return res.status(200).json({
-      meeting,
+      meeting: {
+        ...meeting,
+        mute_all_enabled: muteAllEnabled
+      },
       participants
     })
   } catch (err) {
