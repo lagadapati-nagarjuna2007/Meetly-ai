@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useRef, useCallback } from 'react'
+import React, { useState, useEffect, useRef, useCallback, useMemo } from 'react'
 import { useParams, useNavigate } from 'react-router-dom'
 import { io } from 'socket.io-client'
 import {
@@ -33,7 +33,8 @@ import {
   Lock,
   Unlock,
   AlertTriangle,
-  RefreshCw
+  RefreshCw,
+  Search
 } from 'lucide-react'
 
 import AIChatPanel from '../components/AIChatPanel'
@@ -2144,6 +2145,40 @@ function MeetingRoomContent({
     }, 600)
   }
 
+  // Handle Auto Admit Toggle (Host Only)
+  const handleToggleAutoAdmit = async () => {
+    if (!isHost || !meetingData) return
+    const nextState = meetingData.auto_admit === false ? true : false
+
+    try {
+      const token = typeof window !== 'undefined' ? sessionStorage.getItem('meetly_auth_token') : null
+      const headers = { 'Content-Type': 'application/json' }
+      if (token) headers['Authorization'] = `Bearer ${token}`
+
+      const res = await fetch(`${import.meta.env.VITE_API_URL || 'http://localhost:5000'}/api/meetings/security/toggle-auto-admit`, {
+        method: 'POST',
+        headers,
+        body: JSON.stringify({ meetingId: meetingData.meeting_id, autoAdmit: nextState }),
+        credentials: 'include'
+      })
+
+      if (res.ok) {
+        setMeetingData((prev) => (prev ? { ...prev, auto_admit: nextState } : null))
+        showToast(`Auto Admit toggled ${nextState ? 'ON' : 'OFF'}`, 'success')
+      } else {
+        let errMsg = 'Failed to toggle Auto Admit'
+        try {
+          const data = await res.json()
+          errMsg = data.message || errMsg
+        } catch (e) {}
+        showToast(errMsg, 'error')
+      }
+    } catch (err) {
+      console.error('[Toggle Auto Admit Error]', err)
+      showToast('Error toggling Auto Admit status.', 'error')
+    }
+  }
+
   // Deduplicate participants list by identity or sid to prevent duplicate cards
   const rawParticipants = [localParticipant, ...(participants || [])].filter(Boolean)
   const participantMap = new Map()
@@ -2154,6 +2189,30 @@ function MeetingRoomContent({
     }
   })
   const allParticipants = Array.from(participantMap.values())
+
+  // Participant search state & instant local filtering
+  const [participantSearchQuery, setParticipantSearchQuery] = useState('')
+
+  const filteredParticipants = useMemo(() => {
+    if (!participantSearchQuery.trim()) return allParticipants
+    const q = participantSearchQuery.toLowerCase().trim()
+    return allParticipants.filter((p) => {
+      let email = ''
+      let username = ''
+      try {
+        const meta = JSON.parse(p?.metadata || '{}')
+        email = meta.email || ''
+        username = meta.username || ''
+      } catch (e) {}
+
+      const nameMatch = p.name ? p.name.toLowerCase().includes(q) : false
+      const identityMatch = p.identity ? p.identity.toLowerCase().includes(q) : false
+      const emailMatch = email ? email.toLowerCase().includes(q) : false
+      const usernameMatch = username ? username.toLowerCase().includes(q) : false
+
+      return nameMatch || identityMatch || emailMatch || usernameMatch
+    })
+  }, [allParticipants, participantSearchQuery])
 
   return (
     <div className="fixed inset-0 z-40 bg-[#04050b] flex flex-col items-stretch overflow-hidden text-left">
@@ -2394,67 +2453,95 @@ function MeetingRoomContent({
 
               {/* TAB: PARTICIPANTS */}
               {activeTab === 'participants' && (
-                <div className="flex flex-col gap-3 overflow-y-auto">
-                  {allParticipants.map((p) => {
-                    let role = 'participant'
-                    let pUserId = p.identity
-                    try {
-                      const meta = JSON.parse(p?.metadata || '{}')
-                      role = meta.role || 'participant'
-                      pUserId = meta.userId || p.identity
-                    } catch (e) {}
+                <div className="flex flex-col gap-3 h-full overflow-y-auto">
+                  {/* Participant Search Bar */}
+                  <div className="relative shrink-0 select-none">
+                    <Search className="absolute left-3 top-1/2 -translate-y-1/2 text-gray-400" size={14} />
+                    <input
+                      type="text"
+                      placeholder="Search participants..."
+                      value={participantSearchQuery}
+                      onChange={(e) => setParticipantSearchQuery(e.target.value)}
+                      className="w-full bg-slate-900/60 border border-white/10 rounded-xl pl-9 pr-8 py-2 text-xs text-white placeholder-gray-500 focus:outline-none focus:border-brand-purple transition-all duration-200"
+                    />
+                    {participantSearchQuery && (
+                      <button
+                        onClick={() => setParticipantSearchQuery('')}
+                        className="absolute right-2.5 top-1/2 -translate-y-1/2 text-gray-400 hover:text-white p-0.5 rounded-md cursor-pointer text-xs"
+                        title="Clear search"
+                      >
+                        ✕
+                      </button>
+                    )}
+                  </div>
 
-                    return (
-                      <div key={p.sid || p.identity} className="flex items-center gap-3 p-2 bg-white/2 border border-white/5 rounded-xl justify-between">
-                        <div className="flex items-center gap-3 flex-1 min-w-0">
-                          <div className="w-8 h-8 rounded-full bg-white/5 flex items-center justify-center text-xs font-bold text-gray-300 shrink-0">
-                            {p.name?.charAt(0).toUpperCase() || 'P'}
-                          </div>
-                          <div className="flex flex-col text-left min-w-0">
-                            <span className="text-xs font-semibold text-white truncate">
-                              {p.name} {p.identity === localParticipant?.identity && ' (You)'}
-                            </span>
-                            <span className="text-[10px] text-gray-400 font-bold uppercase tracking-wider mt-0.5">{role}</span>
-                          </div>
-                        </div>
+                  {/* Participant List */}
+                  {filteredParticipants.length === 0 ? (
+                    <div className="py-8 text-center text-gray-400 text-xs select-none">
+                      No participants found
+                    </div>
+                  ) : (
+                    filteredParticipants.map((p) => {
+                      let role = 'participant'
+                      let pUserId = p.identity
+                      try {
+                        const meta = JSON.parse(p?.metadata || '{}')
+                        role = meta.role || 'participant'
+                        pUserId = meta.userId || p.identity
+                      } catch (e) {}
 
-                        {isHost && role !== 'host' && p.identity !== localParticipant?.identity && (() => {
-                          const micPub = p.getTrackPublication ? p.getTrackPublication(Track.Source.Microphone) : null
-                          const isMuted = p.isMicrophoneEnabled === false || (micPub && micPub.isMuted === true)
-
-                          return (
-                            <div className="flex items-center gap-1 shrink-0 select-none">
-                              <button
-                                onClick={() => handleMuteParticipant(p)}
-                                className={`p-1.5 rounded-lg transition-all cursor-pointer ${
-                                  isMuted
-                                    ? 'bg-red-950/50 hover:bg-red-900/50 border border-red-500/20 text-red-400 hover:text-red-300'
-                                    : 'bg-slate-800 hover:bg-slate-700 text-emerald-400 hover:text-emerald-300'
-                                }`}
-                                title={isMuted ? 'Request Unmute' : 'Mute Participant'}
-                              >
-                                {isMuted ? '🚫' : '🎤'}
-                              </button>
-                              <button
-                                onClick={() => handleRemoveParticipant(p.name, pUserId)}
-                                className="p-1.5 bg-slate-800 hover:bg-slate-700 text-amber-500 hover:text-amber-400 rounded-lg transition-all cursor-pointer"
-                                title="Remove Participant"
-                              >
-                                👢
-                              </button>
-                              <button
-                                onClick={() => handleBanDevice(p.name, pUserId)}
-                                className="p-1.5 bg-red-950/40 hover:bg-red-900/40 border border-red-500/10 text-red-500 hover:text-red-400 rounded-lg transition-all cursor-pointer"
-                                title="Ban Device"
-                              >
-                                🚫
-                              </button>
+                      return (
+                        <div key={p.sid || p.identity} className="flex items-center gap-3 p-2 bg-white/2 border border-white/5 rounded-xl justify-between">
+                          <div className="flex items-center gap-3 flex-1 min-w-0">
+                            <div className="w-8 h-8 rounded-full bg-white/5 flex items-center justify-center text-xs font-bold text-gray-300 shrink-0">
+                              {p.name?.charAt(0).toUpperCase() || 'P'}
                             </div>
-                          )
-                        })()}
-                      </div>
-                    )
-                  })}
+                            <div className="flex flex-col text-left min-w-0">
+                              <span className="text-xs font-semibold text-white truncate">
+                                {p.name} {p.identity === localParticipant?.identity && ' (You)'}
+                              </span>
+                              <span className="text-[10px] text-gray-400 font-bold uppercase tracking-wider mt-0.5">{role}</span>
+                            </div>
+                          </div>
+
+                          {isHost && role !== 'host' && p.identity !== localParticipant?.identity && (() => {
+                            const micPub = p.getTrackPublication ? p.getTrackPublication(Track.Source.Microphone) : null
+                            const isMuted = p.isMicrophoneEnabled === false || (micPub && micPub.isMuted === true)
+
+                            return (
+                              <div className="flex items-center gap-1 shrink-0 select-none">
+                                <button
+                                  onClick={() => handleMuteParticipant(p)}
+                                  className={`p-1.5 rounded-lg transition-all cursor-pointer ${
+                                    isMuted
+                                      ? 'bg-red-950/50 hover:bg-red-900/50 border border-red-500/20 text-red-400 hover:text-red-300'
+                                      : 'bg-slate-800 hover:bg-slate-700 text-emerald-400 hover:text-emerald-300'
+                                  }`}
+                                  title={isMuted ? 'Request Unmute' : 'Mute Participant'}
+                                >
+                                  {isMuted ? '🚫' : '🎤'}
+                                </button>
+                                <button
+                                  onClick={() => handleRemoveParticipant(p.name, pUserId)}
+                                  className="p-1.5 bg-slate-800 hover:bg-slate-700 text-amber-500 hover:text-amber-400 rounded-lg transition-all cursor-pointer"
+                                  title="Remove Participant"
+                                >
+                                  👢
+                                </button>
+                                <button
+                                  onClick={() => handleBanDevice(p.name, pUserId)}
+                                  className="p-1.5 bg-red-950/40 hover:bg-red-900/40 border border-red-500/10 text-red-500 hover:text-red-400 rounded-lg transition-all cursor-pointer"
+                                  title="Ban Device"
+                                >
+                                  🚫
+                                </button>
+                              </div>
+                            )
+                          })()}
+                        </div>
+                      )
+                    })
+                  )}
                 </div>
               )}
 
@@ -2482,37 +2569,23 @@ function MeetingRoomContent({
                     </button>
                   </div>
 
+                  {/* Auto Admit Participants Toggle */}
                   <div className="flex items-center justify-between p-3 bg-white/2 border border-white/5 rounded-xl">
-                    <span className="text-xs font-semibold text-white">Auto Admit Participants</span>
-                    <input
-                      type="checkbox"
-                      checked={meetingData?.auto_admit !== false}
-                      onChange={async (e) => {
-                        const checked = e.target.checked
-                        try {
-                          const token = typeof window !== 'undefined' ? sessionStorage.getItem('meetly_auth_token') : null
-                          const headers = { 'Content-Type': 'application/json' }
-                          if (token) headers['Authorization'] = `Bearer ${token}`
-
-                          const res = await fetch(`${import.meta.env.VITE_API_URL || 'http://localhost:5000'}/api/meetings/security/toggle-auto-admit`, {
-                            method: 'POST',
-                            headers,
-                            body: JSON.stringify({ meetingId: meetingData.meeting_id, autoAdmit: checked }),
-                            credentials: 'include'
-                          })
-                          if (res.ok) {
-                            setMeetingData(prev => prev ? { ...prev, auto_admit: checked } : null)
-                            showToast(`Auto Admit toggled ${checked ? 'ON' : 'OFF'}`, 'success')
-                          } else {
-                            showToast('Failed to toggle Auto Admit', 'error')
-                          }
-                        } catch (err) {
-                          console.error(err)
-                          showToast('Error toggling Auto Admit', 'error')
-                        }
-                      }}
-                      className="accent-brand-purple cursor-pointer h-4 w-4"
-                    />
+                    <div className="flex flex-col text-left pr-2">
+                      <span className="text-xs font-semibold text-white">Auto Admit Participants</span>
+                      <span className="text-[10px] text-gray-400">Automatically admit eligible participants</span>
+                    </div>
+                    <button
+                      onClick={handleToggleAutoAdmit}
+                      className={`relative inline-flex h-6 w-11 shrink-0 items-center rounded-full transition-colors cursor-pointer ${
+                        meetingData?.auto_admit !== false ? 'bg-purple-600' : 'bg-slate-700'
+                      }`}
+                      title={meetingData?.auto_admit !== false ? "Disable Auto Admit" : "Enable Auto Admit"}
+                    >
+                      <span className={`inline-block h-4 w-4 transform rounded-full bg-white transition-transform ${
+                        meetingData?.auto_admit !== false ? 'translate-x-6' : 'translate-x-1'
+                      }`} />
+                    </button>
                   </div>
 
                   <div className="flex flex-col gap-2">
