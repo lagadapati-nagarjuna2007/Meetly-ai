@@ -36,97 +36,231 @@ export default function MeetingCard({ meeting, index = 0, onDeleted }) {
     setIsGeneratingPdf(true)
     showToast('Generating meeting summary, please wait...', 'info')
     try {
-      const summaryText = await generateMeetingSummary(meeting.dbId)
+      const summaryData = await generateMeetingSummary(meeting.dbId)
+
+      let summaryObj = summaryData
+      if (typeof summaryObj === 'string') {
+        try {
+          summaryObj = JSON.parse(summaryObj)
+        } catch (e) {
+          summaryObj = { overview: summaryData, topicsDiscussed: [], keyPoints: [], decisionsMade: [], actionItems: [] }
+        }
+      }
+
+      const overviewText = summaryObj.overview || 'No overview available.'
+      const topics = Array.isArray(summaryObj.topicsDiscussed) ? summaryObj.topicsDiscussed : []
+      const keyPoints = Array.isArray(summaryObj.keyPoints) ? summaryObj.keyPoints : []
+      const decisions = Array.isArray(summaryObj.decisionsMade) ? summaryObj.decisionsMade : []
+      const actions = Array.isArray(summaryObj.actionItems) ? summaryObj.actionItems : []
 
       // Generate PDF
       const doc = new jsPDF()
       const pageHeight = doc.internal.pageSize.height
       const margin = 20
-      const lineSpacing = 7
       let cursorY = 20
+
+      const checkOverflow = (needed = 7) => {
+        if (cursorY + needed > pageHeight - margin) {
+          doc.addPage()
+          cursorY = margin
+        }
+      }
 
       // MEETLY AI Header
       doc.setFont('helvetica', 'bold')
       doc.setFontSize(22)
       doc.setTextColor(124, 58, 237) // purple color #7c3aed
       doc.text('MEETLY AI', margin, cursorY)
-      cursorY += 10
+      cursorY += 9
 
-      doc.setFontSize(14)
+      doc.setFontSize(13)
       doc.setTextColor(100, 116, 139) // Slate gray #64748b
-      doc.text('Meeting Summary Report', margin, cursorY)
-      cursorY += 10
+      doc.text('AI Meeting Summary Report', margin, cursorY)
+      cursorY += 8
 
       // Divider Line
-      doc.setDrawColor(226, 232, 240) // border line #e2e8f0
+      doc.setDrawColor(226, 232, 240)
       doc.setLineWidth(0.5)
       doc.line(margin, cursorY, 210 - margin, cursorY)
-      cursorY += 12
+      cursorY += 10
 
       // Metadata Block
       doc.setFont('helvetica', 'bold')
       doc.setFontSize(10)
-      doc.setTextColor(71, 85, 105) // #475569
+      doc.setTextColor(71, 85, 105)
       doc.text('Meeting Name:', margin, cursorY)
       doc.setFont('helvetica', 'normal')
       doc.text(meeting.name || 'Untitled Meeting', margin + 30, cursorY)
-      cursorY += 8
+      cursorY += 7
 
       doc.setFont('helvetica', 'bold')
       doc.text('Meeting Date:', margin, cursorY)
       doc.setFont('helvetica', 'normal')
       doc.text(meeting.date || 'N/A', margin + 30, cursorY)
-      cursorY += 8
+      cursorY += 7
 
       doc.setFont('helvetica', 'bold')
       doc.text('Duration:', margin, cursorY)
       doc.setFont('helvetica', 'normal')
       doc.text(meeting.duration || 'N/A', margin + 30, cursorY)
-      cursorY += 12
+      cursorY += 10
 
       // Divider Line
       doc.line(margin, cursorY, 210 - margin, cursorY)
-      cursorY += 12
-
-      // Summary Section
-      doc.setFont('helvetica', 'bold')
-      doc.setFontSize(12)
-      doc.setTextColor(15, 23, 42) // Slate-900 #0f172a
-      doc.text('Meeting Summary', margin, cursorY)
       cursorY += 10
+
+      // 1. Overview
+      checkOverflow(15)
+      doc.setFont('helvetica', 'bold')
+      doc.setFontSize(11)
+      doc.setTextColor(15, 23, 42)
+      doc.text('1. Overview', margin, cursorY)
+      cursorY += 6
 
       doc.setFont('helvetica', 'normal')
-      doc.setFontSize(10)
-      doc.setTextColor(51, 65, 85) // Slate-700 #334155
-
-      // Wrap summary text
-      const wrappedText = doc.splitTextToSize(summaryText, 210 - margin * 2)
-
-      wrappedText.forEach((line) => {
-        if (cursorY + lineSpacing > pageHeight - margin) {
-          doc.addPage()
-          cursorY = margin // Reset Y coordinate for new page
-        }
+      doc.setFontSize(9.5)
+      doc.setTextColor(51, 65, 85)
+      const overviewLines = doc.splitTextToSize(overviewText, 210 - margin * 2)
+      overviewLines.forEach((line) => {
+        checkOverflow(6)
         doc.text(line, margin, cursorY)
-        cursorY += lineSpacing
+        cursorY += 5.5
       })
+      cursorY += 6
 
-      cursorY += 5
+      // 2. Topics Discussed
+      checkOverflow(15)
+      doc.setFont('helvetica', 'bold')
+      doc.setFontSize(11)
+      doc.setTextColor(15, 23, 42)
+      doc.text('2. Topics Discussed', margin, cursorY)
+      cursorY += 6
+
+      if (topics.length === 0) {
+        doc.setFont('helvetica', 'normal')
+        doc.setFontSize(9.5)
+        doc.setTextColor(100, 116, 139)
+        doc.text('None identified.', margin, cursorY)
+        cursorY += 6
+      } else {
+        topics.forEach((t) => {
+          checkOverflow(12)
+          doc.setFont('helvetica', 'bold')
+          doc.setFontSize(9.5)
+          doc.setTextColor(15, 23, 42)
+          doc.text(`• ${t.title}`, margin, cursorY)
+          cursorY += 5
+          if (t.description) {
+            doc.setFont('helvetica', 'normal')
+            doc.setTextColor(51, 65, 85)
+            const descLines = doc.splitTextToSize(t.description, 210 - margin * 2 - 6)
+            descLines.forEach((l) => {
+              checkOverflow(5.5)
+              doc.text(l, margin + 5, cursorY)
+              cursorY += 5
+            })
+          }
+          cursorY += 2
+        })
+      }
+      cursorY += 4
+
+      // 3. Key Points
+      checkOverflow(15)
+      doc.setFont('helvetica', 'bold')
+      doc.setFontSize(11)
+      doc.setTextColor(15, 23, 42)
+      doc.text('3. Key Points', margin, cursorY)
+      cursorY += 6
+
+      doc.setFont('helvetica', 'normal')
+      doc.setFontSize(9.5)
+      doc.setTextColor(51, 65, 85)
+      if (keyPoints.length === 0) {
+        doc.setTextColor(100, 116, 139)
+        doc.text('None identified.', margin, cursorY)
+        cursorY += 6
+      } else {
+        keyPoints.forEach((kp) => {
+          const kpLines = doc.splitTextToSize(`• ${kp}`, 210 - margin * 2)
+          kpLines.forEach((l) => {
+            checkOverflow(5.5)
+            doc.text(l, margin, cursorY)
+            cursorY += 5
+          })
+          cursorY += 1.5
+        })
+      }
+      cursorY += 4
+
+      // 4. Decisions Made
+      checkOverflow(15)
+      doc.setFont('helvetica', 'bold')
+      doc.setFontSize(11)
+      doc.setTextColor(15, 23, 42)
+      doc.text('4. Decisions Made', margin, cursorY)
+      cursorY += 6
+
+      doc.setFont('helvetica', 'normal')
+      doc.setFontSize(9.5)
+      if (decisions.length === 0) {
+        doc.setTextColor(100, 116, 139)
+        doc.text('None identified.', margin, cursorY)
+        cursorY += 6
+      } else {
+        doc.setTextColor(51, 65, 85)
+        decisions.forEach((d) => {
+          const dLines = doc.splitTextToSize(`• ${d}`, 210 - margin * 2)
+          dLines.forEach((l) => {
+            checkOverflow(5.5)
+            doc.text(l, margin, cursorY)
+            cursorY += 5
+          })
+          cursorY += 1.5
+        })
+      }
+      cursorY += 4
+
+      // 5. Action Items
+      checkOverflow(15)
+      doc.setFont('helvetica', 'bold')
+      doc.setFontSize(11)
+      doc.setTextColor(15, 23, 42)
+      doc.text('5. Action Items', margin, cursorY)
+      cursorY += 6
+
+      doc.setFont('helvetica', 'normal')
+      doc.setFontSize(9.5)
+      if (actions.length === 0) {
+        doc.setTextColor(100, 116, 139)
+        doc.text('None identified.', margin, cursorY)
+        cursorY += 6
+      } else {
+        doc.setTextColor(51, 65, 85)
+        actions.forEach((a) => {
+          const itemText = a.assignee ? `• ${a.assignee} → ${a.task}` : `• ${a.task}`
+          const aLines = doc.splitTextToSize(itemText, 210 - margin * 2)
+          aLines.forEach((l) => {
+            checkOverflow(5.5)
+            doc.text(l, margin, cursorY)
+            cursorY += 5
+          })
+          cursorY += 1.5
+        })
+      }
+      cursorY += 8
 
       // Footer divider
-      if (cursorY + 15 > pageHeight - margin) {
-        doc.addPage()
-        cursorY = margin
-      }
+      checkOverflow(12)
       doc.setDrawColor(226, 232, 240)
       doc.line(margin, cursorY, 210 - margin, cursorY)
-      cursorY += 10
+      cursorY += 8
 
       // Footer Note
       doc.setFont('helvetica', 'italic')
       doc.setFontSize(9)
-      doc.setTextColor(148, 163, 184) // Slate-400 #94a3b8
-      doc.text('Generated by Meetly AI', margin, cursorY)
+      doc.setTextColor(148, 163, 184)
+      doc.text('Generated by Meetly AI Platform', margin, cursorY)
 
       // Download file automatically
       const safeTitle = (meeting.name || 'meeting').toLowerCase().replace(/[^a-z0-9]+/g, '_')

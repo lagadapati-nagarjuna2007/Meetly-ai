@@ -402,6 +402,20 @@ export function MeetingProvider({ children }) {
     return data.summary
   }
 
+  // FETCH STORED SUMMARY
+  const fetchMeetingSummary = async (meetingId) => {
+    const res = await fetch(`${API_URL}/summary/${meetingId}`, {
+      method: 'GET',
+      headers: getAuthHeaders(),
+      credentials: 'include'
+    })
+    const data = await res.json()
+    if (!res.ok) {
+      throw new Error(data.message || 'Unable to fetch meeting summary.')
+    }
+    return data.summary
+  }
+
   // 14. SUBMIT ATTENDANCE RECORD
   const submitAttendanceRecord = async (record) => {
     const res = await fetch(`${API_URL}/attendance`, {
@@ -471,6 +485,7 @@ export function MeetingProvider({ children }) {
         fetchMeetingDetails,
         fetchMeetingParticipants,
         generateMeetingSummary,
+        fetchMeetingSummary,
         submitAttendanceRecord,
         getAttendanceReport,
         clearAttendanceRecords,

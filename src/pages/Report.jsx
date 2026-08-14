@@ -1,4 +1,4 @@
-import { useState } from 'react'
+import { useState, useEffect } from 'react'
 import { useParams, useSearchParams, useNavigate } from 'react-router-dom'
 import { useMeetings } from '../context/MeetingContext'
 import { useToast } from '../components/Toast'
@@ -20,7 +20,7 @@ export default function Report() {
   const { id } = useParams()
   const [searchParams] = useSearchParams()
   const navigate = useNavigate()
-  const { meetings } = useMeetings()
+  const { meetings, fetchMeetingSummary, generateMeetingSummary } = useMeetings()
   const { showToast } = useToast()
 
   // Find meeting report data
@@ -32,6 +32,54 @@ export default function Report() {
   
   // Transcript search
   const [searchTranscript, setSearchTranscript] = useState('')
+
+  // AI Summary State
+  const [summaryData, setSummaryData] = useState(null)
+  const [isLoadingSummary, setIsLoadingSummary] = useState(false)
+  const [summaryError, setSummaryError] = useState(null)
+
+  useEffect(() => {
+    if (activeTab === 'summary' && meeting?.dbId && !summaryData && !isLoadingSummary) {
+      setIsLoadingSummary(true)
+      fetchMeetingSummary(meeting.dbId)
+        .then((data) => {
+          let parsed = data
+          if (typeof parsed === 'string') {
+            try { parsed = JSON.parse(parsed) } catch (e) {}
+          }
+          setSummaryData(parsed)
+          setSummaryError(null)
+        })
+        .catch((err) => {
+          console.warn('[Report] Failed to fetch stored summary:', err.message)
+          setSummaryError(err.message || 'Summary not generated yet.')
+        })
+        .finally(() => {
+          setIsLoadingSummary(false)
+        })
+    }
+  }, [activeTab, meeting?.dbId, fetchMeetingSummary])
+
+  const handleGenerateSummaryInReport = async () => {
+    if (!meeting?.dbId) return
+    setIsLoadingSummary(true)
+    setSummaryError(null)
+    try {
+      const data = await generateMeetingSummary(meeting.dbId)
+      let parsed = data
+      if (typeof parsed === 'string') {
+        try { parsed = JSON.parse(parsed) } catch (e) {}
+      }
+      setSummaryData(parsed)
+      showToast('AI Summary generated successfully!', 'success')
+    } catch (err) {
+      console.error('[Report Summary Error]:', err)
+      setSummaryError(err.message || 'Unable to generate summary.')
+      showToast(err.message || 'Unable to generate summary.', 'error')
+    } finally {
+      setIsLoadingSummary(false)
+    }
+  }
 
   if (!meeting) {
     return (
@@ -254,34 +302,140 @@ export default function Report() {
 
         {/* PANEL: SUMMARY */}
         {activeTab === 'summary' && (
-          <div className="flex flex-col gap-5 text-left text-xs leading-relaxed max-w-3xl">
-            {/* Outline */}
-            <div className="flex flex-col gap-1.5">
-              <h3 className="text-sm font-bold text-white tracking-wide border-b border-white/5 pb-2">AI Abstract</h3>
-              <p className="text-gray-300 whitespace-pre-line leading-relaxed font-medium">
-                {meeting.summary || 'Summary has not been generated for this meeting.'}
-              </p>
-            </div>
+          <div className="flex flex-col gap-6 text-left text-xs leading-relaxed max-w-4xl">
+            {isLoadingSummary ? (
+              <div className="flex flex-col items-center justify-center py-12 gap-3 text-gray-400">
+                <div className="w-8 h-8 rounded-full border-2 border-brand-purple border-t-transparent animate-spin" />
+                <span className="text-xs font-semibold">Generating AI Summary...</span>
+              </div>
+            ) : summaryData ? (
+              (() => {
+                const overview = typeof summaryData === 'string' ? summaryData : (summaryData.overview || 'No overview available.')
+                const topics = Array.isArray(summaryData?.topicsDiscussed) ? summaryData.topicsDiscussed : []
+                const keyPoints = Array.isArray(summaryData?.keyPoints) ? summaryData.keyPoints : []
+                const decisions = Array.isArray(summaryData?.decisionsMade) ? summaryData.decisionsMade : []
+                const actions = Array.isArray(summaryData?.actionItems) ? summaryData.actionItems : []
 
-            {/* Key Decisions */}
-            <div className="flex flex-col gap-1.5 mt-2">
-              <h3 className="text-sm font-bold text-white tracking-wide border-b border-white/5 pb-2">Key Decisions Made</h3>
-              <ul className="list-disc list-inside flex flex-col gap-1.5 text-gray-300 pl-1 font-medium">
-                <li>Adopted the Tailwind CSS v4 styling scheme with local CSS custom theme declarations.</li>
-                <li>Approved the 10 screen interface flows for implementation in Phase 1.</li>
-                <li>Decided to delay the LiveKit and MediaPipe integration details to Phase 2.</li>
-              </ul>
-            </div>
+                return (
+                  <div className="flex flex-col gap-6">
+                    {/* Header Action Bar */}
+                    <div className="flex items-center justify-between pb-3 border-b border-white/5">
+                      <h2 className="text-sm font-bold text-white tracking-wide flex items-center gap-2">
+                        <FileText size={16} className="text-brand-purple" />
+                        AI Meeting Summary
+                      </h2>
+                      <button
+                        onClick={handleGenerateSummaryInReport}
+                        className="px-3 py-1.5 bg-brand-purple/20 hover:bg-brand-purple/30 border border-brand-purple/30 text-purple-300 rounded-xl text-xs font-semibold transition-all cursor-pointer flex items-center gap-1.5"
+                      >
+                        <Brain size={14} />
+                        <span>Regenerate Summary</span>
+                      </button>
+                    </div>
 
-            {/* Actions */}
-            <div className="flex flex-col gap-1.5 mt-2">
-              <h3 className="text-sm font-bold text-white tracking-wide border-b border-white/5 pb-2">Action Items</h3>
-              <ul className="list-disc list-inside flex flex-col gap-1.5 text-gray-300 pl-1 font-medium">
-                <li><span className="font-semibold text-brand-purple-hover">Nagarjuna Sai</span>: Complete code edits on individual React screen routers.</li>
-                <li><span className="font-semibold text-brand-blue-hover">Design Team</span>: Verify contrast colors on the active login panels.</li>
-                <li><span className="font-semibold text-emerald-400">All</span>: Gather next week for Phase 2 backend specs session.</li>
-              </ul>
-            </div>
+                    {/* 1. Overview */}
+                    <div className="flex flex-col gap-2 p-4 bg-white/2 border border-white/5 rounded-2xl">
+                      <h3 className="text-xs font-bold uppercase tracking-wider text-brand-purple">1. Overview</h3>
+                      <p className="text-gray-200 leading-relaxed font-medium">
+                        {overview}
+                      </p>
+                    </div>
+
+                    {/* 2. Topics Discussed */}
+                    <div className="flex flex-col gap-3 p-4 bg-white/2 border border-white/5 rounded-2xl">
+                      <h3 className="text-xs font-bold uppercase tracking-wider text-brand-purple">2. Topics Discussed</h3>
+                      {topics.length === 0 ? (
+                        <p className="text-gray-400 italic">None identified.</p>
+                      ) : (
+                        <div className="flex flex-col gap-3">
+                          {topics.map((t, idx) => (
+                            <div key={idx} className="flex flex-col gap-1 text-left pl-2 border-l-2 border-purple-500/40">
+                              <span className="text-xs font-bold text-white">• {t.title}</span>
+                              {t.description && <p className="text-gray-300 text-[11px] leading-relaxed">{t.description}</p>}
+                            </div>
+                          ))}
+                        </div>
+                      )}
+                    </div>
+
+                    {/* 3. Key Points */}
+                    <div className="flex flex-col gap-3 p-4 bg-white/2 border border-white/5 rounded-2xl">
+                      <h3 className="text-xs font-bold uppercase tracking-wider text-brand-purple">3. Key Points</h3>
+                      {keyPoints.length === 0 ? (
+                        <p className="text-gray-400 italic">None identified.</p>
+                      ) : (
+                        <ul className="flex flex-col gap-2 pl-2 text-gray-200 font-medium">
+                          {keyPoints.map((kp, idx) => (
+                            <li key={idx} className="flex items-start gap-2">
+                              <span className="text-brand-purple font-bold">•</span>
+                              <span>{kp}</span>
+                            </li>
+                          ))}
+                        </ul>
+                      )}
+                    </div>
+
+                    {/* 4. Decisions Made */}
+                    <div className="flex flex-col gap-3 p-4 bg-white/2 border border-white/5 rounded-2xl">
+                      <h3 className="text-xs font-bold uppercase tracking-wider text-brand-purple">4. Decisions Made</h3>
+                      {decisions.length === 0 ? (
+                        <p className="text-gray-400 italic">None identified.</p>
+                      ) : (
+                        <ul className="flex flex-col gap-2 pl-2 text-gray-200 font-medium">
+                          {decisions.map((d, idx) => (
+                            <li key={idx} className="flex items-start gap-2">
+                              <CheckCircle size={14} className="text-emerald-400 shrink-0 mt-0.5" />
+                              <span>{d}</span>
+                            </li>
+                          ))}
+                        </ul>
+                      )}
+                    </div>
+
+                    {/* 5. Action Items */}
+                    <div className="flex flex-col gap-3 p-4 bg-white/2 border border-white/5 rounded-2xl">
+                      <h3 className="text-xs font-bold uppercase tracking-wider text-brand-purple">5. Action Items</h3>
+                      {actions.length === 0 ? (
+                        <p className="text-gray-400 italic">None identified.</p>
+                      ) : (
+                        <div className="flex flex-col gap-2.5 pl-1">
+                          {actions.map((a, idx) => (
+                            <div key={idx} className="flex items-center gap-2 text-xs bg-slate-900/40 p-2.5 rounded-xl border border-white/5">
+                              {a.assignee ? (
+                                <>
+                                  <span className="px-2 py-0.5 rounded bg-brand-purple/20 border border-brand-purple/30 text-purple-300 font-bold text-[10px] shrink-0">
+                                    {a.assignee}
+                                  </span>
+                                  <span className="text-gray-400">→</span>
+                                </>
+                              ) : null}
+                              <span className="text-gray-200 font-medium">{a.task}</span>
+                            </div>
+                          ))}
+                        </div>
+                      )}
+                    </div>
+                  </div>
+                )
+              })()
+            ) : (
+              <div className="flex flex-col items-center justify-center py-12 text-center gap-4 border border-dashed border-white/10 rounded-2xl p-6 bg-white/2">
+                <FileText size={32} className="text-gray-500" />
+                <div className="flex flex-col gap-1">
+                  <span className="text-sm font-semibold text-white">No AI Summary Generated</span>
+                  <p className="text-xs text-gray-400 max-w-md">
+                    {summaryError || 'Click below to analyze the meeting transcript and generate a structured AI summary.'}
+                  </p>
+                </div>
+                <button
+                  onClick={handleGenerateSummaryInReport}
+                  className="mt-2 px-5 py-2 bg-brand-purple hover:bg-brand-purple-hover text-white rounded-xl text-xs font-bold transition-all shadow-lg shadow-purple-900/30 cursor-pointer flex items-center gap-2"
+                >
+                  <Brain size={14} />
+                  <span>Generate AI Summary</span>
+                </button>
+              </div>
+            )}
           </div>
         )}
 

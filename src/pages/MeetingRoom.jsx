@@ -34,10 +34,21 @@ import {
   Unlock,
   AlertTriangle,
   RefreshCw,
-  Search
+  Search,
+  Smile,
+  MoreHorizontal
 } from 'lucide-react'
 
 import AIChatPanel from '../components/AIChatPanel'
+
+const EMOJI_CATEGORIES = [
+  { id: 'all', label: 'All', icon: '⭐', emojis: [] },
+  { id: 'frequently', label: 'Frequently Used', icon: '⭐', emojis: ['👍', '❤️', '😂', '🎉', '😮', '👏', '🚀', '🎈'] },
+  { id: 'smileys', label: 'Smileys & People', icon: '😃', emojis: ['😀', '😃', '😄', '😁', '😆', '😅', '😂', '🤣', '😊', '😇', '🙂', '🙃', '😉', '😌', '😍', '🥰', '😘', '😗', '😙', '😚', '😋', '😛', '😝', '😜', '🤪', '🤨', '🧐', '🤓', '😎', '🤩', '🥳', '😏', '😒', '😞', '😔', '😟', '😕', '🙁', '😣', '😖', '😫', '😩', '🥺', '😢', '😭', '😤', '😠', '😡', '🤬', '🤯', '😳', '🥵', '🥶', '😱', '😨', '😰', '😥', '😓', '🤗', '🤔', '🤭', '🤫', '🤥', '😶', '😐', '😑', '😬', '🙄', '😯', '😦', '😧', '😮', '😲', '🥱', '😴', '🤤', '😪', '😵', '🤐', '🥴', '🤢', '🤮', '🤧', '😷', '🤒', '🤕'] },
+  { id: 'gestures', label: 'Gestures & Body', icon: '👍', emojis: ['👋', '🤚', '🖐️', '✋', '🖖', '👌', '🤏', '✌️', '🤞', '🤟', '🤘', '🤙', '👈', '👉', '👆', '🖕', '👇', '☝️', '👍', '👎', '✊', '👊', '🤛', '🤜', '👏', '🙌', '👐', '🤲', '🤝', '🙏', '✍️', '💅', '<ctrl42>', '💪'] },
+  { id: 'symbols', label: 'Hearts & Symbols', icon: '❤️', emojis: ['❤️', '🧡', '💛', '💚', '💙', '💜', '🖤', '🤍', '🤎', '💔', '❣️', '💕', '💞', '💓', '💗', '💖', '💘', '💝', '💟', '✨', '🌟', '💫', '💥', '💢', '💦', '💧', '💤', '🎉', '🎊'] },
+  { id: 'objects', label: 'Objects & Food', icon: '💡', emojis: ['💡', '🔦', '🎈', '🎉', '🎂', '🏆', '🥇', '⚽', '🏀', '🏈', '⚾', '🎾', '🍕', '🍔', '🍟', '🌭', '🍿', '☕', '🍵', '🧃', '🥤', '🍺', '🍻', '🥂', '🍷'] }
+]
 
 // Error Boundary component to catch unhandled React errors in MeetingRoom
 class MeetingErrorBoundary extends React.Component {
@@ -846,9 +857,119 @@ function MeetingRoomContent({
     isHostRef.current = isHost
   }, [isHost])
 
+  // Reaction, Raise Hand, and Status States
+  const [activeReactionsMap, setActiveReactionsMap] = useState({})
+  const [raisedHandsMap, setRaisedHandsMap] = useState({})
+  const [participantStatusMap, setParticipantStatusMap] = useState({})
+
+  const [raisedHand, setRaisedHand] = useState(false)
+  const [beRightBack, setBeRightBack] = useState(false)
+
+  const [activePopup, setActivePopup] = useState(null) // 'react' | 'more' | null
+  const [showEndConfirmModal, setShowEndConfirmModal] = useState(false)
+
+  const [emojiSearchQuery, setEmojiSearchQuery] = useState('')
+  const [emojiCategory, setEmojiCategory] = useState('all')
+
+  const reactionCooldownRef = useRef(0)
+
+  // Keyboard shortcut listener (Escape closes popups & modals)
   useEffect(() => {
-    attendanceConsentRef.current = attendanceConsent
-  }, [attendanceConsent])
+    const handleKeyDown = (e) => {
+      if (e.key === 'Escape') {
+        setActivePopup(null)
+        setShowEndConfirmModal(false)
+      }
+    }
+    window.addEventListener('keydown', handleKeyDown)
+    return () => window.removeEventListener('keydown', handleKeyDown)
+  }, [])
+
+  // Socket.IO listeners for reactions, raise hand, status
+  useEffect(() => {
+    const currentSocket = socket?.current
+    if (!currentSocket) return
+
+    const handleReaction = ({ identity, reaction }) => {
+      if (!identity || !reaction) return
+      setActiveReactionsMap((prev) => ({ ...prev, [identity]: reaction }))
+      setTimeout(() => {
+        setActiveReactionsMap((prev) => {
+          const next = { ...prev }
+          delete next[identity]
+          return next
+        })
+      }, 3500)
+    }
+
+    const handleRaiseHand = ({ identity, raised }) => {
+      if (!identity) return
+      setRaisedHandsMap((prev) => ({ ...prev, [identity]: !!raised }))
+    }
+
+    const handleStatusChange = ({ identity, status }) => {
+      if (!identity) return
+      setParticipantStatusMap((prev) => ({ ...prev, [identity]: status }))
+    }
+
+    currentSocket.on('participant_reaction', handleReaction)
+    currentSocket.on('participant_raise_hand', handleRaiseHand)
+    currentSocket.on('participant_status_change', handleStatusChange)
+
+    return () => {
+      currentSocket.off('participant_reaction', handleReaction)
+      currentSocket.off('participant_raise_hand', handleRaiseHand)
+      currentSocket.off('participant_status_change', handleStatusChange)
+    }
+  }, [socket])
+
+  const handleSendReaction = (emoji) => {
+    const now = Date.now()
+    if (now - reactionCooldownRef.current < 400) return
+    reactionCooldownRef.current = now
+
+    const currentSocket = socket?.current
+    const identity = localParticipant?.identity
+    if (currentSocket && identity) {
+      currentSocket.emit('send_reaction', {
+        roomName: meetingData?.meeting_code,
+        identity,
+        senderName: user?.full_name || 'Participant',
+        reaction: emoji
+      })
+    }
+  }
+
+  const handleToggleRaiseHand = () => {
+    const newRaised = !raisedHand
+    setRaisedHand(newRaised)
+    const currentSocket = socket?.current
+    const identity = localParticipant?.identity
+    if (currentSocket && identity) {
+      currentSocket.emit('toggle_raise_hand', {
+        roomName: meetingData?.meeting_code,
+        identity,
+        senderName: user?.full_name || 'Participant',
+        raised: newRaised
+      })
+    }
+  }
+
+  const handleToggleBeRightBack = () => {
+    const newBRB = !beRightBack
+    setBeRightBack(newBRB)
+    const newStatus = newBRB ? 'be_right_back' : 'active'
+    const currentSocket = socket?.current
+    const identity = localParticipant?.identity
+    if (currentSocket && identity) {
+      currentSocket.emit('toggle_status', {
+        roomName: meetingData?.meeting_code,
+        identity,
+        senderName: user?.full_name || 'Participant',
+        status: newStatus
+      })
+    }
+  }
 
   useEffect(() => {
     userRef.current = user
@@ -2343,7 +2464,31 @@ function MeetingRoomContent({
                     </div>
                   )}
 
-                  {/* Quality quality status */}
+                  {/* Raised Hand Top-Right Badge */}
+                  {raisedHandsMap[p.identity] && (
+                    <div className="absolute top-3 right-3 z-20 px-2.5 py-1 rounded-full bg-amber-500/90 border border-amber-300 text-slate-950 font-extrabold text-[11px] shadow-lg animate-bounce flex items-center gap-1">
+                      <span>✋</span>
+                      <span>Hand Raised</span>
+                    </div>
+                  )}
+
+                  {/* Be Right Back Full Tile Overlay */}
+                  {participantStatusMap[p.identity] === 'be_right_back' && (
+                    <div className="absolute inset-0 z-15 bg-black/85 backdrop-blur-sm flex flex-col items-center justify-center gap-2 p-4 text-center select-none">
+                      <span className="text-3xl animate-pulse">⌛</span>
+                      <span className="text-xs font-bold text-amber-300 tracking-wider uppercase">Be Right Back</span>
+                      <span className="text-[10px] text-gray-400 font-medium">{p.name} is temporarily away</span>
+                    </div>
+                  )}
+
+                  {/* Floating Reaction Animation Overlay */}
+                  {activeReactionsMap[p.identity] && (
+                    <div className="absolute bottom-12 left-1/2 -translate-x-1/2 z-20 px-3.5 py-1.5 rounded-2xl bg-black/80 border border-purple-500/50 text-white font-bold text-3xl shadow-2xl animate-bounce">
+                      {activeReactionsMap[p.identity]}
+                    </div>
+                  )}
+
+                  {/* Signal quality status */}
                   <div className="absolute top-3 left-3 flex flex-col gap-1 z-10 text-[9px] font-bold uppercase tracking-wider">
                     <span className="px-2 py-1 rounded bg-black/70 border border-white/10 flex items-center gap-1.5 text-gray-300">
                       <span
@@ -2358,8 +2503,10 @@ function MeetingRoomContent({
                   </div>
 
                   {/* Name Tag (Bottom bar) */}
-                  <div className="absolute bottom-3 left-3 px-3 py-1.5 rounded-xl bg-black/60 border border-white/5 text-[10px] font-bold text-white z-10">
-                    {p.name} {isCurrentUser && ' (You)'} {role === 'host' && ' (Host)'}
+                  <div className="absolute bottom-3 left-3 px-3 py-1.5 rounded-xl bg-black/60 border border-white/5 text-[10px] font-bold text-white z-10 flex items-center gap-1.5">
+                    <span>{p.name} {isCurrentUser && ' (You)'} {role === 'host' && ' (Host)'}</span>
+                    {raisedHandsMap[p.identity] && <span className="text-amber-400">✋</span>}
+                    {participantStatusMap[p.identity] === 'be_right_back' && <span className="text-amber-400">⌛</span>}
                   </div>
                 </div>
               )
@@ -2497,8 +2644,18 @@ function MeetingRoomContent({
                               {p.name?.charAt(0).toUpperCase() || 'P'}
                             </div>
                             <div className="flex flex-col text-left min-w-0">
-                              <span className="text-xs font-semibold text-white truncate">
-                                {p.name} {p.identity === localParticipant?.identity && ' (You)'}
+                              <span className="text-xs font-semibold text-white truncate flex items-center gap-1.5">
+                                <span>{p.name} {p.identity === localParticipant?.identity && ' (You)'}</span>
+                                {raisedHandsMap[p.identity] && (
+                                  <span className="px-1.5 py-0.5 rounded bg-amber-500/20 border border-amber-500/40 text-amber-300 text-[9px] font-bold shrink-0">
+                                    ✋ Hand
+                                  </span>
+                                )}
+                                {participantStatusMap[p.identity] === 'be_right_back' && (
+                                  <span className="px-1.5 py-0.5 rounded bg-amber-500/20 border border-amber-500/40 text-amber-300 text-[9px] font-bold shrink-0">
+                                    ⌛ BRB
+                                  </span>
+                                )}
                               </span>
                               <span className="text-[10px] text-gray-400 font-bold uppercase tracking-wider mt-0.5">{role}</span>
                             </div>
@@ -2682,6 +2839,7 @@ function MeetingRoomContent({
           <button
             onClick={() => setRightPanelOpen(!rightPanelOpen)}
             className={`p-2.5 rounded-xl border border-white/5 text-gray-400 hover:text-white transition-all duration-200 cursor-pointer ${rightPanelOpen ? 'bg-white/5 text-white' : 'hover:bg-white/5'}`}
+            title="Toggle Right Panel"
           >
             <MessageSquare size={16} />
           </button>
@@ -2716,8 +2874,8 @@ function MeetingRoomContent({
           )}
         </div>
 
-        {/* Core Media Controls */}
-        <div className="flex items-center gap-3">
+        {/* Core Media & Meeting Controls Toolbar */}
+        <div className="flex items-center gap-2 md:gap-3 relative">
           {/* Microphone */}
           <button
             onClick={handleToggleMic}
@@ -2744,6 +2902,7 @@ function MeetingRoomContent({
           {/* Camera */}
           <button
             onClick={handleToggleCam}
+            title={camActive ? "Turn off camera" : "Turn on camera"}
             className={`w-11 h-11 rounded-xl flex items-center justify-center border transition-all duration-200 cursor-pointer ${
               camActive ? 'bg-[#0f1122]/60 hover:bg-[#141629] border-white/10 text-white' : 'bg-red-600 hover:bg-red-500 border-transparent text-white'
             }`}
@@ -2751,18 +2910,275 @@ function MeetingRoomContent({
             {camActive ? <Cam size={18} /> : <VideoOff size={18} />}
           </button>
 
+          {/* Participants Button */}
+          <button
+            onClick={() => {
+              setActiveTab('participants')
+              setRightPanelOpen(true)
+            }}
+            title="Participants"
+            className="px-3 py-2.5 rounded-xl bg-[#0f1122]/60 hover:bg-[#141629] border border-white/10 text-white flex items-center gap-1.5 text-xs font-semibold cursor-pointer transition-all"
+          >
+            <Users size={16} />
+            <span className="hidden md:inline">Participants</span>
+            <span className="px-1.5 py-0.5 rounded-full bg-purple-600/30 text-purple-300 text-[10px] font-bold">
+              {allParticipants.length}
+            </span>
+          </button>
+
+          {/* Chat Button */}
+          <button
+            onClick={() => {
+              setActiveTab('chat')
+              setRightPanelOpen(true)
+            }}
+            title="In-meeting Chat"
+            className="px-3 py-2.5 rounded-xl bg-[#0f1122]/60 hover:bg-[#141629] border border-white/10 text-white flex items-center gap-1.5 text-xs font-semibold cursor-pointer transition-all"
+          >
+            <MessageSquare size={16} />
+            <span className="hidden md:inline">Chat</span>
+          </button>
+
+          {/* Concept A: React Button & Compact Quick Reaction Row */}
+          <div className="relative">
+            <button
+              onClick={() => setActivePopup(activePopup === 'react' ? null : 'react')}
+              aria-label="Open reactions"
+              title="Reactions"
+              className={`px-3 py-2.5 rounded-xl border transition-all duration-200 cursor-pointer flex items-center gap-1.5 text-xs font-semibold ${
+                activePopup === 'react'
+                  ? 'bg-purple-600 border-purple-500 text-white shadow-lg shadow-purple-600/30'
+                  : 'bg-[#0f1122]/60 hover:bg-[#141629] border-white/10 text-white'
+              }`}
+            >
+              <Smile size={16} />
+              <span className="hidden md:inline">React</span>
+            </button>
+
+            {/* Quick Reactions Popup (Compact horizontal row ONLY) */}
+            {activePopup === 'react' && (
+              <div className="absolute bottom-16 left-0 sm:left-1/2 sm:-translate-x-1/2 z-50 bg-[#0c0e1b] border border-white/10 rounded-2xl p-2 shadow-2xl backdrop-blur-xl flex items-center gap-1 select-none">
+                {['👋', '👍', '❤️', '😂', '😮', '🎉', '🎈', '🚀'].map((emoji) => (
+                  <button
+                    key={emoji}
+                    onClick={() => {
+                      handleSendReaction(emoji)
+                      setActivePopup(null)
+                    }}
+                    title={`Send ${emoji}`}
+                    aria-label={`Send ${emoji} reaction`}
+                    className="text-xl p-2 rounded-xl hover:bg-white/10 hover:scale-125 transition-all cursor-pointer"
+                  >
+                    {emoji}
+                  </button>
+                ))}
+              </div>
+            )}
+          </div>
+
           {/* Screen Share */}
           <button
             onClick={handleToggleShare}
+            title="Share Screen"
             className={`w-11 h-11 rounded-xl flex items-center justify-center border transition-all duration-200 cursor-pointer ${
               sharingActive ? 'bg-brand-blue hover:bg-brand-blue-hover border-transparent text-white shadow-lg shadow-brand-blue/20' : 'bg-[#0f1122]/60 hover:bg-[#141629] border-white/10 text-white'
             }`}
           >
             <Monitor size={18} />
           </button>
+
+          {/* Concept B: More Button & Utilities Menu */}
+          <div className="relative">
+            <button
+              onClick={() => setActivePopup(activePopup === 'more' || activePopup === 'emoji' ? null : 'more')}
+              aria-label="More meeting options"
+              title="More Options"
+              className={`px-3 py-2.5 rounded-xl border transition-all duration-200 cursor-pointer flex items-center gap-1.5 text-xs font-semibold ${
+                activePopup === 'more' || activePopup === 'emoji' || raisedHand || beRightBack
+                  ? 'bg-purple-600 border-purple-500 text-white shadow-lg shadow-purple-600/30'
+                  : 'bg-[#0f1122]/60 hover:bg-[#141629] border-white/10 text-white'
+              }`}
+            >
+              <MoreHorizontal size={16} />
+              <span className="hidden md:inline">
+                {raisedHand ? '✋ Hand' : beRightBack ? '⌛ BRB' : 'More'}
+              </span>
+            </button>
+
+            {/* Concept B: More Utilities Floating Menu */}
+            {activePopup === 'more' && (
+              <div className="absolute bottom-16 right-0 sm:right-auto sm:left-1/2 sm:-translate-x-1/2 z-50 w-64 bg-[#0c0e1b] border border-white/10 rounded-2xl p-3 shadow-2xl backdrop-blur-xl flex flex-col gap-2 select-none text-left">
+                <div className="text-[10px] font-bold text-gray-400 uppercase tracking-wider px-2 py-1 border-b border-white/5">
+                  More Options
+                </div>
+
+                {/* Option 1: Raise Hand */}
+                <button
+                  onClick={() => {
+                    handleToggleRaiseHand()
+                    setActivePopup(null)
+                  }}
+                  aria-label="Raise or lower hand"
+                  title="Raise Hand"
+                  className={`w-full py-2.5 px-3 rounded-xl font-semibold text-xs flex items-center justify-between border transition-all cursor-pointer ${
+                    raisedHand
+                      ? 'bg-amber-500/20 border-amber-500/40 text-amber-300'
+                      : 'bg-white/5 hover:bg-white/10 border-white/5 text-white'
+                  }`}
+                >
+                  <span className="flex items-center gap-2.5">
+                    <span className="text-base">✋</span>
+                    <span>{raisedHand ? 'Lower Hand' : 'Raise Hand'}</span>
+                  </span>
+                  <span className="text-[10px] font-bold uppercase tracking-wider">{raisedHand ? 'Raised' : 'Off'}</span>
+                </button>
+
+                {/* Option 2: Be Right Back */}
+                <button
+                  onClick={() => {
+                    handleToggleBeRightBack()
+                    setActivePopup(null)
+                  }}
+                  aria-label="Toggle Be Right Back status"
+                  title="Be Right Back"
+                  className={`w-full py-2.5 px-3 rounded-xl font-semibold text-xs flex items-center justify-between border transition-all cursor-pointer ${
+                    beRightBack
+                      ? 'bg-amber-500/20 border-amber-500/40 text-amber-300'
+                      : 'bg-white/5 hover:bg-white/10 border-white/5 text-white'
+                  }`}
+                >
+                  <span className="flex items-center gap-2.5">
+                    <span className="text-base">⌛</span>
+                    <span>{beRightBack ? "I'm Back" : 'Be Right Back'}</span>
+                  </span>
+                  <span className="text-[10px] font-bold uppercase tracking-wider">{beRightBack ? 'Away' : 'Off'}</span>
+                </button>
+
+                {/* Option 3: Full Emoji / More Reactions */}
+                <button
+                  onClick={() => setActivePopup('emoji')}
+                  aria-label="Open full emoji picker"
+                  title="More Emojis & Reactions"
+                  className="w-full py-2.5 px-3 rounded-xl font-semibold text-xs flex items-center justify-between bg-white/5 hover:bg-white/10 border border-white/5 text-white transition-all cursor-pointer"
+                >
+                  <span className="flex items-center gap-2.5">
+                    <span className="text-base">😃</span>
+                    <span>More Emojis & Reactions</span>
+                  </span>
+                  <span className="text-gray-400 text-xs">›</span>
+                </button>
+              </div>
+            )}
+
+            {/* Concept C: Full Emoji Picker Panel */}
+            {activePopup === 'emoji' && (
+              <div className="absolute bottom-16 right-0 sm:right-auto sm:left-1/2 sm:-translate-x-1/2 z-50 w-80 bg-[#0c0e1b] border border-white/10 rounded-2xl p-4 shadow-2xl backdrop-blur-xl flex flex-col gap-3 select-none text-left max-h-[420px] overflow-hidden">
+                {/* Header & Back Button */}
+                <div className="flex items-center justify-between border-b border-white/5 pb-2">
+                  <div className="flex items-center gap-2">
+                    <button
+                      onClick={() => setActivePopup('more')}
+                      className="text-gray-400 hover:text-white text-xs font-bold px-2 py-0.5 rounded bg-white/5 hover:bg-white/10 transition-colors cursor-pointer"
+                      title="Back to More Menu"
+                    >
+                      ‹ Back
+                    </button>
+                    <span className="text-xs font-bold text-white">Emoji Picker</span>
+                  </div>
+                  <button
+                    onClick={() => setActivePopup(null)}
+                    className="text-gray-400 hover:text-white text-xs cursor-pointer p-1"
+                    title="Close"
+                  >
+                    ✕
+                  </button>
+                </div>
+
+                {/* Search Emoji */}
+                <div className="relative flex items-center">
+                  <Search size={14} className="absolute left-3 text-gray-400 pointer-events-none" />
+                  <input
+                    type="text"
+                    placeholder="Search emoji..."
+                    value={emojiSearchQuery}
+                    onChange={(e) => setEmojiSearchQuery(e.target.value)}
+                    className="w-full pl-9 pr-7 py-1.5 bg-white/5 border border-white/10 rounded-xl text-xs text-white placeholder-gray-400 focus:outline-none focus:border-purple-500 transition-colors"
+                  />
+                  {emojiSearchQuery && (
+                    <button
+                      onClick={() => setEmojiSearchQuery('')}
+                      className="absolute right-2.5 text-gray-400 hover:text-white text-xs"
+                    >
+                      ✕
+                    </button>
+                  )}
+                </div>
+
+                {/* Category Navigation Tabs */}
+                {!emojiSearchQuery && (
+                  <div className="flex items-center gap-1 overflow-x-auto pb-1 border-b border-white/5">
+                    {EMOJI_CATEGORIES.map((cat) => (
+                      <button
+                        key={cat.id}
+                        onClick={() => setEmojiCategory(cat.id)}
+                        title={cat.label}
+                        className={`px-2 py-1 rounded-lg text-xs transition-colors cursor-pointer shrink-0 ${
+                          emojiCategory === cat.id ? 'bg-purple-600 text-white font-bold' : 'text-gray-400 hover:text-white hover:bg-white/5'
+                        }`}
+                      >
+                        {cat.icon}
+                      </button>
+                    ))}
+                  </div>
+                )}
+
+                {/* Scrollable Emoji Grid */}
+                <div className="flex-1 overflow-y-auto max-h-52 flex flex-col gap-2 pr-1">
+                  {emojiSearchQuery ? (
+                    <div className="grid grid-cols-7 gap-1">
+                      {EMOJI_CATEGORIES.flatMap(c => c.emojis)
+                        .filter((e, idx, arr) => arr.indexOf(e) === idx && e.includes(emojiSearchQuery))
+                        .map((emoji) => (
+                          <button
+                            key={emoji}
+                            onClick={() => {
+                              handleSendReaction(emoji)
+                              setActivePopup(null)
+                            }}
+                            className="text-lg hover:scale-125 transition-transform cursor-pointer p-1 rounded hover:bg-white/10 text-center"
+                          >
+                            {emoji}
+                          </button>
+                        ))}
+                    </div>
+                  ) : (
+                    EMOJI_CATEGORIES.filter(c => emojiCategory === 'all' || emojiCategory === c.id).map((cat) => (
+                      <div key={cat.id} className="flex flex-col gap-1">
+                        <span className="text-[10px] font-bold text-gray-400 uppercase tracking-wider">{cat.label}</span>
+                        <div className="grid grid-cols-7 gap-1">
+                          {cat.emojis.map((emoji) => (
+                            <button
+                              key={emoji}
+                              onClick={() => {
+                                handleSendReaction(emoji)
+                                setActivePopup(null)
+                              }}
+                              className="text-lg hover:scale-125 transition-transform cursor-pointer p-1 rounded hover:bg-white/10 text-center"
+                            >
+                              {emoji}
+                            </button>
+                          ))}
+                        </div>
+                      </div>
+                    ))
+                  )}
+                </div>
+              </div>
+            )}
+          </div>
         </div>
 
-        {/* End Call / Leave room controls based on host permissions */}
+        {/* End / Leave Meeting Button (Opens Confirmation Modal) */}
         {isHost ? (
           <div className="flex items-center gap-2">
             <button
@@ -2770,7 +3186,7 @@ function MeetingRoomContent({
               className="px-3.5 py-2 border border-[#8b5cf6]/20 hover:border-[#8b5cf6]/40 bg-[#8b5cf6]/5 hover:bg-[#8b5cf6]/10 text-[#c084fc] hover:text-[#d8b4fe] rounded-xl text-xs font-bold transition-all duration-200 cursor-pointer flex items-center gap-1.5"
             >
               {meetingData?.meeting_status === 'Locked' ? <Unlock size={12} /> : <Lock size={12} />}
-              <span>{meetingData?.meeting_status === 'Locked' ? 'Unlock Room' : 'Lock Room'}</span>
+              <span className="hidden sm:inline">{meetingData?.meeting_status === 'Locked' ? 'Unlock Room' : 'Lock Room'}</span>
             </button>
             <button
               onClick={handleDeleteMeeting}
@@ -2778,18 +3194,94 @@ function MeetingRoomContent({
             >
               Delete
             </button>
-            <Button variant="danger" onClick={handleEndWithAttendance} className="px-5 py-2 rounded-xl text-xs font-semibold flex items-center gap-1.5 shadow-lg shadow-red-600/25">
+            <Button
+              variant="danger"
+              onClick={() => setShowEndConfirmModal(true)}
+              aria-label="End meeting"
+              className="px-5 py-2 rounded-xl text-xs font-semibold flex items-center gap-1.5 shadow-lg shadow-red-600/25 cursor-pointer"
+            >
               <PhoneOff size={14} />
               <span>End Meeting</span>
             </Button>
           </div>
         ) : (
-          <Button variant="danger" onClick={handleLeaveWithAttendance} className="px-5 py-2 rounded-xl text-xs font-semibold flex items-center gap-1.5 shadow-lg shadow-red-600/25">
+          <Button
+            variant="danger"
+            onClick={() => setShowEndConfirmModal(true)}
+            aria-label="Leave meeting"
+            className="px-5 py-2 rounded-xl text-xs font-semibold flex items-center gap-1.5 shadow-lg shadow-red-600/25 cursor-pointer"
+          >
             <PhoneOff size={14} />
             <span>Leave Room</span>
           </Button>
         )}
       </footer>
+
+      {/* END / LEAVE MEETING CONFIRMATION MODAL */}
+      {showEndConfirmModal && (
+        <div className="fixed inset-0 z-50 bg-black/75 backdrop-blur-md flex items-center justify-center p-4 select-none">
+          <div className="max-w-md w-full bg-[#0c0e1b] border border-white/10 rounded-2xl p-6 flex flex-col gap-5 shadow-2xl text-left">
+            <div className="flex items-center gap-3">
+              <div className="w-10 h-10 rounded-full bg-red-600/20 border border-red-500/30 flex items-center justify-center text-red-400 shrink-0">
+                <PhoneOff size={20} />
+              </div>
+              <div className="flex flex-col">
+                <h3 className="text-base font-bold text-white">
+                  {isHost ? 'End meeting for all?' : 'Leave meeting?'}
+                </h3>
+                <p className="text-xs text-gray-400 mt-0.5">
+                  {isHost
+                    ? 'You will end the meeting for all participants. Existing attendance records will be preserved.'
+                    : 'Are you sure you want to leave this meeting session?'}
+                </p>
+              </div>
+            </div>
+
+            <div className="flex flex-col gap-2 pt-2 border-t border-white/5">
+              {isHost ? (
+                <>
+                  <Button
+                    variant="danger"
+                    onClick={() => {
+                      setShowEndConfirmModal(false)
+                      handleEndWithAttendance()
+                    }}
+                    className="w-full py-2.5 rounded-xl text-xs font-bold shadow-lg shadow-red-600/30 cursor-pointer"
+                  >
+                    End meeting for all
+                  </Button>
+                  <button
+                    onClick={() => {
+                      setShowEndConfirmModal(false)
+                      handleLeaveWithAttendance()
+                    }}
+                    className="w-full py-2.5 rounded-xl bg-white/5 hover:bg-white/10 border border-white/10 text-white text-xs font-semibold transition-all cursor-pointer"
+                  >
+                    Leave meeting
+                  </button>
+                </>
+              ) : (
+                <Button
+                  variant="danger"
+                  onClick={() => {
+                    setShowEndConfirmModal(false)
+                    handleLeaveWithAttendance()
+                  }}
+                  className="w-full py-2.5 rounded-xl text-xs font-bold shadow-lg shadow-red-600/30 cursor-pointer"
+                >
+                  Leave meeting
+                </Button>
+              )}
+              <button
+                onClick={() => setShowEndConfirmModal(false)}
+                className="w-full py-2 text-xs font-semibold text-gray-400 hover:text-white transition-colors cursor-pointer"
+              >
+                Cancel
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
     </div>
   )
 }
