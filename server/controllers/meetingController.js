@@ -1170,7 +1170,7 @@ export const submitTranscriptChunk = async (req, res) => {
   }
 }
 
-// 14. GENERATE SUMMARY (Llama 3.3 Chat Completions)
+// 14. GENERATE SUMMARY (Llama 3.3 Chat Completions with Structured Output)
 export const generateSummary = async (req, res) => {
   try {
     const { meetingId } = req.body
@@ -1203,9 +1203,9 @@ export const generateSummary = async (req, res) => {
       .map(c => `${c.speaker_name}: ${c.transcript}`)
       .join('\n')
 
-    console.log(`[Summary] Generating summary for meeting ${meetingId} from ${chunks.length} transcript chunks...`)
+    console.log(`[Summary] Generating structured summary for meeting ${meetingId} from ${chunks.length} transcript chunks...`)
 
-    // 3. Call Groq Llama 3.3
+    // 3. Call Groq Llama 3.3 with JSON mode
     const groqRes = await fetch('https://api.groq.com/openai/v1/chat/completions', {
       method: 'POST',
       headers: {
@@ -1214,28 +1214,48 @@ export const generateSummary = async (req, res) => {
       },
       body: JSON.stringify({
         model: 'llama-3.3-70b-versatile',
+        response_format: { type: 'json_object' },
         messages: [
           {
             role: 'system',
-            content: `You are an AI Meeting Assistant.
+            content: `You are an expert AI Meeting Summarizer.
+Analyze the provided meeting transcript and generate a structured, high-accuracy JSON meeting summary strictly following this exact JSON schema.
 
-Read the following meeting transcript and generate a professional meeting summary.
+CRITICAL ANTI-HALLUCINATION RULES:
+- Summarize ONLY information explicitly discussed or directly supported by the meeting transcript.
+- NEVER invent or assume decisions, action items, assignees, technical details, or topics not discussed in the transcript.
+- If no explicit decisions were made or agreed upon in the conversation, set "decisionsMade": [].
+- If no explicit tasks were assigned in the conversation, set "actionItems": [].
+- Assignees must be actual meeting participants mentioned in the transcript. If a task has no explicit assignee, set "assignee": "".
+- Do NOT include sentiment, scores, mood, timestamps, speaker statistics, or fluff.
 
-Requirements:
-- Summarize only what was discussed.
-- Include important decisions.
-- Include conclusions if mentioned.
-- Include action items only if explicitly discussed.
-- Do not invent information.
-- Do not include attendance.
-- Do not include timestamps.
-- Do not include speaker statistics.
-- Do not include sentiment analysis.
-- Return clean plain text suitable for a PDF.`
+REQUIRED JSON OUTPUT SCHEMA:
+{
+  "overview": "Concise 2-4 sentence overview of what the meeting was mainly about.",
+  "topicsDiscussed": [
+    {
+      "title": "Topic Title",
+      "description": "Short 1-3 sentence summary of what was discussed about this topic."
+    }
+  ],
+  "keyPoints": [
+    "Key takeaway point 1",
+    "Key takeaway point 2"
+  ],
+  "decisionsMade": [
+    "Decision 1"
+  ],
+  "actionItems": [
+    {
+      "assignee": "Person Name or empty string",
+      "task": "Specific task assigned"
+    }
+  ]
+}`
           },
           {
             role: 'user',
-            content: transcriptText
+            content: `Meeting Transcript:\n${transcriptText}`
           }
         ],
         temperature: 0.1
@@ -1249,14 +1269,40 @@ Requirements:
     }
 
     const result = await groqRes.json()
-    const summary = result.choices?.[0]?.message?.content || ''
+    const rawContent = result.choices?.[0]?.message?.content || ''
 
-    if (!summary) {
-      return res.status(500).json({ message: 'Unable to generate meeting summary. Please try again.' })
+    let parsedSummary = null
+    try {
+      const cleanJson = rawContent.replace(/```json/gi, '').replace(/```/g, '').trim()
+      parsedSummary = JSON.parse(cleanJson)
+    } catch (parseErr) {
+      console.warn('[Summary Error] Failed to parse JSON response from Groq:', parseErr)
     }
 
+    if (!parsedSummary || typeof parsedSummary !== 'object') {
+      return res.status(500).json({ message: 'Unable to format meeting summary as structured JSON. Please try again.' })
+    }
+
+    // Sanitize and structure summary object
+    const finalSummary = {
+      overview: typeof parsedSummary.overview === 'string' ? parsedSummary.overview.trim() : '',
+      topicsDiscussed: Array.isArray(parsedSummary.topicsDiscussed)
+        ? parsedSummary.topicsDiscussed.map(t => typeof t === 'string' ? { title: t.trim(), description: '' } : { title: String(t.title || 'Topic').trim(), description: String(t.description || '').trim() }).filter(t => t.title)
+        : [],
+      keyPoints: Array.isArray(parsedSummary.keyPoints)
+        ? parsedSummary.keyPoints.map(k => String(k).trim()).filter(Boolean)
+        : [],
+      decisionsMade: Array.isArray(parsedSummary.decisionsMade)
+        ? parsedSummary.decisionsMade.map(d => String(d).trim()).filter(Boolean)
+        : [],
+      actionItems: Array.isArray(parsedSummary.actionItems)
+        ? parsedSummary.actionItems.map(a => typeof a === 'string' ? { assignee: '', task: a.trim() } : { assignee: String(a.assignee || '').trim(), task: String(a.task || '').trim() }).filter(a => a.task)
+        : []
+    }
+
+    const summaryJsonStr = JSON.stringify(finalSummary)
+
     // 4. Save to meeting_ai_summaries table
-    // Delete any existing summary for this meeting first
     await supabase
       .from('meeting_ai_summaries')
       .delete()
@@ -1267,7 +1313,7 @@ Requirements:
       .insert([
         {
           meeting_id: meetingId,
-          summary
+          summary: summaryJsonStr
         }
       ])
 
@@ -1276,11 +1322,47 @@ Requirements:
       return res.status(500).json({ message: 'Failed to save summary to database.' })
     }
 
-    console.log(`[Summary Success] Generated summary for meeting ${meetingId}`)
-    return res.status(200).json({ summary })
+    console.log(`[Summary Success] Generated structured summary for meeting ${meetingId}`)
+    return res.status(200).json({ summary: finalSummary })
   } catch (err) {
     console.error('Generate summary error:', err)
     return res.status(500).json({ message: 'Unable to generate meeting summary. Please try again.' })
+  }
+}
+
+// GET /api/meetings/summary/:meetingId
+export const getSummary = async (req, res) => {
+  try {
+    const { meetingId } = req.params
+    if (!meetingId) {
+      return res.status(400).json({ message: 'Meeting ID is required.' })
+    }
+
+    const { data: record, error: fetchErr } = await supabase
+      .from('meeting_ai_summaries')
+      .select('summary')
+      .eq('meeting_id', meetingId)
+      .maybeSingle()
+
+    if (fetchErr) throw fetchErr
+
+    if (!record || !record.summary) {
+      return res.status(404).json({ message: 'No summary found for this meeting.' })
+    }
+
+    let summaryObj = record.summary
+    if (typeof summaryObj === 'string') {
+      try {
+        summaryObj = JSON.parse(summaryObj)
+      } catch (e) {
+        summaryObj = { overview: record.summary, topicsDiscussed: [], keyPoints: [], decisionsMade: [], actionItems: [] }
+      }
+    }
+
+    return res.status(200).json({ summary: summaryObj })
+  } catch (err) {
+    console.error('Get summary error:', err)
+    return res.status(500).json({ message: 'Server error retrieving summary.' })
   }
 }
 

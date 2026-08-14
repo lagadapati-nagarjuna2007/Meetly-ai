@@ -15,6 +15,7 @@ import {
   getMeetingHistory,
   submitTranscriptChunk,
   generateSummary,
+  getSummary,
   submitAttendance,
   getAttendanceReport,
   deleteAttendanceRecords
@@ -48,6 +49,7 @@ router.post('/end', endMeeting)
 router.post('/lock', lockMeeting)
 router.post('/transcript', upload.single('file'), submitTranscriptChunk)
 router.post('/summary/generate', generateSummary)
+router.get('/summary/:meetingId', getSummary)
 router.post('/attendance', submitAttendance)
 router.get('/attendance/report/:meetingId', getAttendanceReport)
 router.delete('/attendance/report/:meetingId', deleteAttendanceRecords)

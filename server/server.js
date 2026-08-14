@@ -135,6 +135,39 @@ io.on('connection', (socket) => {
     io.to(data.roomName).emit('participant_removed', { userId: data.userId })
   })
 
+  // Reaction broadcasting
+  socket.on('send_reaction', (data) => {
+    if (data && data.roomName) {
+      io.to(data.roomName).emit('participant_reaction', {
+        identity: data.identity,
+        senderName: data.senderName,
+        reaction: data.reaction
+      })
+    }
+  })
+
+  // Raise hand broadcasting
+  socket.on('toggle_raise_hand', (data) => {
+    if (data && data.roomName) {
+      io.to(data.roomName).emit('participant_raise_hand', {
+        identity: data.identity,
+        senderName: data.senderName,
+        raised: data.raised
+      })
+    }
+  })
+
+  // Status change broadcasting (e.g., Be Right Back)
+  socket.on('toggle_status', (data) => {
+    if (data && data.roomName) {
+      io.to(data.roomName).emit('participant_status_change', {
+        identity: data.identity,
+        senderName: data.senderName,
+        status: data.status
+      })
+    }
+  })
+
   // Host ended room trigger
   socket.on('end_meeting', (roomName) => {
     io.to(roomName).emit('meeting_ended')
