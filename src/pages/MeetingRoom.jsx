@@ -792,6 +792,15 @@ function MeetingRoomContent({
   const [attendanceCamError, setAttendanceCamError] = useState(false)
   const [isShuttingDown, setIsShuttingDown] = useState(false)
 
+  // ── Reaction / Raise Hand / BRB state ─────────────────────────────────────
+  // Declared here (inside MeetingRoomContent) where they are used in JSX,
+  // handlers, and socket listeners. socket is passed as a prop from MeetingRoomInner.
+  const [activeReactionsMap, setActiveReactionsMap] = useState({})
+  const [raisedHandsMap, setRaisedHandsMap] = useState({})
+  const [participantStatusMap, setParticipantStatusMap] = useState({})
+  const [raisedHand, setRaisedHand] = useState(false)
+  const [beRightBack, setBeRightBack] = useState(false)
+
   // Timer state — must live here with all other useState calls to avoid hook-order violations
   const [seconds, setSeconds] = useState(0)
 
@@ -857,13 +866,6 @@ function MeetingRoomContent({
     isHostRef.current = isHost
   }, [isHost])
 
-  // Reaction, Raise Hand, and Status States
-  const [activeReactionsMap, setActiveReactionsMap] = useState({})
-  const [raisedHandsMap, setRaisedHandsMap] = useState({})
-  const [participantStatusMap, setParticipantStatusMap] = useState({})
-
-  const [raisedHand, setRaisedHand] = useState(false)
-  const [beRightBack, setBeRightBack] = useState(false)
 
   const [activePopup, setActivePopup] = useState(null) // 'react' | 'more' | null
   const [showEndConfirmModal, setShowEndConfirmModal] = useState(false)
@@ -885,12 +887,16 @@ function MeetingRoomContent({
     return () => window.removeEventListener('keydown', handleKeyDown)
   }, [])
 
-  // Socket.IO listeners for reactions, raise hand, status
+  // \u2500\u2500 Socket listeners for reactions, raise hand, Be Right Back \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500
+  // Registered here inside MeetingRoomContent, where the state setters live.
+  // The socket ref is passed as a prop from MeetingRoomInner and is already
+  // connected by the time meetingData?.room_name is truthy.
   useEffect(() => {
     const currentSocket = socket?.current
     if (!currentSocket) return
 
-    const handleReaction = ({ identity, reaction }) => {
+    const onReaction = ({ identity, reaction }) => {
+      console.log('[Reaction RECEIVE]', identity, reaction)
       if (!identity || !reaction) return
       setActiveReactionsMap((prev) => ({ ...prev, [identity]: reaction }))
       setTimeout(() => {
@@ -902,26 +908,31 @@ function MeetingRoomContent({
       }, 3500)
     }
 
-    const handleRaiseHand = ({ identity, raised }) => {
+    const onRaiseHand = ({ identity, raised }) => {
+      console.log('[RaiseHand RECEIVE]', identity, raised)
       if (!identity) return
       setRaisedHandsMap((prev) => ({ ...prev, [identity]: !!raised }))
     }
 
-    const handleStatusChange = ({ identity, status }) => {
+    const onStatusChange = ({ identity, status }) => {
+      console.log('[Status RECEIVE]', identity, status)
       if (!identity) return
       setParticipantStatusMap((prev) => ({ ...prev, [identity]: status }))
     }
 
-    currentSocket.on('participant_reaction', handleReaction)
-    currentSocket.on('participant_raise_hand', handleRaiseHand)
-    currentSocket.on('participant_status_change', handleStatusChange)
+    currentSocket.on('participant_reaction', onReaction)
+    currentSocket.on('participant_raise_hand', onRaiseHand)
+    currentSocket.on('participant_status_change', onStatusChange)
 
     return () => {
-      currentSocket.off('participant_reaction', handleReaction)
-      currentSocket.off('participant_raise_hand', handleRaiseHand)
-      currentSocket.off('participant_status_change', handleStatusChange)
+      currentSocket.off('participant_reaction', onReaction)
+      currentSocket.off('participant_raise_hand', onRaiseHand)
+      currentSocket.off('participant_status_change', onStatusChange)
     }
-  }, [socket])
+  // meetingData?.room_name is the proxy signal that socket is ready
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [meetingData?.room_name])
+
 
   const handleSendReaction = (emoji) => {
     const now = Date.now()
@@ -929,29 +940,60 @@ function MeetingRoomContent({
     reactionCooldownRef.current = now
 
     const currentSocket = socket?.current
+    // BUG FIX #1: use room_name (what join_room emits) NOT meeting_code
+    const roomName = meetingData?.room_name
     const identity = localParticipant?.identity
-    if (currentSocket && identity) {
+
+    console.log('[Reaction SEND] roomName:', roomName, 'identity:', identity, 'emoji:', emoji)
+
+    // BUG FIX #3: Show reaction locally immediately (don't wait for server echo)
+    if (identity) {
+      setActiveReactionsMap((prev) => ({ ...prev, [identity]: emoji }))
+      setTimeout(() => {
+        setActiveReactionsMap((prev) => {
+          const next = { ...prev }
+          delete next[identity]
+          return next
+        })
+      }, 3500)
+    }
+
+    if (currentSocket && identity && roomName) {
       currentSocket.emit('send_reaction', {
-        roomName: meetingData?.meeting_code,
+        roomName,
         identity,
         senderName: user?.full_name || 'Participant',
         reaction: emoji
       })
+    } else {
+      console.warn('[Reaction SEND] Missing socket/identity/roomName. socket:', !!currentSocket, 'identity:', identity, 'roomName:', roomName)
     }
   }
 
   const handleToggleRaiseHand = () => {
     const newRaised = !raisedHand
     setRaisedHand(newRaised)
+    // BUG FIX #1: use room_name not meeting_code
+    const roomName = meetingData?.room_name
     const currentSocket = socket?.current
     const identity = localParticipant?.identity
-    if (currentSocket && identity) {
+
+    console.log('[RaiseHand SEND] roomName:', roomName, 'identity:', identity, 'raised:', newRaised)
+
+    // Show locally immediately
+    if (identity) {
+      setRaisedHandsMap((prev) => ({ ...prev, [identity]: newRaised }))
+    }
+
+    if (currentSocket && identity && roomName) {
       currentSocket.emit('toggle_raise_hand', {
-        roomName: meetingData?.meeting_code,
+        roomName,
         identity,
         senderName: user?.full_name || 'Participant',
         raised: newRaised
       })
+    } else {
+      console.warn('[RaiseHand SEND] Missing socket/identity/roomName.')
     }
   }
 
@@ -959,15 +1001,27 @@ function MeetingRoomContent({
     const newBRB = !beRightBack
     setBeRightBack(newBRB)
     const newStatus = newBRB ? 'be_right_back' : 'active'
+    // BUG FIX #1: use room_name not meeting_code
+    const roomName = meetingData?.room_name
     const currentSocket = socket?.current
     const identity = localParticipant?.identity
-    if (currentSocket && identity) {
+
+    console.log('[BRB SEND] roomName:', roomName, 'identity:', identity, 'status:', newStatus)
+
+    // Show locally immediately
+    if (identity) {
+      setParticipantStatusMap((prev) => ({ ...prev, [identity]: newStatus }))
+    }
+
+    if (currentSocket && identity && roomName) {
       currentSocket.emit('toggle_status', {
-        roomName: meetingData?.meeting_code,
+        roomName,
         identity,
         senderName: user?.full_name || 'Participant',
         status: newStatus
       })
+    } else {
+      console.warn('[BRB SEND] Missing socket/identity/roomName.')
     }
   }
 
@@ -2939,14 +2993,14 @@ function MeetingRoomContent({
             <span className="hidden md:inline">Chat</span>
           </button>
 
-          {/* Concept A: React Button & Compact Quick Reaction Row */}
+          {/* Single React Button & Unified Reaction Panel */}
           <div className="relative">
             <button
-              onClick={() => setActivePopup(activePopup === 'react' ? null : 'react')}
+              onClick={() => setActivePopup(activePopup === 'react' || activePopup === 'emoji' ? null : 'react')}
               aria-label="Open reactions"
               title="Reactions"
               className={`px-3 py-2.5 rounded-xl border transition-all duration-200 cursor-pointer flex items-center gap-1.5 text-xs font-semibold ${
-                activePopup === 'react'
+                activePopup === 'react' || activePopup === 'emoji' || raisedHand || beRightBack
                   ? 'bg-purple-600 border-purple-500 text-white shadow-lg shadow-purple-600/30'
                   : 'bg-[#0f1122]/60 hover:bg-[#141629] border-white/10 text-white'
               }`}
@@ -2955,131 +3009,110 @@ function MeetingRoomContent({
               <span className="hidden md:inline">React</span>
             </button>
 
-            {/* Quick Reactions Popup (Compact horizontal row ONLY) */}
+            {/* Unified React Panel */}
             {activePopup === 'react' && (
-              <div className="absolute bottom-16 left-0 sm:left-1/2 sm:-translate-x-1/2 z-50 bg-[#0c0e1b] border border-white/10 rounded-2xl p-2 shadow-2xl backdrop-blur-xl flex items-center gap-1 select-none">
-                {['👋', '👍', '❤️', '😂', '😮', '🎉', '🎈', '🚀'].map((emoji) => (
-                  <button
-                    key={emoji}
-                    onClick={() => {
-                      handleSendReaction(emoji)
-                      setActivePopup(null)
-                    }}
-                    title={`Send ${emoji}`}
-                    aria-label={`Send ${emoji} reaction`}
-                    className="text-xl p-2 rounded-xl hover:bg-white/10 hover:scale-125 transition-all cursor-pointer"
-                  >
-                    {emoji}
-                  </button>
-                ))}
-              </div>
-            )}
-          </div>
-
-          {/* Screen Share */}
-          <button
-            onClick={handleToggleShare}
-            title="Share Screen"
-            className={`w-11 h-11 rounded-xl flex items-center justify-center border transition-all duration-200 cursor-pointer ${
-              sharingActive ? 'bg-brand-blue hover:bg-brand-blue-hover border-transparent text-white shadow-lg shadow-brand-blue/20' : 'bg-[#0f1122]/60 hover:bg-[#141629] border-white/10 text-white'
-            }`}
-          >
-            <Monitor size={18} />
-          </button>
-
-          {/* Concept B: More Button & Utilities Menu */}
-          <div className="relative">
-            <button
-              onClick={() => setActivePopup(activePopup === 'more' || activePopup === 'emoji' ? null : 'more')}
-              aria-label="More meeting options"
-              title="More Options"
-              className={`px-3 py-2.5 rounded-xl border transition-all duration-200 cursor-pointer flex items-center gap-1.5 text-xs font-semibold ${
-                activePopup === 'more' || activePopup === 'emoji' || raisedHand || beRightBack
-                  ? 'bg-purple-600 border-purple-500 text-white shadow-lg shadow-purple-600/30'
-                  : 'bg-[#0f1122]/60 hover:bg-[#141629] border-white/10 text-white'
-              }`}
-            >
-              <MoreHorizontal size={16} />
-              <span className="hidden md:inline">
-                {raisedHand ? '✋ Hand' : beRightBack ? '⌛ BRB' : 'More'}
-              </span>
-            </button>
-
-            {/* Concept B: More Utilities Floating Menu */}
-            {activePopup === 'more' && (
-              <div className="absolute bottom-16 right-0 sm:right-auto sm:left-1/2 sm:-translate-x-1/2 z-50 w-64 bg-[#0c0e1b] border border-white/10 rounded-2xl p-3 shadow-2xl backdrop-blur-xl flex flex-col gap-2 select-none text-left">
-                <div className="text-[10px] font-bold text-gray-400 uppercase tracking-wider px-2 py-1 border-b border-white/5">
-                  More Options
+              <div className="absolute bottom-16 left-0 sm:left-1/2 sm:-translate-x-1/2 z-50 w-72 bg-[#0c0e1b] border border-white/10 rounded-2xl p-4 shadow-2xl backdrop-blur-xl flex flex-col gap-3.5 select-none text-left">
+                {/* 1. SEND WITH EFFECT */}
+                <div className="flex flex-col gap-1.5">
+                  <span className="text-[10px] font-bold uppercase tracking-wider text-gray-400">SEND WITH EFFECT</span>
+                  <div className="flex items-center justify-between bg-white/5 p-2 rounded-xl border border-white/5">
+                    {['🎈', '🚀', '👍', '😂', '🎉', '❤️'].map((emoji) => (
+                      <button
+                        key={emoji}
+                        onClick={() => {
+                          handleSendReaction(emoji)
+                          setActivePopup(null)
+                        }}
+                        title={`Send ${emoji} effect`}
+                        aria-label={`Send ${emoji} effect`}
+                        className="text-lg hover:scale-125 transition-transform cursor-pointer p-1 rounded hover:bg-white/10"
+                      >
+                        {emoji}
+                      </button>
+                    ))}
+                  </div>
                 </div>
 
-                {/* Option 1: Raise Hand */}
+                {/* 2. REACTIONS */}
+                <div className="flex flex-col gap-1.5">
+                  <span className="text-[10px] font-bold uppercase tracking-wider text-gray-400">REACTIONS</span>
+                  <div className="grid grid-cols-6 gap-1 bg-white/5 p-2 rounded-xl border border-white/5">
+                    {['👋', '👍', '❤️', '😂', '😮', '🎉'].map((emoji) => (
+                      <button
+                        key={emoji}
+                        onClick={() => {
+                          handleSendReaction(emoji)
+                          setActivePopup(null)
+                        }}
+                        title={`Send ${emoji}`}
+                        aria-label={`Send ${emoji} reaction`}
+                        className="text-lg hover:scale-125 transition-transform cursor-pointer p-1 rounded hover:bg-white/10 text-center"
+                      >
+                        {emoji}
+                      </button>
+                    ))}
+                  </div>
+                </div>
+
+                {/* 3. RAISE HAND */}
                 <button
                   onClick={() => {
                     handleToggleRaiseHand()
                     setActivePopup(null)
                   }}
                   aria-label="Raise or lower hand"
-                  title="Raise Hand"
-                  className={`w-full py-2.5 px-3 rounded-xl font-semibold text-xs flex items-center justify-between border transition-all cursor-pointer ${
+                  title={raisedHand ? "Lower Hand" : "Raise Hand"}
+                  className={`w-full py-2.5 px-4 rounded-xl font-bold text-xs flex items-center justify-center gap-2 border transition-all cursor-pointer ${
                     raisedHand
-                      ? 'bg-amber-500/20 border-amber-500/40 text-amber-300'
-                      : 'bg-white/5 hover:bg-white/10 border-white/5 text-white'
+                      ? 'bg-amber-500 hover:bg-amber-400 border-amber-300 text-slate-950 shadow-lg shadow-amber-500/20'
+                      : 'bg-purple-600 hover:bg-purple-500 border-purple-400/30 text-white'
                   }`}
                 >
-                  <span className="flex items-center gap-2.5">
-                    <span className="text-base">✋</span>
-                    <span>{raisedHand ? 'Lower Hand' : 'Raise Hand'}</span>
-                  </span>
-                  <span className="text-[10px] font-bold uppercase tracking-wider">{raisedHand ? 'Raised' : 'Off'}</span>
+                  <span className="text-base">{raisedHand ? '👇' : '✋'}</span>
+                  <span>{raisedHand ? 'Lower Hand' : 'Raise Hand'}</span>
                 </button>
 
-                {/* Option 2: Be Right Back */}
+                {/* 4. BE RIGHT BACK */}
                 <button
                   onClick={() => {
                     handleToggleBeRightBack()
                     setActivePopup(null)
                   }}
                   aria-label="Toggle Be Right Back status"
-                  title="Be Right Back"
-                  className={`w-full py-2.5 px-3 rounded-xl font-semibold text-xs flex items-center justify-between border transition-all cursor-pointer ${
+                  title={beRightBack ? "I'm Back" : "Be Right Back"}
+                  className={`w-full py-2.5 px-4 rounded-xl font-bold text-xs flex items-center justify-center gap-2 border transition-all cursor-pointer ${
                     beRightBack
                       ? 'bg-amber-500/20 border-amber-500/40 text-amber-300'
-                      : 'bg-white/5 hover:bg-white/10 border-white/5 text-white'
+                      : 'bg-white/5 hover:bg-white/10 border-white/10 text-white'
                   }`}
                 >
-                  <span className="flex items-center gap-2.5">
-                    <span className="text-base">⌛</span>
-                    <span>{beRightBack ? "I'm Back" : 'Be Right Back'}</span>
-                  </span>
-                  <span className="text-[10px] font-bold uppercase tracking-wider">{beRightBack ? 'Away' : 'Off'}</span>
+                  <span className="text-base">⌛</span>
+                  <span>{beRightBack ? "I'm Back" : 'Be Right Back'}</span>
                 </button>
 
-                {/* Option 3: Full Emoji / More Reactions */}
+                {/* 5. MORE EMOJI */}
                 <button
                   onClick={() => setActivePopup('emoji')}
                   aria-label="Open full emoji picker"
-                  title="More Emojis & Reactions"
-                  className="w-full py-2.5 px-3 rounded-xl font-semibold text-xs flex items-center justify-between bg-white/5 hover:bg-white/10 border border-white/5 text-white transition-all cursor-pointer"
+                  title="More Emoji"
+                  className="w-full py-2.5 px-4 rounded-xl font-bold text-xs flex items-center justify-center gap-2 bg-white/5 hover:bg-white/10 border border-white/10 text-white transition-all cursor-pointer"
                 >
-                  <span className="flex items-center gap-2.5">
-                    <span className="text-base">😃</span>
-                    <span>More Emojis & Reactions</span>
-                  </span>
-                  <span className="text-gray-400 text-xs">›</span>
+                  <span className="text-base">😀</span>
+                  <span>More Emoji</span>
                 </button>
               </div>
             )}
 
-            {/* Concept C: Full Emoji Picker Panel */}
+            {/* Full Emoji Picker Panel */}
             {activePopup === 'emoji' && (
-              <div className="absolute bottom-16 right-0 sm:right-auto sm:left-1/2 sm:-translate-x-1/2 z-50 w-80 bg-[#0c0e1b] border border-white/10 rounded-2xl p-4 shadow-2xl backdrop-blur-xl flex flex-col gap-3 select-none text-left max-h-[420px] overflow-hidden">
+              <div className="absolute bottom-16 left-0 sm:left-1/2 sm:-translate-x-1/2 z-50 w-80 bg-[#0c0e1b] border border-white/10 rounded-2xl p-4 shadow-2xl backdrop-blur-xl flex flex-col gap-3 select-none text-left max-h-[420px] overflow-hidden">
                 {/* Header & Back Button */}
                 <div className="flex items-center justify-between border-b border-white/5 pb-2">
                   <div className="flex items-center gap-2">
                     <button
-                      onClick={() => setActivePopup('more')}
+                      onClick={() => setActivePopup('react')}
                       className="text-gray-400 hover:text-white text-xs font-bold px-2 py-0.5 rounded bg-white/5 hover:bg-white/10 transition-colors cursor-pointer"
-                      title="Back to More Menu"
+                      title="Back to React Panel"
                     >
                       ‹ Back
                     </button>
@@ -3176,6 +3209,17 @@ function MeetingRoomContent({
               </div>
             )}
           </div>
+
+          {/* Screen Share */}
+          <button
+            onClick={handleToggleShare}
+            title="Share Screen"
+            className={`w-11 h-11 rounded-xl flex items-center justify-center border transition-all duration-200 cursor-pointer ${
+              sharingActive ? 'bg-brand-blue hover:bg-brand-blue-hover border-transparent text-white shadow-lg shadow-brand-blue/20' : 'bg-[#0f1122]/60 hover:bg-[#141629] border-white/10 text-white'
+            }`}
+          >
+            <Monitor size={18} />
+          </button>
         </div>
 
         {/* End / Leave Meeting Button (Opens Confirmation Modal) */}
