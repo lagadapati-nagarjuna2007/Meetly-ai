@@ -1409,14 +1409,21 @@ export const startRetentionCleanup = () => {
 
 // 16. SUBMIT ATTENDANCE (AI Face Detection record)
 export const submitAttendance = async (req, res) => {
-  console.log('[Attendance] Attendance endpoint called')
   try {
     const {
       meetingId,
       presenceSeconds,
       meetingDurationSeconds,
-      cameraPermission
+      cameraPermission,
+      isFinalSubmit   // true = fresh final submission → overwrite DB; false/absent = reconnect → accumulate
     } = req.body
+
+    console.log('[Attendance Backend]')
+    console.log(`  meetingId=${meetingId}`)
+    console.log(`  userId=${req.user?.id}`)
+    console.log(`  presenceSeconds=${presenceSeconds}`)
+    console.log(`  meetingDurationSeconds=${meetingDurationSeconds}`)
+    console.log(`  isFinalSubmit=${isFinalSubmit}`)
 
     if (!meetingId) {
       console.error('[Attendance Error] Missing meetingId')
@@ -1437,15 +1444,20 @@ export const submitAttendance = async (req, res) => {
       return res.status(200).json({ message: 'Host attendance bypassed.' })
     }
 
+    const incomingPresence = presenceSeconds !== undefined ? Number(presenceSeconds) : 0
+    const incomingDuration = meetingDurationSeconds !== undefined ? Number(meetingDurationSeconds) : 0
+    const incomingCamPermission = !!cameraPermission
+    const isOverwrite = isFinalSubmit === true
+
     console.log('[Attendance Backend Received]', {
       meetingId,
       userId: req.user.id,
-      presenceSeconds,
-      meetingDurationSeconds
+      incomingPresence,
+      incomingDuration,
+      isFinalSubmit: isOverwrite
     })
 
     // Fetch existing attendance record for this user and meeting if it exists
-    console.log(`[Attendance] Attendance SELECT running for meetingId=${meetingId}, userId=${req.user.id}`)
     const { data: existingRecord, error: fetchErr } = await supabase
       .from('meeting_attendance')
       .select('presence_seconds, meeting_duration_seconds, camera_permission')
@@ -1456,47 +1468,65 @@ export const submitAttendance = async (req, res) => {
     if (fetchErr) {
       console.error('[Attendance Error] Attendance SELECT failed:', fetchErr)
     } else {
-      console.log(`[Attendance] Attendance SELECT completed. Record found:`, !!existingRecord)
+      console.log('[Attendance] Existing record found:', !!existingRecord, existingRecord ? `(presence_seconds=${existingRecord.presence_seconds})` : '')
     }
 
-    let finalDuration = meetingDurationSeconds !== undefined ? Number(meetingDurationSeconds) : 0
-    let finalPresence = presenceSeconds !== undefined ? Number(presenceSeconds) : 0
-    let finalCameraPermission = !!cameraPermission
+    let finalPresence
+    let finalDuration
+    let finalCameraPermission
 
-    if (existingRecord) {
-      console.log('[Attendance] Attendance UPDATE (Rejoin): Accumulating metrics')
-      finalDuration = (existingRecord.meeting_duration_seconds || 0) + finalDuration
-      finalPresence = (existingRecord.presence_seconds || 0) + finalPresence
-      finalCameraPermission = existingRecord.camera_permission || finalCameraPermission
+    if (existingRecord && !isOverwrite) {
+      // Reconnect path: frontend lost its state (no isFinalSubmit flag) — accumulate
+      console.log('[Attendance] Accumulating (reconnect): old presence =', existingRecord.presence_seconds, '+ new =', incomingPresence)
+      finalPresence = (existingRecord.presence_seconds || 0) + incomingPresence
+      finalDuration = (existingRecord.meeting_duration_seconds || 0) + incomingDuration
+      finalCameraPermission = existingRecord.camera_permission || incomingCamPermission
     } else {
-      console.log('[Attendance] Attendance INSERT (First Join): Initializing metrics')
+      // Final submit path: frontend sends authoritative total — overwrite
+      if (existingRecord && isOverwrite) {
+        console.log('[Attendance] Overwriting stale record. Old presence =', existingRecord.presence_seconds, '→ New presence =', incomingPresence)
+      } else {
+        console.log('[Attendance] First submission (no existing record). Presence =', incomingPresence)
+      }
+      finalPresence = incomingPresence
+      finalDuration = incomingDuration
+      finalCameraPermission = incomingCamPermission
     }
 
-    // Determine actual participant attendance duration (fallback to session duration if presence is 0)
-    const participantAttendanceSec = finalPresence > 0 ? finalPresence : finalDuration
+    // Clamp to sane values
+    finalPresence = Math.max(0, finalPresence)
+    finalDuration = Math.max(0, finalDuration)
 
-    // Calculate total meeting duration (from started_at to ended_at/now)
-    let totalMeetingSec = finalDuration
+    // Calculate total meeting duration from actual meeting timestamps
+    // Do NOT use finalDuration as the denominator — use the real meeting wall-clock time
+    let totalMeetingSec = 0
     if (meetingCheck) {
       const start = meetingCheck.started_at || meetingCheck.created_at
       const end = meetingCheck.ended_at || new Date().toISOString()
       if (start) {
-        const diffSec = Math.max(1, Math.round((new Date(end) - new Date(start)) / 1000))
-        totalMeetingSec = Math.max(diffSec, participantAttendanceSec)
+        totalMeetingSec = Math.max(1, Math.round((new Date(end) - new Date(start)) / 1000))
       }
     }
+    // Fallback: if we couldn't get meeting timestamps, use participant's connection duration
+    if (totalMeetingSec <= 0) {
+      totalMeetingSec = Math.max(1, finalDuration)
+    }
 
+    // Presence can never exceed total meeting duration
+    finalPresence = Math.min(finalPresence, totalMeetingSec)
+
+    // Determine participant attendance (strictly face-presence based)
+    const participantAttendanceSec = finalPresence
     const rawPercentage = totalMeetingSec > 0 ? (participantAttendanceSec / totalMeetingSec) * 100 : 0
-    const finalPercentage = Math.min(100, Number(rawPercentage.toFixed(2)))
+    const finalPercentage = Math.max(0, Math.min(100, Number(rawPercentage.toFixed(2))))
     const finalStatus = finalPercentage >= 75 ? 'Present' : 'Absent'
 
-    console.log('[Attendance Backend Mapped Values to Write]', {
+    console.log('[Attendance Backend Write]', {
       meetingId,
       userId: req.user.id,
-      participantAttendanceSec,
-      totalMeetingSec,
-      finalDuration,
       finalPresence,
+      finalDuration,
+      totalMeetingSec,
       finalPercentage: finalPercentage.toFixed(2),
       finalStatus,
       finalCameraPermission
@@ -1525,7 +1555,21 @@ export const submitAttendance = async (req, res) => {
       return res.status(500).json({ message: 'Failed to save attendance record.' })
     }
 
-    console.log('[Attendance] Attendance saved successfully')
+    // Verify the row actually exists in DB after upsert
+    const { data: verifyRow } = await supabase
+      .from('meeting_attendance')
+      .select('presence_seconds, attendance_percentage, status')
+      .eq('meeting_id', meetingId)
+      .eq('user_id', req.user.id)
+      .maybeSingle()
+
+    console.log('[Attendance DB]')
+    console.log(`  record exists after upsert=${!!verifyRow}`)
+    console.log(`  presence_seconds=${verifyRow?.presence_seconds ?? 'n/a'}`)
+    console.log(`  attendance_percentage=${verifyRow?.attendance_percentage ?? 'n/a'}`)
+    console.log(`  status=${verifyRow?.status ?? 'n/a'}`)
+
+    console.log('[Attendance] Saved successfully — presence:', finalPresence, 's,', finalPercentage.toFixed(2), '%, status:', finalStatus)
     return res.status(200).json({ message: 'Attendance recorded successfully.' })
   } catch (err) {
     console.error('[Attendance Error] Unexpected exception:', err)
@@ -1556,8 +1600,13 @@ export const getAttendanceReport = async (req, res) => {
     const end = meeting?.ended_at ? new Date(meeting.ended_at) : new Date()
     const totalMtgSec = start ? Math.max(1, Math.round((end - start) / 1000)) : 0
 
+    console.log('[Attendance Report]')
+    console.log(`  meetingId=${meetingId}`)
+    console.log(`  meetingFound=${!!meeting}`)
+    console.log(`  hostId=${hostId}`)
+    console.log(`  totalMtgSec=${totalMtgSec}`)
+
     // Join users table to get the user's full_name dynamically
-    console.log(`[Attendance] Attendance SELECT running for report meetingId=${meetingId}`)
     let query = supabase
       .from('meeting_attendance')
       .select('*, user:user_id ( full_name )')
@@ -1574,14 +1623,24 @@ export const getAttendanceReport = async (req, res) => {
       return res.status(500).json({ message: 'Failed to retrieve attendance logs.' })
     }
 
+    console.log(`  records found=${records?.length ?? 0}`)
+    if (records && records.length > 0) {
+      records.forEach((r, i) => {
+        console.log(`  record[${i}] user_id=${r.user_id} presence_seconds=${r.presence_seconds} status=${r.status}`)
+      })
+    }
+
     const rowCount = records?.length || 0
     console.log(`[Attendance] Attendance SELECT returned ${rowCount} rows`)
 
     // Map records to match frontend expected fields with accurate percentage calculation
     const mapped = (records || []).map((rec) => {
-      const pAttendanceSec = rec.presence_seconds > 0 ? rec.presence_seconds : rec.meeting_duration_seconds
-      const totalSec = totalMtgSec > 0 ? Math.max(totalMtgSec, pAttendanceSec) : rec.meeting_duration_seconds
-      const calcPercentage = totalSec > 0 ? Math.min(100, Number(((pAttendanceSec / totalSec) * 100).toFixed(2))) : rec.attendance_percentage
+      const pAttendanceSec = Math.max(0, rec.presence_seconds !== undefined && rec.presence_seconds !== null ? Number(rec.presence_seconds) : 0)
+      // Use actual meeting wall-clock duration as denominator — same logic as submitAttendance
+      const denominator = totalMtgSec > 0 ? totalMtgSec : Math.max(1, rec.meeting_duration_seconds || 1)
+      // Presence can never exceed meeting duration
+      const clampedPresence = Math.min(pAttendanceSec, denominator)
+      const calcPercentage = Math.max(0, Math.min(100, Number(((clampedPresence / denominator) * 100).toFixed(2))))
       const calcStatus = calcPercentage >= 75 ? 'Present' : 'Absent'
 
       return {
@@ -1590,7 +1649,7 @@ export const getAttendanceReport = async (req, res) => {
         user_id: rec.user_id,
         participant_name: rec.user?.full_name || 'Anonymous User',
         meeting_duration_seconds: rec.meeting_duration_seconds,
-        presence_seconds: rec.presence_seconds,
+        presence_seconds: clampedPresence,
         attendance_percentage: calcPercentage,
         status: calcStatus,
         camera_permission: rec.camera_permission

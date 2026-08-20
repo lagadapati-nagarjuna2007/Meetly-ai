@@ -824,19 +824,35 @@ function MeetingRoomContent({
   const roomState = room?.state
   console.log('[MeetingRoomContent Render] roomState:', roomState, 'localParticipant:', !!localParticipant, 'participants count:', participants?.length || 0)
 
-  // AI Attendance tracking parameters
+  // ─── AI Attendance State Machine (Face-Presence Intervals) ─────────────────
+  //
+  // States:  WAITING_FOR_FACE → PRESENT → GRACE → PAUSED
+  //
+  // Source of truth for presence time: TIMESTAMPS, not tick counters.
+  // presenceSeconds.current is only used for fast UI display; all final
+  // calculations use getFacePresenceSeconds() which derives from intervals.
+
+  const GRACE_PERIOD_SECONDS = 7
   const detectorRef = useRef(null)
   const cameraStreamRef = useRef(null)
   const animationFrameIdRef = useRef(null)
   const hasUploaded = useRef(false)
 
-  const presenceSeconds = useRef(0)
-  const tempAbsenceSeconds = useRef(0)
+  // State machine
+  const attendanceStateRef = useRef('WAITING_FOR_FACE') // 'WAITING_FOR_FACE'|'PRESENT'|'GRACE'|'PAUSED'
+  const graceStartTimeRef = useRef(null)       // Date.now() when GRACE started
+  const currentIntervalStartRef = useRef(null) // Date.now() when current PRESENT interval started
+  const attendanceIntervalsRef = useRef([])    // { start: ms, end: ms, seconds: n }[]
   const consecutiveDetections = useRef(0)
-  const isPresent = useRef(false)
   const totalSeconds = useRef(0)
-  const cameraInterruptedCount = useRef(0)
-  const tempAbsenceIncidents = useRef(0)
+
+  // presenceSeconds is a fast display counter only — NOT the source of truth.
+  // Use getFacePresenceSeconds() for any final calculations.
+  const presenceSeconds = useRef(0)
+
+  // Flag so the backend knows this is a fresh final submission, not a reconnect accumulation
+  const isFirstSubmitRef = useRef(true)
+
   const videoRef = useRef(null)
   const attendanceCameraStreamRef = useRef(null)
   const transcriptMediaRecorderRef = useRef(null)
@@ -844,6 +860,45 @@ function MeetingRoomContent({
   const transcriptIntervalRef = useRef(null)
   const isTranscriptActiveRef = useRef(false)
   const activeTranscriptUploadsRef = useRef(0)
+
+  /**
+   * Compute total face-presence seconds from closed intervals + current open interval.
+   * This is the SINGLE SOURCE OF TRUTH for presence duration.
+   */
+  const getFacePresenceSeconds = useCallback(() => {
+    const closedSeconds = attendanceIntervalsRef.current.reduce((sum, iv) => sum + iv.seconds, 0)
+    let openSeconds = 0
+    const state = attendanceStateRef.current
+    if ((state === 'PRESENT' || state === 'GRACE') && currentIntervalStartRef.current) {
+      openSeconds = Math.max(0, Math.floor((Date.now() - currentIntervalStartRef.current) / 1000))
+    }
+    return closedSeconds + openSeconds
+  }, [])
+
+  /**
+   * Close any open interval and set state to PAUSED.
+   * Must be called before every attendance upload.
+   */
+  const finalizeAttendanceState = useCallback((reason = 'leave') => {
+    const now = Date.now()
+    if (attendanceStateRef.current === 'PRESENT' || attendanceStateRef.current === 'GRACE') {
+      if (currentIntervalStartRef.current) {
+        const intervalDuration = Math.max(0, Math.floor((now - currentIntervalStartRef.current) / 1000))
+        attendanceIntervalsRef.current.push({
+          start: currentIntervalStartRef.current,
+          end: now,
+          seconds: intervalDuration
+        })
+        console.log(`[AI Attendance] Interval closed (${reason}) | duration: ${intervalDuration}s`)
+        currentIntervalStartRef.current = null
+      }
+    }
+    attendanceStateRef.current = 'PAUSED'
+    graceStartTimeRef.current = null
+    // Sync the display counter with timestamp-based truth
+    presenceSeconds.current = attendanceIntervalsRef.current.reduce((sum, iv) => sum + iv.seconds, 0)
+    console.log(`[AI Attendance] Finalized (${reason}) | total face-presence: ${presenceSeconds.current}s | intervals: ${attendanceIntervalsRef.current.length}`)
+  }, [])
 
   // Get local camera video track from LiveKit
   const localVideoTrack = localParticipant?.getTrackPublication(Track.Source.Camera)?.videoTrack ||
@@ -1187,47 +1242,69 @@ function MeetingRoomContent({
   }, [socket, isHost, localParticipant, setMeetingData, showToast])
 
   const uploadAttendance = async () => {
+    // ── Diagnostic: entry ──────────────────────────────────────────────────
+    const safeMeetingData = meetingDataRef.current
+    const safeMeetingId   = safeMeetingData?.meeting_id  ?? null
+    const safeUserId      = userRef.current?.id          ?? 'unknown'
+
+    console.log('[Attendance Finalize]')
+    console.log(`  meetingId=${safeMeetingId}`)
+    console.log(`  userId=${safeUserId}`)
+    console.log(`  isHost=${isHost}`)
+    console.log(`  enable_ai_attendance=${safeMeetingData?.enable_ai_attendance}`)
+    console.log(`  attendanceConsent=${attendanceConsentRef.current}`)
+    console.log(`  hasUploaded=${hasUploaded.current}`)
+    console.log(`  attendanceState=${attendanceStateRef.current}`)
+    console.log(`  intervalCount=${attendanceIntervalsRef.current.length}`)
+
     if (isHost) {
-      console.log('[Attendance] Bypassing upload: User is the meeting host.')
+      console.log('[Attendance Finalize] SKIP — user is the meeting host')
       return true
     }
 
-    const duration = sessionStartTimeRef.current 
+    if (!safeMeetingId) {
+      console.error('[Attendance Finalize] ABORT — meetingId is null/undefined. Cannot upload.')
+      return false
+    }
+
+    // Close any open interval and sync presenceSeconds
+    finalizeAttendanceState('uploadAttendance')
+
+    // Source of truth: sum of timestamp-based intervals
+    const effectivePresence = getFacePresenceSeconds()
+    const duration = sessionStartTimeRef.current
       ? Math.max(0, Math.floor((Date.now() - sessionStartTimeRef.current) / 1000))
       : 0
 
-    if (duration <= 0) {
-      console.log('[Attendance] Bypassing upload: Session duration is 0 seconds (startup check or join event).')
+    console.log('[Attendance Finalize]')
+    console.log(`  presenceSeconds=${effectivePresence}`)
+    console.log(`  meetingDurationSeconds=${duration}`)
+    console.log(`  isFinalSubmit=${isFirstSubmitRef.current}`)
+
+    // Prevent double-upload (guard is set before fetch, reset if all retries fail)
+    if (hasUploaded.current) {
+      console.log('[Attendance Finalize] SKIP — already uploaded (hasUploaded=true)')
       return true
     }
-
-    if (hasUploaded.current) return true
     hasUploaded.current = true
 
-    const effectivePresence = presenceSeconds.current > 0 ? presenceSeconds.current : duration
-    const percentage = duration > 0 ? (effectivePresence / duration) * 100 : 0
+    const percentage = duration > 0
+      ? Math.min(100, Math.max(0, (effectivePresence / duration) * 100))
+      : 0
     const status = percentage >= 75 ? 'Present' : 'Absent'
-    const camPermission = attendanceConsent === 'Granted'
+    const camPermission = attendanceConsentRef.current === 'Granted'
+    const isFinalSubmit = isFirstSubmitRef.current
+    isFirstSubmitRef.current = false
 
     const payload = {
-      meetingId: meetingData.meeting_id,
+      meetingId: safeMeetingId,
       presenceSeconds: effectivePresence,
       meetingDurationSeconds: duration,
       attendancePercentage: Number(percentage.toFixed(2)),
       status,
-      cameraPermission: camPermission
+      cameraPermission: camPermission,
+      isFinalSubmit
     }
-
-    console.log('[Attendance Finalize]', {
-      meetingId: meetingData.meeting_id,
-      userId: user?.id || 'unknown',
-      isHost,
-      sessionStart: sessionStartTimeRef.current ? new Date(sessionStartTimeRef.current).toISOString() : null,
-      sessionDurationSeconds: duration,
-      presenceSeconds: presenceSeconds.current,
-      cameraPermission: camPermission
-    })
-    console.log('[Attendance Upload Payload]', payload)
 
     const maxRetries = 3
     let attempt = 0
@@ -1246,18 +1323,32 @@ function MeetingRoomContent({
           body: JSON.stringify(payload),
           credentials: 'include'
         })
+
+        const httpStatus = res.status
+        let responseText = ''
+        try { responseText = await res.text() } catch (_) {}
+
+        console.log('[Attendance Upload]')
+        console.log(`  attempt=${attempt + 1}`)
+        console.log(`  HTTP status=${httpStatus}`)
+        console.log(`  response=${responseText}`)
+
         if (res.ok) {
-          console.log('[Attendance] Upload successful')
+          console.log('[Attendance Upload] SUCCESS — record written to database')
           return true
+        } else {
+          console.error(`[Attendance Upload] Non-OK response on attempt ${attempt + 1}: status=${httpStatus} body=${responseText}`)
         }
       } catch (err) {
-        console.error(`[Attendance] Attempt ${attempt + 1} failed:`, err)
+        console.error(`[Attendance Upload] Network error on attempt ${attempt + 1}:`, err)
       }
       attempt++
       if (attempt < maxRetries) {
         await delay(Math.pow(2, attempt) * 500)
       }
     }
+
+    console.error('[Attendance Upload] ALL RETRIES FAILED — attendance record NOT saved')
     hasUploaded.current = false
     return false
   }
@@ -1484,7 +1575,14 @@ function MeetingRoomContent({
   }
 
   const handleLeaveWithAttendance = async () => {
-    console.log('[Attendance Finalize Trigger] leave-button')
+    console.log('[Attendance Finalize Trigger] handleLeaveWithAttendance called')
+    console.log(`  meetingId=${meetingDataRef.current?.meeting_id}`)
+    console.log(`  enable_ai_attendance=${meetingDataRef.current?.enable_ai_attendance}`)
+    console.log(`  isHost=${isHost}`)
+    console.log(`  attendanceConsent=${attendanceConsentRef.current}`)
+    console.log(`  hasUploaded=${hasUploaded.current}`)
+    console.log(`  attendanceState=${attendanceStateRef.current}`)
+    console.log(`  intervalCount=${attendanceIntervalsRef.current.length}`)
     if (isIntentionalLeaveRef) {
       isIntentionalLeaveRef.current = true
     }
@@ -1500,6 +1598,7 @@ function MeetingRoomContent({
         cleanupResources()
       }
     } else {
+      console.warn('[Attendance Finalize Trigger] SKIP uploadAttendance — enable_ai_attendance is falsy:', meetingData?.enable_ai_attendance)
       cleanupResources()
     }
     setIsShuttingDown(false)
@@ -1683,8 +1782,8 @@ function MeetingRoomContent({
         videoRef.current = video
         console.log('[Attendance] Separate camera stream attached to hidden video element.')
 
-        // Start requestAnimationFrame loop
-        console.log('[Attendance] Starting detection loop')
+        // ── rAF: Face Detection Loop (runs every ~400ms) ──────────────────
+        console.log('[AI Attendance] Starting face detection loop')
         let lastTime = 0
         const runDetection = (timestamp) => {
           if (!detectorRef.current || !videoRef.current) return
@@ -1695,26 +1794,42 @@ function MeetingRoomContent({
               if (video.readyState >= 2) { // HAVE_CURRENT_DATA
                 const results = detectorRef.current.detectForVideo(video, timestamp)
                 const faceDetected = results && results.detections && results.detections.length > 0
-                
+                const prevState = attendanceStateRef.current
+
                 if (faceDetected) {
-                  console.log('[Attendance] Face detected')
                   consecutiveDetections.current++
-                  if (consecutiveDetections.current >= 3) {
-                    if (!isPresent.current) {
-                      isPresent.current = true
+                  console.log(`[AI Attendance] Face detected (consecutive: ${consecutiveDetections.current}) | state: ${prevState}`)
+
+                  if (prevState === 'WAITING_FOR_FACE' || prevState === 'PAUSED') {
+                    if (consecutiveDetections.current >= 2) {
+                      attendanceStateRef.current = 'PRESENT'
+                      graceStartTimeRef.current = null
+                      currentIntervalStartRef.current = Date.now()
+                      console.log(`[AI Attendance] State transition: ${prevState} → PRESENT`)
+                      console.log('[AI Attendance] Interval started at:', new Date(currentIntervalStartRef.current).toISOString())
                     }
-                    if (tempAbsenceSeconds.current > 0) {
-                      console.log('[Attendance] Temporary absence cleared')
-                      tempAbsenceSeconds.current = 0
-                    }
+                  } else if (prevState === 'GRACE') {
+                    attendanceStateRef.current = 'PRESENT'
+                    graceStartTimeRef.current = null
+                    console.log('[AI Attendance] State transition: GRACE → PRESENT (face returned within grace)')
                   }
                 } else {
-                  console.log('[Attendance] Face missing')
+                  if (consecutiveDetections.current > 0) {
+                    console.log('[AI Attendance] Face not detected | state:', prevState)
+                  }
                   consecutiveDetections.current = 0
+
+                  if (prevState === 'PRESENT') {
+                    attendanceStateRef.current = 'GRACE'
+                    graceStartTimeRef.current = Date.now()
+                    console.log('[AI Attendance] State transition: PRESENT → GRACE')
+                  }
                 }
+              } else {
+                console.log('[AI Attendance] Video not ready yet, readyState:', video.readyState)
               }
             } catch (err) {
-              console.error('[Attendance Error] Face detection frame processing failed:', err)
+              console.error('[AI Attendance Error] Face detection frame failed:', err)
             }
           }
           rafId = requestAnimationFrame(runDetection)
@@ -1724,45 +1839,57 @@ function MeetingRoomContent({
         rafId = requestAnimationFrame(runDetection)
         animationFrameIdRef.current = rafId
 
-        // Clock timer (runs every 1 second)
+        // ── Clock: Grace Expiry + Display Update (every 1 second) ─────────
+        // This interval is NOT the source of truth for presence duration.
+        // It only: (1) expires grace, (2) syncs the presenceSeconds display counter.
+        let lastDebugLog = 0
         clockInterval = setInterval(() => {
           totalSeconds.current++
 
-          if (isPresent.current) {
-            if (consecutiveDetections.current === 0) {
-              tempAbsenceSeconds.current++
-              if (tempAbsenceSeconds.current === 1) {
-                console.log('[Attendance] Temporary absence started')
-                tempAbsenceIncidents.current++
-              }
+          if (attendanceStateRef.current === 'GRACE' && graceStartTimeRef.current) {
+            const elapsedGraceSec = Math.floor((Date.now() - graceStartTimeRef.current) / 1000)
+            if (elapsedGraceSec >= GRACE_PERIOD_SECONDS) {
+              console.log(`[AI Attendance] State transition: GRACE → PAUSED (grace expired after ${elapsedGraceSec}s)`)
+              attendanceStateRef.current = 'PAUSED'
+              graceStartTimeRef.current = null
 
-              if (tempAbsenceSeconds.current >= 20) {
-                if (isPresent.current) {
-                  console.log('[Attendance] Face missing for 20s. Marking Absent.')
-                  isPresent.current = false
-                }
-              } else {
-                presenceSeconds.current++
+              if (currentIntervalStartRef.current) {
+                const intervalEnd = Date.now()
+                // Interval ends where grace started, not now — grace period was already counted
+                // Actually: interval includes grace time up to grace expiry.
+                const intervalDuration = Math.max(0, Math.floor((intervalEnd - currentIntervalStartRef.current) / 1000))
+                attendanceIntervalsRef.current.push({
+                  start: currentIntervalStartRef.current,
+                  end: intervalEnd,
+                  seconds: intervalDuration
+                })
+                console.log(`[AI Attendance] Interval closed | duration: ${intervalDuration}s`)
+                console.log(`[AI Attendance] Total intervals so far: ${attendanceIntervalsRef.current.length}`)
+                currentIntervalStartRef.current = null
               }
-            } else {
-              presenceSeconds.current++
-              tempAbsenceSeconds.current = 0
-            }
-          } else {
-            tempAbsenceSeconds.current++
-
-            if (consecutiveDetections.current >= 3) {
-              console.log('[Attendance] Face returned. Restoring presence state.')
-              isPresent.current = true
-              tempAbsenceSeconds.current = 0
-              presenceSeconds.current++
             }
           }
 
-          const elapsedSessionSeconds = sessionStartTimeRef.current 
-            ? Math.floor((Date.now() - sessionStartTimeRef.current) / 1000)
-            : 0
-          console.log(`[Attendance Debug] Face detected: ${isPresent.current} | Session duration: ${elapsedSessionSeconds} | Presence seconds: ${presenceSeconds.current}`)
+          // Sync display counter from timestamps (not tick-based)
+          presenceSeconds.current = attendanceIntervalsRef.current.reduce((sum, iv) => sum + iv.seconds, 0)
+          if ((attendanceStateRef.current === 'PRESENT' || attendanceStateRef.current === 'GRACE') && currentIntervalStartRef.current) {
+            presenceSeconds.current += Math.max(0, Math.floor((Date.now() - currentIntervalStartRef.current) / 1000))
+          }
+
+          // Debug log every 5 seconds to avoid spam
+          const now = Date.now()
+          if (now - lastDebugLog >= 5000) {
+            lastDebugLog = now
+            const elapsedSessionSec = sessionStartTimeRef.current 
+              ? Math.floor((Date.now() - sessionStartTimeRef.current) / 1000)
+              : 0
+            console.log(
+              `[AI Attendance Debug] state=${attendanceStateRef.current}` +
+              ` | session=${elapsedSessionSec}s` +
+              ` | facePresence=${presenceSeconds.current}s` +
+              ` | intervals=${attendanceIntervalsRef.current.length}`
+            )
+          }
         }, 1000)
 
       } catch (err) {
@@ -1791,7 +1918,7 @@ function MeetingRoomContent({
       }
       videoRef.current = null
     }
-  }, [meetingData, attendanceConsent, isHost])
+  }, [meetingData, attendanceConsent, isHost, showToast])
 
   // beforeunload listener for browser closing / refresh events
   useEffect(() => {
@@ -1801,21 +1928,23 @@ function MeetingRoomContent({
       const currentConsent = attendanceConsentRef.current
 
       if (currentMeetingData?.enable_ai_attendance && !currentIsHost && !hasUploaded.current) {
+        finalizeAttendanceState('beforeunload')
+
         const duration = sessionStartTimeRef.current 
           ? Math.max(0, Math.floor((Date.now() - sessionStartTimeRef.current) / 1000))
           : 0
 
-        if (duration <= 0) {
-          console.log('[Attendance] Bypassing beforeunload upload: Session duration is 0 seconds.')
-          return
-        }
-
+        // Send even if presence=0 so backend can overwrite stale records
         hasUploaded.current = true
 
-        const effectivePresence = presenceSeconds.current > 0 ? presenceSeconds.current : duration
-        const percentage = duration > 0 ? (effectivePresence / duration) * 100 : 0
+        const effectivePresence = attendanceIntervalsRef.current.reduce((sum, iv) => sum + iv.seconds, 0)
+        const percentage = duration > 0
+          ? Math.min(100, Math.max(0, (effectivePresence / duration) * 100))
+          : 0
         const status = percentage >= 75 ? 'Present' : 'Absent'
         const camPermission = currentConsent === 'Granted'
+        const isFinalSubmit = isFirstSubmitRef.current
+        isFirstSubmitRef.current = false
 
         const payload = {
           meetingId: currentMeetingData.meeting_id,
@@ -1823,20 +1952,11 @@ function MeetingRoomContent({
           meetingDurationSeconds: duration,
           attendancePercentage: Number(percentage.toFixed(2)),
           status,
-          cameraPermission: camPermission
+          cameraPermission: camPermission,
+          isFinalSubmit
         }
 
-        console.log('[Attendance Finalize Trigger] beforeunload')
-        console.log('[Attendance Finalize]', {
-          meetingId: currentMeetingData.meeting_id,
-          userId: userRef.current?.id || 'unknown',
-          isHost: currentIsHost,
-          sessionStart: sessionStartTimeRef.current ? new Date(sessionStartTimeRef.current).toISOString() : null,
-          sessionDurationSeconds: duration,
-          presenceSeconds: effectivePresence,
-          cameraPermission: camPermission
-        })
-        console.log('[Attendance Upload Payload]', payload)
+        console.log('[AI Attendance] beforeunload | facePresence:', effectivePresence, 's | duration:', duration, 's | %:', percentage.toFixed(2))
 
         const apiUrl = `${import.meta.env.VITE_API_URL || 'http://localhost:5000'}/api/meetings/attendance`
         const blob = new Blob([JSON.stringify(payload)], { type: 'application/json' })
@@ -1848,7 +1968,7 @@ function MeetingRoomContent({
     return () => {
       window.removeEventListener('beforeunload', handleBeforeUnloadAttendance)
     }
-  }, [])
+  }, [finalizeAttendanceState])
 
   // Dedicated mount/unmount effect for AI Attendance finalization fallback
   useEffect(() => {
@@ -1860,21 +1980,23 @@ function MeetingRoomContent({
       const currentConsent = attendanceConsentRef.current
 
       if (currentMeetingData?.enable_ai_attendance && !currentIsHost && !hasUploaded.current) {
+        finalizeAttendanceState('component-unmount')
+
         const duration = sessionStartTimeRef.current 
           ? Math.max(0, Math.floor((Date.now() - sessionStartTimeRef.current) / 1000))
           : 0
 
-        if (duration <= 0) {
-          console.log('[Attendance] Bypassing unmount upload: Session duration is 0 seconds.')
-          return
-        }
-
+        // Send even if presence=0 so backend can overwrite stale records
         hasUploaded.current = true
-        
-        const effectivePresence = presenceSeconds.current > 0 ? presenceSeconds.current : duration
-        const percentage = duration > 0 ? (effectivePresence / duration) * 100 : 0
+
+        const effectivePresence = attendanceIntervalsRef.current.reduce((sum, iv) => sum + iv.seconds, 0)
+        const percentage = duration > 0
+          ? Math.min(100, Math.max(0, (effectivePresence / duration) * 100))
+          : 0
         const status = percentage >= 75 ? 'Present' : 'Absent'
         const camPermission = currentConsent === 'Granted'
+        const isFinalSubmit = isFirstSubmitRef.current
+        isFirstSubmitRef.current = false
 
         const payload = {
           meetingId: currentMeetingData.meeting_id,
@@ -1882,20 +2004,11 @@ function MeetingRoomContent({
           meetingDurationSeconds: duration,
           attendancePercentage: Number(percentage.toFixed(2)),
           status,
-          cameraPermission: camPermission
+          cameraPermission: camPermission,
+          isFinalSubmit
         }
 
-        console.log('[Attendance Finalize Trigger] component-unmount')
-        console.log('[Attendance Finalize]', {
-          meetingId: currentMeetingData.meeting_id,
-          userId: userRef.current?.id || 'unknown',
-          isHost: currentIsHost,
-          sessionStart: sessionStartTimeRef.current ? new Date(sessionStartTimeRef.current).toISOString() : null,
-          sessionDurationSeconds: duration,
-          presenceSeconds: presenceSeconds.current,
-          cameraPermission: camPermission
-        })
-        console.log('[Attendance Upload Payload]', payload)
+        console.log('[AI Attendance] unmount | facePresence:', effectivePresence, 's | duration:', duration, 's | %:', percentage.toFixed(2))
 
         const apiUrl = `${import.meta.env.VITE_API_URL || 'http://localhost:5000'}/api/meetings/attendance`
         if (navigator.sendBeacon) {
@@ -1913,12 +2026,12 @@ function MeetingRoomContent({
             keepalive: true,
             credentials: 'include'
           }).catch(err => {
-            console.error('[Attendance] Unmount background upload failed:', err)
+            console.error('[AI Attendance] Unmount background upload failed:', err)
           })
         }
       }
     }
-  }, [])
+  }, [finalizeAttendanceState])
 
   // Transcript chunk collection
   useEffect(() => {
