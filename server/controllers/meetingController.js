@@ -1497,40 +1497,45 @@ export const submitAttendance = async (req, res) => {
     finalPresence = Math.max(0, finalPresence)
     finalDuration = Math.max(0, finalDuration)
 
-    // Calculate total meeting duration from actual meeting timestamps
-    // Do NOT use finalDuration as the denominator — use the real meeting wall-clock time
-    let totalMeetingSec = 0
-    if (meetingCheck) {
+    // Denominator for percentage = participant's submitted connection time (meetingDurationSeconds).
+    // This is the time the participant was actually connected to the meeting, submitted by the
+    // frontend from sessionStartTimeRef → Date.now(). It is NOT the full meeting wall-clock time
+    // from DB timestamps, which can be longer if the host started early.
+    //
+    // Example: host starts at T=0, participant joins at T=13s, meeting ends at T=137s.
+    //   DB meeting duration = 137s
+    //   Participant connection time = 124s (submitted by frontend)
+    //   Face presence = 96s
+    //   Correct percentage = 96/124 = 77.42%  ← use finalDuration (124s)
+    //   Wrong percentage  = 96/137 = 70.07%  ← would result from DB timestamps
+    let totalMeetingSec = finalDuration > 0 ? finalDuration : 0
+
+    // Fallback: if frontend sent 0 duration (e.g., sessionStartTimeRef was never set),
+    // use actual meeting wall-clock time from DB timestamps so we don't divide by zero.
+    if (totalMeetingSec <= 0 && meetingCheck) {
       const start = meetingCheck.started_at || meetingCheck.created_at
       const end = meetingCheck.ended_at || new Date().toISOString()
       if (start) {
         totalMeetingSec = Math.max(1, Math.round((new Date(end) - new Date(start)) / 1000))
       }
     }
-    // Fallback: if we couldn't get meeting timestamps, use participant's connection duration
-    if (totalMeetingSec <= 0) {
-      totalMeetingSec = Math.max(1, finalDuration)
-    }
+    totalMeetingSec = Math.max(1, totalMeetingSec)
 
-    // Presence can never exceed total meeting duration
+    // Presence can never exceed the participant's connection time
     finalPresence = Math.min(finalPresence, totalMeetingSec)
 
-    // Determine participant attendance (strictly face-presence based)
+    // Attendance percentage: face-presence / participant-connection-time
     const participantAttendanceSec = finalPresence
-    const rawPercentage = totalMeetingSec > 0 ? (participantAttendanceSec / totalMeetingSec) * 100 : 0
+    const rawPercentage = (participantAttendanceSec / totalMeetingSec) * 100
     const finalPercentage = Math.max(0, Math.min(100, Number(rawPercentage.toFixed(2))))
     const finalStatus = finalPercentage >= 75 ? 'Present' : 'Absent'
 
-    console.log('[Attendance Backend Write]', {
-      meetingId,
-      userId: req.user.id,
-      finalPresence,
-      finalDuration,
-      totalMeetingSec,
-      finalPercentage: finalPercentage.toFixed(2),
-      finalStatus,
-      finalCameraPermission
-    })
+    console.log('[Attendance Backend Write]')
+    console.log(`  presence_seconds=${finalPresence}`)
+    console.log(`  meeting_duration_seconds=${finalDuration}`)
+    console.log(`  totalMeetingSec_used_as_denominator=${totalMeetingSec}`)
+    console.log(`  attendance_percentage=${finalPercentage.toFixed(2)}`)
+    console.log(`  status=${finalStatus}`)
 
     // Upsert to handle disconnects/reconnects without duplicate rows
     const { error: upsertErr } = await supabase
@@ -1633,22 +1638,37 @@ export const getAttendanceReport = async (req, res) => {
     const rowCount = records?.length || 0
     console.log(`[Attendance] Attendance SELECT returned ${rowCount} rows`)
 
-    // Map records to match frontend expected fields with accurate percentage calculation
+    // Map records — recalculate percentage using the stored participant connection time
+    // (rec.meeting_duration_seconds) as the denominator, NOT the DB wall-clock meeting time.
+    // This must match the logic in submitAttendance exactly.
     const mapped = (records || []).map((rec) => {
-      const pAttendanceSec = Math.max(0, rec.presence_seconds !== undefined && rec.presence_seconds !== null ? Number(rec.presence_seconds) : 0)
-      // Use actual meeting wall-clock duration as denominator — same logic as submitAttendance
-      const denominator = totalMtgSec > 0 ? totalMtgSec : Math.max(1, rec.meeting_duration_seconds || 1)
-      // Presence can never exceed meeting duration
+      const pAttendanceSec = Math.max(0, rec.presence_seconds != null ? Number(rec.presence_seconds) : 0)
+      const storedDuration = rec.meeting_duration_seconds != null ? Number(rec.meeting_duration_seconds) : 0
+
+      // Denominator priority: participant's connection time → DB meeting wall-clock → 1 (safety)
+      const denominator = storedDuration > 0 ? storedDuration
+                        : totalMtgSec     > 0 ? totalMtgSec
+                        : 1
+
+      // Presence can never exceed the denominator used
       const clampedPresence = Math.min(pAttendanceSec, denominator)
       const calcPercentage = Math.max(0, Math.min(100, Number(((clampedPresence / denominator) * 100).toFixed(2))))
       const calcStatus = calcPercentage >= 75 ? 'Present' : 'Absent'
+
+      console.log('[Attendance Report Calculation]')
+      console.log(`  user_id=${rec.user_id}`)
+      console.log(`  presence_seconds=${pAttendanceSec}`)
+      console.log(`  meeting_duration_seconds=${storedDuration}`)
+      console.log(`  totalMtgSec_fallback=${totalMtgSec}`)
+      console.log(`  denominator_used=${denominator}`)
+      console.log(`  calculated_percentage=${calcPercentage}`)
 
       return {
         id: rec.id,
         meeting_id: rec.meeting_id,
         user_id: rec.user_id,
         participant_name: rec.user?.full_name || 'Anonymous User',
-        meeting_duration_seconds: rec.meeting_duration_seconds,
+        meeting_duration_seconds: storedDuration,
         presence_seconds: clampedPresence,
         attendance_percentage: calcPercentage,
         status: calcStatus,

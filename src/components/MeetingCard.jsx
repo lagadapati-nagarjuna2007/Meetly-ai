@@ -377,6 +377,13 @@ export default function MeetingCard({ meeting, index = 0, onDeleted }) {
           ? `${Math.floor(rec.meeting_duration_seconds / 60)}m ${rec.meeting_duration_seconds % 60}s`
           : `${rec.meeting_duration_seconds}s`
 
+        console.log('[Attendance PDF Data]')
+        console.log(`  participant=${rec.participant_name}`)
+        console.log(`  presence_seconds=${rec.presence_seconds}`)
+        console.log(`  meeting_duration_seconds=${rec.meeting_duration_seconds}`)
+        console.log(`  attendance_percentage=${rec.attendance_percentage}`)
+        console.log(`  status=${rec.status}`)
+
         // Color status green if Present, red if Absent
         const isPresent = rec.status === 'Present'
         doc.setTextColor(51, 65, 85) // Reset color to slate-700
