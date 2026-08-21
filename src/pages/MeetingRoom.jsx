@@ -921,6 +921,22 @@ function MeetingRoomContent({
     isHostRef.current = isHost
   }, [isHost])
 
+  // CRITICAL: sync attendanceConsentRef when the user grants/denies consent
+  // Without this, the ref stays null even after the user clicks "Grant"
+  useEffect(() => {
+    attendanceConsentRef.current = attendanceConsent
+  }, [attendanceConsent])
+
+  useEffect(() => {
+    userRef.current = user
+  }, [user])
+
+  // Guards that prevent the detector and camera loop from being destroyed/recreated
+  // mid-meeting whenever meetingData object identity changes (re-render).
+  // Both effects run exactly once after consent is granted.
+  const detectorInitializedOnceRef = useRef(false)
+  const cameraLoopStartedOnceRef   = useRef(false)
+
 
   const [activePopup, setActivePopup] = useState(null) // 'react' | 'more' | null
   const [showEndConfirmModal, setShowEndConfirmModal] = useState(false)
@@ -1650,16 +1666,30 @@ function MeetingRoomContent({
     }
   }
 
-  // 1. MediaPipe Detector Initialization Effect (runs once)
+  // ─────────────────────────────────────────────────────────────────────────
+  // 1. MediaPipe Detector Initialization Effect
+  //
+  // IMPORTANT: deps = [attendanceConsent] ONLY (not meetingData).
+  //   • meetingData was previously in deps — any re-render that created a new
+  //     meetingData object identity caused cleanup (detector.close()) then
+  //     re-init, producing the "Cleaning up detector → Starting AI Attendance"
+  //     cycle observed in production.
+  //   • detectorInitializedOnceRef prevents this effect from running more than
+  //     once per component lifetime even if attendanceConsent flickers.
+  //   • Cleanup only closes the detector on TRUE component unmount (not on
+  //     re-run caused by dependency changes).
+  // ─────────────────────────────────────────────────────────────────────────
   useEffect(() => {
-    if (!meetingData || !meetingData.enable_ai_attendance || isHost || attendanceConsent !== 'Granted') {
-      return
-    }
+    // Read conditions from refs — never from closure — so stale values don't block init
+    const md = meetingDataRef.current
+    if (!md || !md.enable_ai_attendance || isHostRef.current) return
+    if (attendanceConsent !== 'Granted') return
 
-    if (detectorRef.current || isInitializingRef.current) {
-      return // Prevent duplicate initialization
-    }
+    // One-shot guard: never re-initialize after first successful init
+    if (detectorInitializedOnceRef.current) return
+    if (detectorRef.current || isInitializingRef.current) return
 
+    detectorInitializedOnceRef.current = true
     isInitializingRef.current = true
     console.log('[Attendance] Starting AI Attendance')
 
@@ -1667,7 +1697,7 @@ function MeetingRoomContent({
       try {
         console.log('[Attendance] Loading MediaPipe')
         const { FilesetResolver, FaceDetector } = await import('@mediapipe/tasks-vision')
-        
+
         console.log('[Attendance] Loading WASM')
         const vision = await FilesetResolver.forVisionTasks(
           'https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.8/wasm'
@@ -1675,16 +1705,14 @@ function MeetingRoomContent({
 
         console.log('[Attendance] Loading Face Detector model')
         const modelUrl = 'https://storage.googleapis.com/mediapipe-models/face_detector/blaze_face_short_range/float16/1/blaze_face_short_range.tflite'
-        
+
         console.log(`[Attendance] Verifying model access: ${modelUrl}`)
         try {
           const checkRes = await fetch(modelUrl, { method: 'HEAD' })
-          if (!checkRes.ok) {
-            throw new Error(`Model request returned HTTP ${checkRes.status} for URL: ${modelUrl}`)
-          }
+          if (!checkRes.ok) throw new Error(`Model HTTP ${checkRes.status}`)
           console.log('[Attendance] Model URL accessibility verified (HTTP 200)')
         } catch (fetchErr) {
-          console.error(`[Attendance Error] Pre-fetch verification check failed for URL ${modelUrl}:`, fetchErr)
+          console.warn('[Attendance] Model pre-check failed (may still work):', fetchErr.message)
         }
 
         console.log('[Attendance] Creating detector')
@@ -1702,46 +1730,46 @@ function MeetingRoomContent({
         console.log('[Attendance] Initialization completed')
       } catch (err) {
         isInitializingRef.current = false
-        console.error('[Attendance Error] MediaPipe FaceDetector initialization failed:', err)
-        console.error('[Attendance Error] Error details:', {
-          message: err.message,
-          stack: err.stack,
-          errorObject: err
-        })
-        showToast('AI Attendance system initialization failed: ' + (err.message || err), 'error')
+        detectorInitializedOnceRef.current = false // allow retry on error
+        console.error('[Attendance Error] MediaPipe FaceDetector initialization failed:', err.message)
+        showToast('AI Attendance initialization failed: ' + (err.message || err), 'error')
       }
     }
 
     loadDetector()
 
+    // Cleanup: only destroy the detector on TRUE component unmount
     return () => {
-      console.log('[Attendance] Cleaning up detector on unmount')
+      console.log('[Attendance] Detector cleanup on component unmount')
       if (detectorRef.current) {
-        try {
-          detectorRef.current.close()
-        } catch (e) {
-          console.error('[Attendance Error] Failed to close detector:', e)
-        }
+        try { detectorRef.current.close() } catch (_) {}
         detectorRef.current = null
       }
+      isInitializingRef.current = false
     }
-  }, [meetingData, attendanceConsent, showToast, isHost])
+  }, [attendanceConsent, showToast]) // ← meetingData intentionally REMOVED
 
-  // 2. Local Camera Tracking Loop Effect
+  // ─────────────────────────────────────────────────────────────────────────
+  // 2. Local Camera Stream + Detection Loop Effect
+  //
+  // IMPORTANT: deps = [attendanceConsent] ONLY (not meetingData, not showToast).
+  //   • Same reason as above: meetingData in deps caused stream teardown and
+  //     restart on every re-render, killing active face detection.
+  //   • cameraLoopStartedOnceRef ensures we only call getUserMedia once.
+  //   • Instead of early-returning when detectorRef.current is null, we poll
+  //     for up to 15 seconds so the camera stream and rAF loop start as soon
+  //     as the async detector init completes — regardless of render timing.
+  // ─────────────────────────────────────────────────────────────────────────
   useEffect(() => {
-    if (!meetingData || !meetingData.enable_ai_attendance || isHost || attendanceConsent !== 'Granted') {
-      return
-    }
+    const md = meetingDataRef.current
+    if (!md || !md.enable_ai_attendance || isHostRef.current) return
+    if (attendanceConsent !== 'Granted') return
+    if (cameraLoopStartedOnceRef.current) return
 
-    // Wait until detector is loaded
-    if (!detectorRef.current) {
-      console.log('[Attendance] Waiting for detector to be loaded...')
-      return
-    }
-
+    cameraLoopStartedOnceRef.current = true
     console.log('[Attendance] Initializing separate local camera stream for AI Attendance...')
 
-    // Create a hidden video element to attach the track
+    // Create a single hidden video element — reused for the lifetime of the component
     const video = document.createElement('video')
     video.autoplay = true
     video.playsInline = true
@@ -1760,78 +1788,134 @@ function MeetingRoomContent({
     let activeStream = null
     let clockInterval = null
     let rafId = null
+    let destroyed = false // flag set by cleanup to stop any async work after unmount
 
     const startCamera = async () => {
       try {
         setAttendanceCamError(false)
         console.log('[Attendance] Requesting getUserMedia for local camera stream...')
         const stream = await navigator.mediaDevices.getUserMedia({
-          video: {
-            width: { ideal: 640 },
-            height: { ideal: 480 },
-            facingMode: 'user'
-          },
+          video: { width: { ideal: 640 }, height: { ideal: 480 }, facingMode: 'user' },
           audio: false
         })
+        if (destroyed) {
+          stream.getTracks().forEach(t => t.stop())
+          return
+        }
         activeStream = stream
         attendanceCameraStreamRef.current = stream
-        console.log('[Attendance] Separate local camera stream obtained successfully.')
 
         // Attach stream to hidden video element
         video.srcObject = stream
         videoRef.current = video
         console.log('[Attendance] Separate camera stream attached to hidden video element.')
 
-        // ── rAF: Face Detection Loop (runs every ~400ms) ──────────────────
-        console.log('[AI Attendance] Starting face detection loop')
-        let lastTime = 0
-        const runDetection = (timestamp) => {
-          if (!detectorRef.current || !videoRef.current) return
+        // Poll for detector ready (up to 15 s, checking every 200 ms)
+        // This handles the race where getUserMedia resolves before the async
+        // model download completes.
+        let waitMs = 0
+        while (!detectorRef.current && waitMs < 15000 && !destroyed) {
+          await new Promise(r => setTimeout(r, 200))
+          waitMs += 200
+        }
+        if (destroyed) return
+        if (!detectorRef.current) {
+          console.error('[Attendance Error] Detector never became ready after 15s — stopping camera')
+          setAttendanceCamError(true)
+          return
+        }
 
-          if (timestamp - lastTime >= 400) {
-            lastTime = timestamp
+        console.log('[Attendance Detection Loop] started=true')
+
+        // ── rAF: Face Detection Loop (~400 ms cadence) ───────────────────
+        let lastRafTime = 0
+        let framesProcessed = 0
+        let lastDiagnosticLog = 0
+        let lastFaceLog = 0
+
+        const runDetection = (timestamp) => {
+          if (destroyed || !detectorRef.current || !videoRef.current) return
+
+          if (timestamp - lastRafTime >= 400) {
+            lastRafTime = timestamp
+
+            // ── Video readiness diagnostics (every 2s) ───────────────────
+            const nowMs = Date.now()
+            if (nowMs - lastDiagnosticLog >= 2000) {
+              lastDiagnosticLog = nowMs
+              const vt = videoRef.current
+              const track = activeStream?.getVideoTracks?.()[0] ?? null
+              console.log('[Attendance Detection Input]')
+              console.log(`  videoExists=${!!vt}`)
+              console.log(`  videoReadyState=${vt?.readyState ?? 'n/a'}`)
+              console.log(`  videoWidth=${vt?.videoWidth ?? 0}`)
+              console.log(`  videoHeight=${vt?.videoHeight ?? 0}`)
+              console.log(`  videoPaused=${vt?.paused ?? 'n/a'}`)
+              console.log(`  videoCurrentTime=${vt?.currentTime ?? 0}`)
+              console.log(`  srcObjectExists=${!!(vt?.srcObject)}`)
+              console.log(`  cameraTrackExists=${!!track}`)
+              console.log(`  trackReadyState=${track?.readyState ?? 'n/a'}`)
+              console.log(`  trackEnabled=${track?.enabled ?? 'n/a'}`)
+              console.log('[Attendance Detection Loop]')
+              console.log(`  framesProcessed=${framesProcessed}`)
+              console.log(`  lastFrameTimestamp=${lastRafTime.toFixed(0)}`)
+            }
+
             try {
-              if (video.readyState >= 2) { // HAVE_CURRENT_DATA
-                const results = detectorRef.current.detectForVideo(video, timestamp)
-                const faceDetected = results && results.detections && results.detections.length > 0
+              const vt = videoRef.current
+              if (vt && vt.readyState >= 2 && vt.videoWidth > 0 && vt.videoHeight > 0) {
+                framesProcessed++
+                const results = detectorRef.current.detectForVideo(vt, timestamp)
+                const faceDetected = results?.detections?.length > 0
                 const prevState = attendanceStateRef.current
+
+                // ── Face result log (throttled) ──────────────────────────
+                if (nowMs - lastFaceLog >= 1000) {
+                  lastFaceLog = nowMs
+                  console.log('[Attendance Face Detection]')
+                  console.log(`  faceDetected=${faceDetected}`)
+                  console.log(`  detectionsCount=${results?.detections?.length ?? 0}`)
+                  console.log(`  timestamp=${timestamp.toFixed(0)}`)
+                  console.log(`  state=${prevState}`)
+                }
 
                 if (faceDetected) {
                   consecutiveDetections.current++
-                  console.log(`[AI Attendance] Face detected (consecutive: ${consecutiveDetections.current}) | state: ${prevState}`)
 
                   if (prevState === 'WAITING_FOR_FACE' || prevState === 'PAUSED') {
                     if (consecutiveDetections.current >= 2) {
                       attendanceStateRef.current = 'PRESENT'
                       graceStartTimeRef.current = null
                       currentIntervalStartRef.current = Date.now()
-                      console.log(`[AI Attendance] State transition: ${prevState} → PRESENT`)
-                      console.log('[AI Attendance] Interval started at:', new Date(currentIntervalStartRef.current).toISOString())
+                      console.log(`[Attendance State] ${prevState} → PRESENT`)
+                      console.log('[Attendance Interval] started')
                     }
                   } else if (prevState === 'GRACE') {
                     attendanceStateRef.current = 'PRESENT'
                     graceStartTimeRef.current = null
-                    console.log('[AI Attendance] State transition: GRACE → PRESENT (face returned within grace)')
+                    console.log('[Attendance State] GRACE → PRESENT (face returned within grace)')
                   }
                 } else {
                   if (consecutiveDetections.current > 0) {
-                    console.log('[AI Attendance] Face not detected | state:', prevState)
+                    consecutiveDetections.current = 0
                   }
-                  consecutiveDetections.current = 0
-
                   if (prevState === 'PRESENT') {
                     attendanceStateRef.current = 'GRACE'
                     graceStartTimeRef.current = Date.now()
-                    console.log('[AI Attendance] State transition: PRESENT → GRACE')
+                    console.log('[Attendance State] PRESENT → GRACE')
                   }
                 }
               } else {
-                console.log('[AI Attendance] Video not ready yet, readyState:', video.readyState)
+                // Throttled: only log once every 2s when not ready
+                if (nowMs - lastDiagnosticLog <= 100) {
+                  console.log('[Attendance Detection Input] video not ready — readyState:', videoRef.current?.readyState, 'w:', videoRef.current?.videoWidth, 'h:', videoRef.current?.videoHeight)
+                }
               }
             } catch (err) {
-              console.error('[AI Attendance Error] Face detection frame failed:', err)
+              console.error('[Attendance Error] Face detection frame error:', err.message)
             }
           }
+
           rafId = requestAnimationFrame(runDetection)
           animationFrameIdRef.current = rafId
         }
@@ -1839,32 +1923,28 @@ function MeetingRoomContent({
         rafId = requestAnimationFrame(runDetection)
         animationFrameIdRef.current = rafId
 
-        // ── Clock: Grace Expiry + Display Update (every 1 second) ─────────
-        // This interval is NOT the source of truth for presence duration.
-        // It only: (1) expires grace, (2) syncs the presenceSeconds display counter.
+        // ── Clock: Grace Expiry + Display Sync (every 1 second) ──────────
         let lastDebugLog = 0
         clockInterval = setInterval(() => {
+          if (destroyed) return
           totalSeconds.current++
 
           if (attendanceStateRef.current === 'GRACE' && graceStartTimeRef.current) {
             const elapsedGraceSec = Math.floor((Date.now() - graceStartTimeRef.current) / 1000)
             if (elapsedGraceSec >= GRACE_PERIOD_SECONDS) {
-              console.log(`[AI Attendance] State transition: GRACE → PAUSED (grace expired after ${elapsedGraceSec}s)`)
+              console.log(`[Attendance State] GRACE → PAUSED (grace expired after ${elapsedGraceSec}s)`)
               attendanceStateRef.current = 'PAUSED'
               graceStartTimeRef.current = null
 
               if (currentIntervalStartRef.current) {
                 const intervalEnd = Date.now()
-                // Interval ends where grace started, not now — grace period was already counted
-                // Actually: interval includes grace time up to grace expiry.
                 const intervalDuration = Math.max(0, Math.floor((intervalEnd - currentIntervalStartRef.current) / 1000))
                 attendanceIntervalsRef.current.push({
                   start: currentIntervalStartRef.current,
                   end: intervalEnd,
                   seconds: intervalDuration
                 })
-                console.log(`[AI Attendance] Interval closed | duration: ${intervalDuration}s`)
-                console.log(`[AI Attendance] Total intervals so far: ${attendanceIntervalsRef.current.length}`)
+                console.log(`[Attendance Interval] closed | duration: ${intervalDuration}s | total intervals: ${attendanceIntervalsRef.current.length}`)
                 currentIntervalStartRef.current = null
               }
             }
@@ -1876,49 +1956,45 @@ function MeetingRoomContent({
             presenceSeconds.current += Math.max(0, Math.floor((Date.now() - currentIntervalStartRef.current) / 1000))
           }
 
-          // Debug log every 5 seconds to avoid spam
+          // Debug log every 5 seconds
           const now = Date.now()
           if (now - lastDebugLog >= 5000) {
             lastDebugLog = now
-            const elapsedSessionSec = sessionStartTimeRef.current 
+            const elapsedSessionSec = sessionStartTimeRef.current
               ? Math.floor((Date.now() - sessionStartTimeRef.current) / 1000)
               : 0
-            console.log(
-              `[AI Attendance Debug] state=${attendanceStateRef.current}` +
-              ` | session=${elapsedSessionSec}s` +
-              ` | facePresence=${presenceSeconds.current}s` +
-              ` | intervals=${attendanceIntervalsRef.current.length}`
-            )
+            console.log('[Attendance Debug]')
+            console.log(`  state=${attendanceStateRef.current}`)
+            console.log(`  session=${elapsedSessionSec}s`)
+            console.log(`  facePresence=${presenceSeconds.current}s`)
+            console.log(`  intervalCount=${attendanceIntervalsRef.current.length}`)
           }
         }, 1000)
 
       } catch (err) {
-        console.error('[Attendance Error] Failed to obtain separate local camera stream:', err)
-        setAttendanceCamError(true)
-        showToast('AI Attendance: Camera access failed or hardware busy.', 'warning')
+        if (!destroyed) {
+          console.error('[Attendance Error] Failed to obtain camera stream:', err)
+          setAttendanceCamError(true)
+          showToast('AI Attendance: Camera access failed or hardware busy.', 'warning')
+        }
       }
     }
 
     startCamera()
 
     return () => {
+      destroyed = true
       console.log('[Attendance] Cleaning up tracking loop and separate camera track')
       if (clockInterval) clearInterval(clockInterval)
       if (rafId) cancelAnimationFrame(rafId)
       if (activeStream) {
-        try {
-          activeStream.getTracks().forEach(track => track.stop())
-        } catch (e) {
-          console.error('[Attendance Error] Failed to stop stream tracks:', e)
-        }
+        try { activeStream.getTracks().forEach(track => track.stop()) } catch (_) {}
       }
       attendanceCameraStreamRef.current = null
-      if (video && video.parentNode) {
-        video.parentNode.removeChild(video)
-      }
+      if (video && video.parentNode) video.parentNode.removeChild(video)
       videoRef.current = null
     }
-  }, [meetingData, attendanceConsent, isHost, showToast])
+  }, [attendanceConsent, showToast]) // ← meetingData intentionally REMOVED
 
   // beforeunload listener for browser closing / refresh events
   useEffect(() => {
