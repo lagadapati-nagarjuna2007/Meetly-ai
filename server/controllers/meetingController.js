@@ -1170,7 +1170,7 @@ export const submitTranscriptChunk = async (req, res) => {
   }
 }
 
-// 14. GENERATE SUMMARY (Llama 3.3 Chat Completions with Structured Output)
+// 14. GENERATE SUMMARY (meeting-type-aware, detail-preserving)
 export const generateSummary = async (req, res) => {
   try {
     const { meetingId } = req.body
@@ -1198,65 +1198,231 @@ export const generateSummary = async (req, res) => {
       })
     }
 
-    // 2. Concatenate transcripts
+    // 2. Concatenate transcripts preserving speaker order
     const transcriptText = chunks
       .map(c => `${c.speaker_name}: ${c.transcript}`)
       .join('\n')
 
-    console.log(`[Summary] Generating structured summary for meeting ${meetingId} from ${chunks.length} transcript chunks...`)
+    console.log('[Summary Generation]')
+    console.log(`  transcript_chunks=${chunks.length}`)
+    console.log(`  transcript_length=${transcriptText.length} chars`)
 
-    // 3. Call Groq Llama 3.3 with JSON mode
-    const groqRes = await fetch('https://api.groq.com/openai/v1/chat/completions', {
+    const groqHeaders = {
+      'Authorization': `Bearer ${apiKey}`,
+      'Content-Type': 'application/json'
+    }
+
+    // ── STEP 1: Classify meeting type ────────────────────────────────────────
+    const classifyRes = await fetch('https://api.groq.com/openai/v1/chat/completions', {
       method: 'POST',
-      headers: {
-        'Authorization': `Bearer ${apiKey}`,
-        'Content-Type': 'application/json'
-      },
+      headers: groqHeaders,
       body: JSON.stringify({
         model: 'openai/gpt-oss-120b',
         response_format: { type: 'json_object' },
         messages: [
           {
             role: 'system',
-            content: `You are an expert AI Meeting Summarizer.
-Analyze the provided meeting transcript and generate a structured, high-accuracy JSON meeting summary strictly following this exact JSON schema.
+            content: `You are a meeting classifier. Analyze the transcript and output ONLY a JSON object with one field "meetingType".
 
-CRITICAL ANTI-HALLUCINATION RULES:
-- Summarize ONLY information explicitly discussed or directly supported by the meeting transcript.
-- NEVER invent or assume decisions, action items, assignees, technical details, or topics not discussed in the transcript.
-- If no explicit decisions were made or agreed upon in the conversation, set "decisionsMade": [].
-- If no explicit tasks were assigned in the conversation, set "actionItems": [].
-- Assignees must be actual meeting participants mentioned in the transcript. If a task has no explicit assignee, set "assignee": "".
-- Do NOT include sentiment, scores, mood, timestamps, speaker statistics, or fluff.
+Choose exactly one of these values:
+- "Educational / Lecture" — if the meeting is a class, lecture, tutorial, or teaching session where concepts, theories, or skills are being explained/taught
+- "Technical / Development" — if the meeting is about software engineering, system design, debugging, architecture, code review, or technical problem-solving (but NOT primarily a teaching session)
+- "Business / Professional" — if the meeting is about business strategy, project management, planning, HR, sales, or organizational topics
+- "General Discussion" — if the meeting does not clearly fit any of the above
 
-REQUIRED JSON OUTPUT SCHEMA:
-{
-  "overview": "Concise 2-4 sentence overview of what the meeting was mainly about.",
-  "topicsDiscussed": [
-    {
-      "title": "Topic Title",
-      "description": "Short 1-3 sentence summary of what was discussed about this topic."
-    }
-  ],
-  "keyPoints": [
-    "Key takeaway point 1",
-    "Key takeaway point 2"
-  ],
-  "decisionsMade": [
-    "Decision 1"
-  ],
-  "actionItems": [
-    {
-      "assignee": "Person Name or empty string",
-      "task": "Specific task assigned"
-    }
-  ]
-}`
+Output ONLY: {"meetingType": "<one of the four values above>"}`
           },
           {
             role: 'user',
-            content: `Meeting Transcript:\n${transcriptText}`
+            content: `Transcript (first 3000 chars for classification):\n${transcriptText.slice(0, 3000)}`
           }
+        ],
+        temperature: 0.0,
+        max_tokens: 50
+      })
+    })
+
+    let meetingType = 'General Discussion'
+    if (classifyRes.ok) {
+      try {
+        const classifyResult = await classifyRes.json()
+        const raw = classifyResult.choices?.[0]?.message?.content || '{}'
+        const parsed = JSON.parse(raw.replace(/```json/gi, '').replace(/```/g, '').trim())
+        if (parsed.meetingType && typeof parsed.meetingType === 'string') {
+          meetingType = parsed.meetingType
+        }
+      } catch (_) {}
+    }
+
+    console.log('[Summary Type]')
+    console.log(`  type=${meetingType}`)
+
+    // ── STEP 2: Type-specific prompt ──────────────────────────────────────────
+    let systemPrompt
+    let expectedSchema
+
+    if (meetingType === 'Educational / Lecture') {
+      systemPrompt = `You are an expert educational content analyst and note-taker.
+
+Your task is to analyze this educational meeting/lecture transcript and produce DETAILED STUDY NOTES in JSON format.
+
+CRITICAL RULES:
+1. ONLY include content that is ACTUALLY discussed in the transcript. Do NOT invent definitions, examples, code, or explanations.
+2. If a concept is explained in detail in the transcript, preserve that detail fully.
+3. If a concept is mentioned only briefly, summarize it briefly.
+4. The depth of each concept section must be PROPORTIONAL to how much it was discussed.
+5. Preserve the ORDER in which concepts were introduced.
+6. Do NOT merge separate concepts into one.
+
+REQUIRED JSON SCHEMA:
+{
+  "meetingType": "Educational / Lecture",
+  "overview": "2-4 sentence summary of what the session covered overall.",
+  "concepts": [
+    {
+      "name": "Concept Name (exactly as discussed)",
+      "definition": "The definition or explanation given in the session. Empty string if not defined.",
+      "explanation": "Detailed explanation as discussed. Include all important points made. Empty string if not explained.",
+      "purpose": "Why it is used or what problem it solves, if discussed. Empty string if not mentioned.",
+      "characteristics": ["characteristic 1", "characteristic 2"],
+      "example": "Any example discussed in the transcript. Empty string if none.",
+      "analogy": "Any real-world analogy used. Empty string if none.",
+      "codeExample": "Any code or pseudocode shown or described. Use actual code from transcript. Empty string if none.",
+      "importantPoints": ["important point 1", "important point 2"],
+      "questionsRaised": ["Any question or doubt raised about this concept. Empty array if none."]
+    }
+  ],
+  "keyPoints": ["Overall key takeaway 1", "Overall key takeaway 2"],
+  "topicsDiscussed": [
+    {
+      "title": "Topic Title",
+      "description": "Brief description for table of contents."
+    }
+  ],
+  "decisionsMade": [],
+  "actionItems": []
+}
+
+For the "concepts" array: include EVERY distinct concept that was actually explained in the transcript.
+Each concept must have its own entry even if related to others (e.g., Encapsulation and Abstraction are separate entries).
+If a section was not discussed, use empty string "" or empty array [].`
+
+      expectedSchema = 'educational'
+
+    } else if (meetingType === 'Technical / Development') {
+      systemPrompt = `You are an expert technical meeting analyst.
+
+Analyze this technical meeting transcript and produce a structured JSON summary.
+
+CRITICAL RULES:
+- Only include content actually discussed. Never invent technical details.
+- Preserve code snippets, commands, or technical specifications mentioned.
+- Be specific about technical decisions and their rationale.
+
+REQUIRED JSON SCHEMA:
+{
+  "meetingType": "Technical / Development",
+  "overview": "2-4 sentence overview of the technical meeting.",
+  "topicsDiscussed": [
+    {
+      "title": "Topic/Problem Title",
+      "description": "Detailed technical description of what was discussed, including architecture, implementation details, and technical reasoning."
+    }
+  ],
+  "technicalDetails": [
+    {
+      "area": "Area name (e.g. Architecture, API Design, Database)",
+      "detail": "Specific technical detail or decision discussed.",
+      "codeOrExample": "Any code, command, query, or technical example mentioned. Empty string if none."
+    }
+  ],
+  "issuesDiscussed": ["Issue 1 discussed", "Issue 2 discussed"],
+  "keyPoints": ["Key technical takeaway 1", "Key technical takeaway 2"],
+  "decisionsMade": ["Technical decision 1", "Technical decision 2"],
+  "actionItems": [
+    {
+      "assignee": "Person name or empty string",
+      "task": "Specific task"
+    }
+  ],
+  "nextSteps": ["Next step 1", "Next step 2"]
+}`
+      expectedSchema = 'technical'
+
+    } else if (meetingType === 'Business / Professional') {
+      systemPrompt = `You are an expert business meeting analyst.
+
+Analyze this business meeting transcript and produce a structured JSON summary.
+
+CRITICAL RULES:
+- Only include content actually discussed. Never invent decisions, owners, or deadlines.
+- If assignees or deadlines are explicitly mentioned, include them. Otherwise leave empty.
+
+REQUIRED JSON SCHEMA:
+{
+  "meetingType": "Business / Professional",
+  "overview": "2-4 sentence overview of the meeting purpose and outcome.",
+  "topicsDiscussed": [
+    {
+      "title": "Topic Title",
+      "description": "Detailed description of what was discussed, including context and important points raised."
+    }
+  ],
+  "keyPoints": ["Important point 1", "Important point 2"],
+  "decisionsMade": ["Decision 1 with context", "Decision 2 with context"],
+  "actionItems": [
+    {
+      "assignee": "Person name or empty string if not explicitly assigned",
+      "task": "Specific task with context",
+      "deadline": "Deadline if mentioned, otherwise empty string"
+    }
+  ],
+  "openQuestions": ["Unresolved question or issue 1", "Unresolved question 2"]
+}`
+      expectedSchema = 'business'
+
+    } else {
+      // General Discussion
+      systemPrompt = `You are an expert meeting analyst.
+
+Analyze this meeting transcript and produce a structured JSON summary.
+
+CRITICAL RULES:
+- Only include content actually discussed. Never invent information.
+- Be proportionally detailed — longer discussions get more detail.
+
+REQUIRED JSON SCHEMA:
+{
+  "meetingType": "General Discussion",
+  "overview": "2-4 sentence overview of the meeting.",
+  "topicsDiscussed": [
+    {
+      "title": "Topic Title",
+      "description": "Detailed description of what was discussed about this topic."
+    }
+  ],
+  "keyPoints": ["Key point 1", "Key point 2"],
+  "decisionsMade": ["Decision 1", "Decision 2"],
+  "actionItems": [
+    {
+      "assignee": "Person name or empty string",
+      "task": "Task description"
+    }
+  ]
+}`
+      expectedSchema = 'general'
+    }
+
+    // ── STEP 3: Generate the summary ──────────────────────────────────────────
+    const groqRes = await fetch('https://api.groq.com/openai/v1/chat/completions', {
+      method: 'POST',
+      headers: groqHeaders,
+      body: JSON.stringify({
+        model: 'openai/gpt-oss-120b',
+        response_format: { type: 'json_object' },
+        messages: [
+          { role: 'system', content: systemPrompt },
+          { role: 'user', content: `Meeting Transcript:\n${transcriptText}` }
         ],
         temperature: 0.1
       })
@@ -1276,33 +1442,158 @@ REQUIRED JSON OUTPUT SCHEMA:
       const cleanJson = rawContent.replace(/```json/gi, '').replace(/```/g, '').trim()
       parsedSummary = JSON.parse(cleanJson)
     } catch (parseErr) {
-      console.warn('[Summary Error] Failed to parse JSON response from Groq:', parseErr)
+      console.warn('[Summary Error] Failed to parse JSON response from Groq:', parseErr.message)
     }
 
     if (!parsedSummary || typeof parsedSummary !== 'object') {
       return res.status(500).json({ message: 'Unable to format meeting summary as structured JSON. Please try again.' })
     }
 
-    // Sanitize and structure summary object
-    const finalSummary = {
-      overview: typeof parsedSummary.overview === 'string' ? parsedSummary.overview.trim() : '',
-      topicsDiscussed: Array.isArray(parsedSummary.topicsDiscussed)
-        ? parsedSummary.topicsDiscussed.map(t => typeof t === 'string' ? { title: t.trim(), description: '' } : { title: String(t.title || 'Topic').trim(), description: String(t.description || '').trim() }).filter(t => t.title)
-        : [],
-      keyPoints: Array.isArray(parsedSummary.keyPoints)
-        ? parsedSummary.keyPoints.map(k => String(k).trim()).filter(Boolean)
-        : [],
-      decisionsMade: Array.isArray(parsedSummary.decisionsMade)
-        ? parsedSummary.decisionsMade.map(d => String(d).trim()).filter(Boolean)
-        : [],
-      actionItems: Array.isArray(parsedSummary.actionItems)
-        ? parsedSummary.actionItems.map(a => typeof a === 'string' ? { assignee: '', task: a.trim() } : { assignee: String(a.assignee || '').trim(), task: String(a.task || '').trim() }).filter(a => a.task)
+    // ── STEP 4: Sanitize by schema type ──────────────────────────────────────
+    let finalSummary
+
+    if (expectedSchema === 'educational') {
+      const rawConcepts = Array.isArray(parsedSummary.concepts) ? parsedSummary.concepts : []
+      const sanitizedConcepts = rawConcepts
+        .filter(c => c && typeof c === 'object' && c.name)
+        .map(c => ({
+          name: String(c.name || '').trim(),
+          definition: String(c.definition || '').trim(),
+          explanation: String(c.explanation || '').trim(),
+          purpose: String(c.purpose || '').trim(),
+          characteristics: Array.isArray(c.characteristics)
+            ? c.characteristics.map(x => String(x).trim()).filter(Boolean)
+            : [],
+          example: String(c.example || '').trim(),
+          analogy: String(c.analogy || '').trim(),
+          codeExample: String(c.codeExample || '').trim(),
+          importantPoints: Array.isArray(c.importantPoints)
+            ? c.importantPoints.map(x => String(x).trim()).filter(Boolean)
+            : [],
+          questionsRaised: Array.isArray(c.questionsRaised)
+            ? c.questionsRaised.map(x => String(x).trim()).filter(Boolean)
+            : []
+        }))
+
+      // Build topicsDiscussed from concepts for backward compatibility
+      const topicsFromConcepts = sanitizedConcepts.map(c => ({
+        title: c.name,
+        description: c.definition || c.explanation?.slice(0, 150) || ''
+      }))
+
+      finalSummary = {
+        meetingType: 'Educational / Lecture',
+        overview: typeof parsedSummary.overview === 'string' ? parsedSummary.overview.trim() : '',
+        concepts: sanitizedConcepts,
+        topicsDiscussed: Array.isArray(parsedSummary.topicsDiscussed) && parsedSummary.topicsDiscussed.length > 0
+          ? parsedSummary.topicsDiscussed.map(t => ({ title: String(t.title || '').trim(), description: String(t.description || '').trim() })).filter(t => t.title)
+          : topicsFromConcepts,
+        keyPoints: Array.isArray(parsedSummary.keyPoints)
+          ? parsedSummary.keyPoints.map(k => String(k).trim()).filter(Boolean)
+          : [],
+        decisionsMade: [],
+        actionItems: []
+      }
+
+      console.log('[Summary Generation]')
+      console.log(`  major_topics=${sanitizedConcepts.length}`)
+      console.log(`  summary_sections=${sanitizedConcepts.length + 2}`)
+
+    } else if (expectedSchema === 'technical') {
+      const technicalDetails = Array.isArray(parsedSummary.technicalDetails)
+        ? parsedSummary.technicalDetails
+            .filter(d => d && typeof d === 'object')
+            .map(d => ({
+              area: String(d.area || '').trim(),
+              detail: String(d.detail || '').trim(),
+              codeOrExample: String(d.codeOrExample || '').trim()
+            }))
+            .filter(d => d.detail)
         : []
+
+      finalSummary = {
+        meetingType: 'Technical / Development',
+        overview: typeof parsedSummary.overview === 'string' ? parsedSummary.overview.trim() : '',
+        topicsDiscussed: Array.isArray(parsedSummary.topicsDiscussed)
+          ? parsedSummary.topicsDiscussed.map(t => ({ title: String(t.title || '').trim(), description: String(t.description || '').trim() })).filter(t => t.title)
+          : [],
+        technicalDetails,
+        issuesDiscussed: Array.isArray(parsedSummary.issuesDiscussed)
+          ? parsedSummary.issuesDiscussed.map(x => String(x).trim()).filter(Boolean)
+          : [],
+        keyPoints: Array.isArray(parsedSummary.keyPoints)
+          ? parsedSummary.keyPoints.map(k => String(k).trim()).filter(Boolean)
+          : [],
+        decisionsMade: Array.isArray(parsedSummary.decisionsMade)
+          ? parsedSummary.decisionsMade.map(d => String(d).trim()).filter(Boolean)
+          : [],
+        actionItems: Array.isArray(parsedSummary.actionItems)
+          ? parsedSummary.actionItems.map(a => typeof a === 'string' ? { assignee: '', task: a.trim() } : { assignee: String(a.assignee || '').trim(), task: String(a.task || '').trim() }).filter(a => a.task)
+          : [],
+        nextSteps: Array.isArray(parsedSummary.nextSteps)
+          ? parsedSummary.nextSteps.map(x => String(x).trim()).filter(Boolean)
+          : []
+      }
+
+      console.log('[Summary Generation]')
+      console.log(`  major_topics=${finalSummary.topicsDiscussed.length}`)
+      console.log(`  summary_sections=${finalSummary.topicsDiscussed.length + finalSummary.technicalDetails.length}`)
+
+    } else if (expectedSchema === 'business') {
+      finalSummary = {
+        meetingType: 'Business / Professional',
+        overview: typeof parsedSummary.overview === 'string' ? parsedSummary.overview.trim() : '',
+        topicsDiscussed: Array.isArray(parsedSummary.topicsDiscussed)
+          ? parsedSummary.topicsDiscussed.map(t => ({ title: String(t.title || '').trim(), description: String(t.description || '').trim() })).filter(t => t.title)
+          : [],
+        keyPoints: Array.isArray(parsedSummary.keyPoints)
+          ? parsedSummary.keyPoints.map(k => String(k).trim()).filter(Boolean)
+          : [],
+        decisionsMade: Array.isArray(parsedSummary.decisionsMade)
+          ? parsedSummary.decisionsMade.map(d => String(d).trim()).filter(Boolean)
+          : [],
+        actionItems: Array.isArray(parsedSummary.actionItems)
+          ? parsedSummary.actionItems.map(a => {
+              if (typeof a === 'string') return { assignee: '', task: a.trim(), deadline: '' }
+              return { assignee: String(a.assignee || '').trim(), task: String(a.task || '').trim(), deadline: String(a.deadline || '').trim() }
+            }).filter(a => a.task)
+          : [],
+        openQuestions: Array.isArray(parsedSummary.openQuestions)
+          ? parsedSummary.openQuestions.map(q => String(q).trim()).filter(Boolean)
+          : []
+      }
+
+      console.log('[Summary Generation]')
+      console.log(`  major_topics=${finalSummary.topicsDiscussed.length}`)
+      console.log(`  summary_sections=${finalSummary.topicsDiscussed.length + 1}`)
+
+    } else {
+      // General
+      finalSummary = {
+        meetingType: 'General Discussion',
+        overview: typeof parsedSummary.overview === 'string' ? parsedSummary.overview.trim() : '',
+        topicsDiscussed: Array.isArray(parsedSummary.topicsDiscussed)
+          ? parsedSummary.topicsDiscussed.map(t => typeof t === 'string' ? { title: t.trim(), description: '' } : { title: String(t.title || '').trim(), description: String(t.description || '').trim() }).filter(t => t.title)
+          : [],
+        keyPoints: Array.isArray(parsedSummary.keyPoints)
+          ? parsedSummary.keyPoints.map(k => String(k).trim()).filter(Boolean)
+          : [],
+        decisionsMade: Array.isArray(parsedSummary.decisionsMade)
+          ? parsedSummary.decisionsMade.map(d => String(d).trim()).filter(Boolean)
+          : [],
+        actionItems: Array.isArray(parsedSummary.actionItems)
+          ? parsedSummary.actionItems.map(a => typeof a === 'string' ? { assignee: '', task: a.trim() } : { assignee: String(a.assignee || '').trim(), task: String(a.task || '').trim() }).filter(a => a.task)
+          : []
+      }
+
+      console.log('[Summary Generation]')
+      console.log(`  major_topics=${finalSummary.topicsDiscussed.length}`)
+      console.log(`  summary_sections=${finalSummary.topicsDiscussed.length + 1}`)
     }
 
     const summaryJsonStr = JSON.stringify(finalSummary)
 
-    // 4. Save to meeting_ai_summaries table
+    // 5. Save to meeting_ai_summaries table (replace any existing record)
     await supabase
       .from('meeting_ai_summaries')
       .delete()
@@ -1310,19 +1601,14 @@ REQUIRED JSON OUTPUT SCHEMA:
 
     const { error: insertErr } = await supabase
       .from('meeting_ai_summaries')
-      .insert([
-        {
-          meeting_id: meetingId,
-          summary: summaryJsonStr
-        }
-      ])
+      .insert([{ meeting_id: meetingId, summary: summaryJsonStr }])
 
     if (insertErr) {
       console.error('[Summary Error] Failed to save summary to DB:', insertErr)
       return res.status(500).json({ message: 'Failed to save summary to database.' })
     }
 
-    console.log(`[Summary Success] Generated structured summary for meeting ${meetingId}`)
+    console.log(`[Summary Success] Generated ${meetingType} summary for meeting ${meetingId}`)
     return res.status(200).json({ summary: finalSummary })
   } catch (err) {
     console.error('Generate summary error:', err)

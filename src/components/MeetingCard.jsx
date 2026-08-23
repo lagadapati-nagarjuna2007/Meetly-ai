@@ -40,229 +40,552 @@ export default function MeetingCard({ meeting, index = 0, onDeleted }) {
 
       let summaryObj = summaryData
       if (typeof summaryObj === 'string') {
-        try {
-          summaryObj = JSON.parse(summaryObj)
-        } catch (e) {
-          summaryObj = { overview: summaryData, topicsDiscussed: [], keyPoints: [], decisionsMade: [], actionItems: [] }
-        }
+        try { summaryObj = JSON.parse(summaryObj) }
+        catch (e) { summaryObj = { overview: summaryData, topicsDiscussed: [], keyPoints: [], decisionsMade: [], actionItems: [] } }
       }
 
-      const overviewText = summaryObj.overview || 'No overview available.'
-      const topics = Array.isArray(summaryObj.topicsDiscussed) ? summaryObj.topicsDiscussed : []
-      const keyPoints = Array.isArray(summaryObj.keyPoints) ? summaryObj.keyPoints : []
-      const decisions = Array.isArray(summaryObj.decisionsMade) ? summaryObj.decisionsMade : []
-      const actions = Array.isArray(summaryObj.actionItems) ? summaryObj.actionItems : []
+      const meetingType  = summaryObj.meetingType  || 'General Discussion'
+      const overviewText = summaryObj.overview     || 'No overview available.'
+      const concepts     = Array.isArray(summaryObj.concepts)       ? summaryObj.concepts       : []
+      const topics       = Array.isArray(summaryObj.topicsDiscussed)? summaryObj.topicsDiscussed: []
+      const keyPoints    = Array.isArray(summaryObj.keyPoints)      ? summaryObj.keyPoints      : []
+      const decisions    = Array.isArray(summaryObj.decisionsMade)  ? summaryObj.decisionsMade  : []
+      const actions      = Array.isArray(summaryObj.actionItems)    ? summaryObj.actionItems    : []
+      const techDetails  = Array.isArray(summaryObj.technicalDetails)? summaryObj.technicalDetails: []
+      const issues       = Array.isArray(summaryObj.issuesDiscussed) ? summaryObj.issuesDiscussed: []
+      const nextSteps    = Array.isArray(summaryObj.nextSteps)       ? summaryObj.nextSteps      : []
+      const openQuestions= Array.isArray(summaryObj.openQuestions)   ? summaryObj.openQuestions  : []
 
-      // Generate PDF
+      // ── PDF setup ──────────────────────────────────────────────────────────
       const doc = new jsPDF()
-      const pageHeight = doc.internal.pageSize.height
-      const margin = 20
-      let cursorY = 20
+      const PW       = doc.internal.pageSize.width   // 210 mm
+      const PH       = doc.internal.pageSize.height  // 297 mm
+      const margin   = 18
+      const contentW = PW - margin * 2               // ~174 mm
+      let   Y        = margin
+      let   pageNum  = 1
 
-      const checkOverflow = (needed = 7) => {
-        if (cursorY + needed > pageHeight - margin) {
-          doc.addPage()
-          cursorY = margin
-        }
+      // Add page number footer to current page
+      const stampPageNumber = () => {
+        const prev = { r: doc.getTextColor(), size: doc.getFontSize(), font: doc.getFont() }
+        doc.setFont('helvetica', 'italic')
+        doc.setFontSize(8)
+        doc.setTextColor(148, 163, 184)
+        doc.text(`Page ${pageNum}`, PW - margin, PH - 8, { align: 'right' })
+        doc.setFont(prev.font.fontName, prev.font.fontStyle)
+        doc.setFontSize(prev.size)
+        doc.setTextColor(51, 65, 85)
       }
 
-      // MEETLY AI Header
-      doc.setFont('helvetica', 'bold')
-      doc.setFontSize(22)
-      doc.setTextColor(124, 58, 237) // purple color #7c3aed
-      doc.text('MEETLY AI', margin, cursorY)
-      cursorY += 9
+      // Check overflow and add page if needed
+      const need = (h) => {
+        if (Y + h > PH - margin - 12) {
+          stampPageNumber()
+          doc.addPage()
+          pageNum++
+          Y = margin
+          return true
+        }
+        return false
+      }
 
-      doc.setFontSize(13)
-      doc.setTextColor(100, 116, 139) // Slate gray #64748b
-      doc.text('AI Meeting Summary Report', margin, cursorY)
-      cursorY += 8
+      // Wrapped text helper — returns the new Y after printing
+      const printWrapped = (text, x, startY, maxW, lineH, color = [51, 65, 85]) => {
+        doc.setTextColor(...color)
+        const lines = doc.splitTextToSize(String(text || ''), maxW)
+        lines.forEach((line) => {
+          need(lineH + 2)
+          doc.text(line, x, Y)
+          Y += lineH
+        })
+        return Y
+      }
 
-      // Divider Line
-      doc.setDrawColor(226, 232, 240)
-      doc.setLineWidth(0.5)
-      doc.line(margin, cursorY, 210 - margin, cursorY)
-      cursorY += 10
-
-      // Metadata Block
-      doc.setFont('helvetica', 'bold')
-      doc.setFontSize(10)
-      doc.setTextColor(71, 85, 105)
-      doc.text('Meeting Name:', margin, cursorY)
-      doc.setFont('helvetica', 'normal')
-      doc.text(meeting.name || 'Untitled Meeting', margin + 30, cursorY)
-      cursorY += 7
-
-      doc.setFont('helvetica', 'bold')
-      doc.text('Meeting Date:', margin, cursorY)
-      doc.setFont('helvetica', 'normal')
-      doc.text(meeting.date || 'N/A', margin + 30, cursorY)
-      cursorY += 7
-
-      doc.setFont('helvetica', 'bold')
-      doc.text('Duration:', margin, cursorY)
-      doc.setFont('helvetica', 'normal')
-      doc.text(meeting.duration || 'N/A', margin + 30, cursorY)
-      cursorY += 10
-
-      // Divider Line
-      doc.line(margin, cursorY, 210 - margin, cursorY)
-      cursorY += 10
-
-      // 1. Overview
-      checkOverflow(15)
-      doc.setFont('helvetica', 'bold')
-      doc.setFontSize(11)
-      doc.setTextColor(15, 23, 42)
-      doc.text('1. Overview', margin, cursorY)
-      cursorY += 6
-
-      doc.setFont('helvetica', 'normal')
-      doc.setFontSize(9.5)
-      doc.setTextColor(51, 65, 85)
-      const overviewLines = doc.splitTextToSize(overviewText, 210 - margin * 2)
-      overviewLines.forEach((line) => {
-        checkOverflow(6)
-        doc.text(line, margin, cursorY)
-        cursorY += 5.5
-      })
-      cursorY += 6
-
-      // 2. Topics Discussed
-      checkOverflow(15)
-      doc.setFont('helvetica', 'bold')
-      doc.setFontSize(11)
-      doc.setTextColor(15, 23, 42)
-      doc.text('2. Topics Discussed', margin, cursorY)
-      cursorY += 6
-
-      if (topics.length === 0) {
+      // Section heading helper
+      const sectionHeading = (num, title, topGap = 6) => {
+        need(14)
+        Y += topGap
+        doc.setFillColor(245, 243, 255) // light purple tint
+        doc.roundedRect(margin - 2, Y - 5, contentW + 4, 9, 1, 1, 'F')
+        doc.setFont('helvetica', 'bold')
+        doc.setFontSize(11)
+        doc.setTextColor(88, 28, 135) // purple-900
+        doc.text(num ? `${num}. ${title}` : title, margin + 1, Y)
+        Y += 6
         doc.setFont('helvetica', 'normal')
         doc.setFontSize(9.5)
-        doc.setTextColor(100, 116, 139)
-        doc.text('None identified.', margin, cursorY)
-        cursorY += 6
-      } else {
-        topics.forEach((t) => {
-          checkOverflow(12)
-          doc.setFont('helvetica', 'bold')
-          doc.setFontSize(9.5)
-          doc.setTextColor(15, 23, 42)
-          doc.text(`• ${t.title}`, margin, cursorY)
-          cursorY += 5
-          if (t.description) {
-            doc.setFont('helvetica', 'normal')
-            doc.setTextColor(51, 65, 85)
-            const descLines = doc.splitTextToSize(t.description, 210 - margin * 2 - 6)
-            descLines.forEach((l) => {
-              checkOverflow(5.5)
-              doc.text(l, margin + 5, cursorY)
-              cursorY += 5
+        doc.setTextColor(51, 65, 85)
+      }
+
+      // Sub-heading helper (concept name inside educational)
+      const conceptHeading = (title) => {
+        need(16)
+        Y += 7
+        doc.setFont('helvetica', 'bold')
+        doc.setFontSize(10.5)
+        doc.setTextColor(15, 23, 42)
+        doc.text(title, margin, Y)
+        Y += 1
+        doc.setDrawColor(124, 58, 237)
+        doc.setLineWidth(0.4)
+        doc.line(margin, Y + 1, margin + doc.getTextWidth(title) + 4, Y + 1)
+        Y += 4
+        doc.setFont('helvetica', 'normal')
+        doc.setFontSize(9.5)
+        doc.setLineWidth(0.5)
+        doc.setDrawColor(226, 232, 240)
+        doc.setTextColor(51, 65, 85)
+      }
+
+      // Field label + body block
+      const fieldBlock = (label, text) => {
+        if (!text || text.trim() === '') return
+        need(10)
+        doc.setFont('helvetica', 'bold')
+        doc.setFontSize(9)
+        doc.setTextColor(71, 85, 105)
+        doc.text(label, margin + 4, Y)
+        Y += 4.5
+        doc.setFont('helvetica', 'normal')
+        doc.setFontSize(9.5)
+        printWrapped(text, margin + 4, Y, contentW - 4, 5.2)
+        Y += 2
+      }
+
+      // Bullet list helper
+      const bulletList = (items, indent = 4) => {
+        items.forEach((item) => {
+          const lines = doc.splitTextToSize(`\u2022  ${item}`, contentW - indent)
+          lines.forEach((line, i) => {
+            need(5.5)
+            doc.text(line, margin + (i === 0 ? indent : indent + 4), Y)
+            Y += 5
+          })
+          Y += 0.5
+        })
+      }
+
+      // Code block helper
+      const codeBlock = (code) => {
+        if (!code || code.trim() === '') return
+        const lines = code.split('\n')
+        const boxH = Math.min(lines.length * 5 + 6, 60)
+        need(boxH + 4)
+        doc.setFillColor(30, 30, 30)
+        doc.roundedRect(margin + 2, Y, contentW - 4, boxH, 2, 2, 'F')
+        doc.setFont('courier', 'normal')
+        doc.setFontSize(8.5)
+        doc.setTextColor(187, 255, 187) // light green
+        let cy = Y + 5
+        lines.forEach((line) => {
+          if (cy < Y + boxH - 4) {
+            const wrapped = doc.splitTextToSize(line || ' ', contentW - 12)
+            wrapped.forEach((wl) => {
+              if (cy < Y + boxH - 4) {
+                doc.text(wl, margin + 5, cy)
+                cy += 4.5
+              }
             })
           }
-          cursorY += 2
         })
-      }
-      cursorY += 4
-
-      // 3. Key Points
-      checkOverflow(15)
-      doc.setFont('helvetica', 'bold')
-      doc.setFontSize(11)
-      doc.setTextColor(15, 23, 42)
-      doc.text('3. Key Points', margin, cursorY)
-      cursorY += 6
-
-      doc.setFont('helvetica', 'normal')
-      doc.setFontSize(9.5)
-      doc.setTextColor(51, 65, 85)
-      if (keyPoints.length === 0) {
-        doc.setTextColor(100, 116, 139)
-        doc.text('None identified.', margin, cursorY)
-        cursorY += 6
-      } else {
-        keyPoints.forEach((kp) => {
-          const kpLines = doc.splitTextToSize(`• ${kp}`, 210 - margin * 2)
-          kpLines.forEach((l) => {
-            checkOverflow(5.5)
-            doc.text(l, margin, cursorY)
-            cursorY += 5
-          })
-          cursorY += 1.5
-        })
-      }
-      cursorY += 4
-
-      // 4. Decisions Made
-      checkOverflow(15)
-      doc.setFont('helvetica', 'bold')
-      doc.setFontSize(11)
-      doc.setTextColor(15, 23, 42)
-      doc.text('4. Decisions Made', margin, cursorY)
-      cursorY += 6
-
-      doc.setFont('helvetica', 'normal')
-      doc.setFontSize(9.5)
-      if (decisions.length === 0) {
-        doc.setTextColor(100, 116, 139)
-        doc.text('None identified.', margin, cursorY)
-        cursorY += 6
-      } else {
+        Y += boxH + 3
+        doc.setFont('helvetica', 'normal')
+        doc.setFontSize(9.5)
         doc.setTextColor(51, 65, 85)
-        decisions.forEach((d) => {
-          const dLines = doc.splitTextToSize(`• ${d}`, 210 - margin * 2)
-          dLines.forEach((l) => {
-            checkOverflow(5.5)
-            doc.text(l, margin, cursorY)
-            cursorY += 5
-          })
-          cursorY += 1.5
-        })
       }
-      cursorY += 4
 
-      // 5. Action Items
-      checkOverflow(15)
+      // ── HEADER ─────────────────────────────────────────────────────────────
       doc.setFont('helvetica', 'bold')
-      doc.setFontSize(11)
-      doc.setTextColor(15, 23, 42)
-      doc.text('5. Action Items', margin, cursorY)
-      cursorY += 6
+      doc.setFontSize(22)
+      doc.setTextColor(124, 58, 237)
+      doc.text('MEETLY AI', margin, Y)
+      Y += 9
 
-      doc.setFont('helvetica', 'normal')
-      doc.setFontSize(9.5)
-      if (actions.length === 0) {
-        doc.setTextColor(100, 116, 139)
-        doc.text('None identified.', margin, cursorY)
-        cursorY += 6
-      } else {
-        doc.setTextColor(51, 65, 85)
-        actions.forEach((a) => {
-          const itemText = a.assignee ? `• ${a.assignee} → ${a.task}` : `• ${a.task}`
-          const aLines = doc.splitTextToSize(itemText, 210 - margin * 2)
-          aLines.forEach((l) => {
-            checkOverflow(5.5)
-            doc.text(l, margin, cursorY)
-            cursorY += 5
-          })
-          cursorY += 1.5
-        })
-      }
-      cursorY += 8
+      doc.setFontSize(13)
+      doc.setTextColor(100, 116, 139)
+      const typeLabel = meetingType === 'Educational / Lecture' ? 'Study Notes & Summary'
+                      : meetingType === 'Technical / Development' ? 'Technical Meeting Summary'
+                      : meetingType === 'Business / Professional'  ? 'Meeting Summary Report'
+                      : 'Meeting Summary Report'
+      doc.text(`AI ${typeLabel}`, margin, Y)
+      Y += 4
 
-      // Footer divider
-      checkOverflow(12)
+      // Type badge
+      doc.setFont('helvetica', 'bold')
+      doc.setFontSize(8)
+      doc.setTextColor(124, 58, 237)
+      doc.text(`[ ${meetingType} ]`, margin, Y + 4)
+      Y += 9
+
       doc.setDrawColor(226, 232, 240)
-      doc.line(margin, cursorY, 210 - margin, cursorY)
-      cursorY += 8
+      doc.setLineWidth(0.5)
+      doc.line(margin, Y, PW - margin, Y)
+      Y += 8
 
-      // Footer Note
+      // ── METADATA ───────────────────────────────────────────────────────────
+      const meta = [
+        ['Meeting Name:', meeting.name || 'Untitled Meeting'],
+        ['Date:', meeting.date || 'N/A'],
+        ['Duration:', meeting.duration || 'N/A']
+      ]
+      doc.setFontSize(9.5)
+      meta.forEach(([label, value]) => {
+        doc.setFont('helvetica', 'bold')
+        doc.setTextColor(71, 85, 105)
+        doc.text(label, margin, Y)
+        doc.setFont('helvetica', 'normal')
+        doc.setTextColor(51, 65, 85)
+        doc.text(String(value), margin + 30, Y)
+        Y += 6.5
+      })
+      Y += 2
+      doc.line(margin, Y, PW - margin, Y)
+      Y += 8
+
+      // ── OVERVIEW ───────────────────────────────────────────────────────────
+      sectionHeading('1', 'Overview')
+      Y += 2
+      doc.setFontSize(9.5)
+      printWrapped(overviewText, margin, Y, contentW, 5.2)
+      Y += 4
+
+      // ═══════════════════════════════════════════════════════════════════════
+      // EDUCATIONAL / LECTURE — concept-by-concept study notes
+      // ═══════════════════════════════════════════════════════════════════════
+      if (meetingType === 'Educational / Lecture' && concepts.length > 0) {
+
+        // Table of Contents
+        need(16)
+        sectionHeading('2', 'Table of Contents')
+        Y += 2
+        doc.setFontSize(9.5)
+        doc.setTextColor(51, 65, 85)
+        concepts.forEach((c, i) => {
+          need(6)
+          doc.setFont('helvetica', 'normal')
+          doc.text(`  ${i + 1}.  ${c.name}`, margin + 2, Y)
+          Y += 5.5
+        })
+        Y += 4
+
+        // Concept sections
+        sectionHeading('3', 'Concept Details')
+        Y += 2
+
+        concepts.forEach((concept, idx) => {
+          conceptHeading(`${idx + 1}. ${concept.name}`)
+
+          fieldBlock('Definition:', concept.definition)
+          fieldBlock('Explanation:', concept.explanation)
+          fieldBlock('Purpose / Why it is used:', concept.purpose)
+
+          if (concept.characteristics && concept.characteristics.length > 0) {
+            need(8)
+            doc.setFont('helvetica', 'bold')
+            doc.setFontSize(9)
+            doc.setTextColor(71, 85, 105)
+            doc.text('Characteristics:', margin + 4, Y)
+            Y += 5
+            doc.setFont('helvetica', 'normal')
+            doc.setFontSize(9.5)
+            doc.setTextColor(51, 65, 85)
+            bulletList(concept.characteristics, 8)
+          }
+
+          fieldBlock('Example:', concept.example)
+          fieldBlock('Real-world Analogy:', concept.analogy)
+
+          if (concept.codeExample && concept.codeExample.trim()) {
+            need(10)
+            doc.setFont('helvetica', 'bold')
+            doc.setFontSize(9)
+            doc.setTextColor(71, 85, 105)
+            doc.text('Code / Example:', margin + 4, Y)
+            Y += 5
+            doc.setFont('helvetica', 'normal')
+            codeBlock(concept.codeExample)
+          }
+
+          if (concept.importantPoints && concept.importantPoints.length > 0) {
+            need(8)
+            doc.setFont('helvetica', 'bold')
+            doc.setFontSize(9)
+            doc.setTextColor(71, 85, 105)
+            doc.text('Important Points:', margin + 4, Y)
+            Y += 5
+            doc.setFont('helvetica', 'normal')
+            doc.setFontSize(9.5)
+            doc.setTextColor(51, 65, 85)
+            bulletList(concept.importantPoints, 8)
+          }
+
+          if (concept.questionsRaised && concept.questionsRaised.length > 0) {
+            need(8)
+            doc.setFont('helvetica', 'bold')
+            doc.setFontSize(9)
+            doc.setTextColor(71, 85, 105)
+            doc.text('Questions / Doubts Raised:', margin + 4, Y)
+            Y += 5
+            doc.setFont('helvetica', 'normal')
+            doc.setFontSize(9.5)
+            doc.setTextColor(100, 116, 139)
+            bulletList(concept.questionsRaised, 8)
+          }
+
+          Y += 2
+          // Light separator between concepts
+          if (idx < concepts.length - 1) {
+            need(4)
+            doc.setDrawColor(226, 232, 240)
+            doc.setLineWidth(0.3)
+            doc.line(margin + 10, Y, PW - margin - 10, Y)
+            Y += 4
+          }
+        })
+
+        // Key Takeaways (educational)
+        if (keyPoints.length > 0) {
+          sectionHeading('4', 'Key Takeaways')
+          Y += 2
+          doc.setFont('helvetica', 'normal')
+          doc.setFontSize(9.5)
+          doc.setTextColor(51, 65, 85)
+          bulletList(keyPoints)
+        }
+
+      // ═══════════════════════════════════════════════════════════════════════
+      // TECHNICAL / DEVELOPMENT
+      // ═══════════════════════════════════════════════════════════════════════
+      } else if (meetingType === 'Technical / Development') {
+        let sn = 2
+
+        if (topics.length > 0) {
+          sectionHeading(sn++, 'Topics Discussed')
+          Y += 2
+          topics.forEach((t) => {
+            need(10)
+            doc.setFont('helvetica', 'bold')
+            doc.setFontSize(9.5)
+            doc.setTextColor(15, 23, 42)
+            doc.text(`\u25B6  ${t.title}`, margin, Y)
+            Y += 5
+            if (t.description) {
+              doc.setFont('helvetica', 'normal')
+              doc.setTextColor(51, 65, 85)
+              printWrapped(t.description, margin + 5, Y, contentW - 5, 5.2)
+              Y += 2
+            }
+          })
+          Y += 2
+        }
+
+        if (techDetails.length > 0) {
+          sectionHeading(sn++, 'Technical Details')
+          Y += 2
+          techDetails.forEach((td) => {
+            need(10)
+            if (td.area) {
+              doc.setFont('helvetica', 'bold')
+              doc.setFontSize(9)
+              doc.setTextColor(71, 85, 105)
+              doc.text(`[${td.area}]`, margin + 2, Y)
+              Y += 5
+            }
+            doc.setFont('helvetica', 'normal')
+            doc.setFontSize(9.5)
+            doc.setTextColor(51, 65, 85)
+            printWrapped(td.detail, margin + 4, Y, contentW - 4, 5.2)
+            if (td.codeOrExample && td.codeOrExample.trim()) {
+              codeBlock(td.codeOrExample)
+            }
+            Y += 2
+          })
+        }
+
+        if (issues.length > 0) {
+          sectionHeading(sn++, 'Issues Discussed')
+          Y += 2
+          doc.setFont('helvetica', 'normal')
+          doc.setFontSize(9.5)
+          bulletList(issues)
+        }
+
+        if (keyPoints.length > 0) {
+          sectionHeading(sn++, 'Key Points')
+          Y += 2
+          doc.setFont('helvetica', 'normal')
+          doc.setFontSize(9.5)
+          bulletList(keyPoints)
+        }
+
+        if (decisions.length > 0) {
+          sectionHeading(sn++, 'Decisions Made')
+          Y += 2
+          doc.setFont('helvetica', 'normal')
+          doc.setFontSize(9.5)
+          bulletList(decisions)
+        }
+
+        if (actions.length > 0) {
+          sectionHeading(sn++, 'Action Items')
+          Y += 2
+          doc.setFont('helvetica', 'normal')
+          doc.setFontSize(9.5)
+          actions.forEach((a) => {
+            const text = a.assignee ? `${a.assignee}  \u2192  ${a.task}` : a.task
+            const lines = doc.splitTextToSize(`\u2022  ${text}`, contentW)
+            lines.forEach((line) => {
+              need(5.5)
+              doc.text(line, margin + 4, Y)
+              Y += 5
+            })
+            Y += 0.5
+          })
+        }
+
+        if (nextSteps.length > 0) {
+          sectionHeading(sn++, 'Next Steps')
+          Y += 2
+          doc.setFont('helvetica', 'normal')
+          doc.setFontSize(9.5)
+          bulletList(nextSteps)
+        }
+
+      // ═══════════════════════════════════════════════════════════════════════
+      // BUSINESS / PROFESSIONAL
+      // ═══════════════════════════════════════════════════════════════════════
+      } else if (meetingType === 'Business / Professional') {
+        let sn = 2
+
+        if (topics.length > 0) {
+          sectionHeading(sn++, 'Topics Discussed')
+          Y += 2
+          topics.forEach((t) => {
+            need(10)
+            doc.setFont('helvetica', 'bold')
+            doc.setFontSize(9.5)
+            doc.setTextColor(15, 23, 42)
+            doc.text(`\u25B6  ${t.title}`, margin, Y)
+            Y += 5
+            if (t.description) {
+              doc.setFont('helvetica', 'normal')
+              doc.setTextColor(51, 65, 85)
+              printWrapped(t.description, margin + 5, Y, contentW - 5, 5.2)
+              Y += 2
+            }
+          })
+          Y += 2
+        }
+
+        if (keyPoints.length > 0) {
+          sectionHeading(sn++, 'Key Points')
+          Y += 2
+          doc.setFont('helvetica', 'normal')
+          doc.setFontSize(9.5)
+          bulletList(keyPoints)
+        }
+
+        if (decisions.length > 0) {
+          sectionHeading(sn++, 'Decisions Made')
+          Y += 2
+          doc.setFont('helvetica', 'normal')
+          doc.setFontSize(9.5)
+          bulletList(decisions)
+        }
+
+        if (actions.length > 0) {
+          sectionHeading(sn++, 'Action Items')
+          Y += 2
+          doc.setFont('helvetica', 'normal')
+          doc.setFontSize(9.5)
+          actions.forEach((a) => {
+            const parts = [a.assignee && `Owner: ${a.assignee}`, a.task, a.deadline && `Due: ${a.deadline}`].filter(Boolean)
+            const lines = doc.splitTextToSize(`\u2022  ${parts.join('  |  ')}`, contentW)
+            lines.forEach((line) => { need(5.5); doc.text(line, margin + 4, Y); Y += 5 })
+            Y += 0.5
+          })
+        }
+
+        if (openQuestions.length > 0) {
+          sectionHeading(sn++, 'Open Questions')
+          Y += 2
+          doc.setFont('helvetica', 'normal')
+          doc.setFontSize(9.5)
+          doc.setTextColor(100, 116, 139)
+          bulletList(openQuestions)
+          doc.setTextColor(51, 65, 85)
+        }
+
+      // ═══════════════════════════════════════════════════════════════════════
+      // GENERAL DISCUSSION (and fallback for educational with no concepts)
+      // ═══════════════════════════════════════════════════════════════════════
+      } else {
+        let sn = 2
+
+        if (topics.length > 0) {
+          sectionHeading(sn++, 'Topics Discussed')
+          Y += 2
+          topics.forEach((t) => {
+            need(10)
+            doc.setFont('helvetica', 'bold')
+            doc.setFontSize(9.5)
+            doc.setTextColor(15, 23, 42)
+            doc.text(`\u2022  ${t.title}`, margin, Y)
+            Y += 5
+            if (t.description) {
+              doc.setFont('helvetica', 'normal')
+              doc.setTextColor(51, 65, 85)
+              printWrapped(t.description, margin + 5, Y, contentW - 5, 5.2)
+              Y += 2
+            }
+          })
+          Y += 2
+        }
+
+        if (keyPoints.length > 0) {
+          sectionHeading(sn++, 'Key Points')
+          Y += 2
+          doc.setFont('helvetica', 'normal')
+          doc.setFontSize(9.5)
+          bulletList(keyPoints)
+        }
+
+        if (decisions.length > 0) {
+          sectionHeading(sn++, 'Decisions Made')
+          Y += 2
+          doc.setFont('helvetica', 'normal')
+          doc.setFontSize(9.5)
+          bulletList(decisions)
+        }
+
+        if (actions.length > 0) {
+          sectionHeading(sn++, 'Action Items')
+          Y += 2
+          doc.setFont('helvetica', 'normal')
+          doc.setFontSize(9.5)
+          actions.forEach((a) => {
+            const text = a.assignee ? `${a.assignee}  \u2192  ${a.task}` : a.task
+            const lines = doc.splitTextToSize(`\u2022  ${text}`, contentW)
+            lines.forEach((line) => { need(5.5); doc.text(line, margin + 4, Y); Y += 5 })
+            Y += 0.5
+          })
+        }
+      }
+
+      // ── FOOTER on last page ────────────────────────────────────────────────
+      need(16)
+      Y += 6
+      doc.setDrawColor(226, 232, 240)
+      doc.setLineWidth(0.5)
+      doc.line(margin, Y, PW - margin, Y)
+      Y += 7
       doc.setFont('helvetica', 'italic')
       doc.setFontSize(9)
       doc.setTextColor(148, 163, 184)
-      doc.text('Generated by Meetly AI Platform', margin, cursorY)
+      doc.text('Generated by Meetly AI Platform', margin, Y)
+      stampPageNumber()
 
-      // Download file automatically
+      // Download
       const safeTitle = (meeting.name || 'meeting').toLowerCase().replace(/[^a-z0-9]+/g, '_')
       doc.save(`meetly_summary_${safeTitle}.pdf`)
       showToast('Meeting summary downloaded successfully.', 'success')
