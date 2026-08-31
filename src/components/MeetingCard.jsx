@@ -64,35 +64,41 @@ export default function MeetingCard({ meeting, index = 0, onDeleted }) {
       const sanitize = (text) => {
         if (text == null) return ''
         return String(text)
-          // ── Soft-hyphen (U+00AD) → visible ASCII hyphen
-          // This is the #1 cause of "object oriented" instead of "object-oriented"
+          // ── Soft-hyphen (U+00AD) → visible ASCII hyphen (object-oriented, compile-time, etc.)
           .replace(/\u00AD/g, '-')
           // ── Unicode hyphen variants → ASCII hyphen
           .replace(/[\u2010\u2011\u2012\u2212\uFE58\uFE63\uFF0D]/g, '-')
-          // ── Dashes → ASCII hyphen
+          // ── Dashes & horizontal bars → ASCII hyphen
           .replace(/[\u2013\u2014\u2015]/g, '-')
           // ── Smart/curly quotes → straight quotes
-          .replace(/[\u2018\u2019\u02BC]/g, "'")
-          .replace(/[\u201C\u201D\u201E\u201F]/g, '"')
+          .replace(/[\u2018\u2019\u02BC\u201A\u201B]/g, "'")
+          .replace(/[\u201C\u201D\u201E\u201F\u00AB\u00BB]/g, '"')
           // ── Ellipsis → three dots
           .replace(/\u2026/g, '...')
-          // ── Bullet → ASCII asterisk (jsPDF WinAnsi cannot render U+2022)
-          .replace(/\u2022/g, '*')
+          // ── Bullets → ASCII asterisk (jsPDF WinAnsi cannot render U+2022)
+          .replace(/[\u2022\u2023\u25E6\u2043\u2219]/g, '*')
           // ── Arrows → ASCII equivalents
-          .replace(/\u2192/g, '->').replace(/\u2190/g, '<-').replace(/\u2194/g, '<->')
-          // ── Triangles → ASCII
-          .replace(/[\u25B6\u25BA\u25B8]/g, '>')
+          .replace(/[\u2192\u2794\u279C\u21D2]/g, '->')
+          .replace(/[\u2190\u21D0]/g, '<-')
+          .replace(/[\u2194\u21D4]/g, '<->')
+          // ── Triangles & pointers → ASCII >
+          .replace(/[\u25B6\u25BA\u25B8\u25C0\u25C4\u25C2]/g, '>')
+          // ── Checkmarks & icons → ASCII
+          .replace(/[\u2713\u2714]/g, '[v]')
+          .replace(/[\u2717\u2718]/g, '[x]')
           // ── Non-breaking / exotic spaces → regular space
-          .replace(/[\u00A0\u202F\u2009\u2007\u2006\u2005\u2004\u2003\u2002\u2001\u2000]/g, ' ')
+          .replace(/[\u00A0\u202F\u2009\u2007\u2006\u2005\u2004\u2003\u2002\u2001\u2000\u3000]/g, ' ')
           // ── Strip remaining non-Latin-1 chars that jsPDF WinAnsi encoding cannot render
-          // But first: preserve all printable Latin-1 (U+0020–U+00FF) and common control chars
+          // Preserves printable ASCII (U+0020–U+007E) and Latin-1 supplement (U+00A0–U+00FF) and standard whitespace
           .replace(/[^\x09\x0A\x0D\x20-\x7E\xA0-\xFF]/g, '')
           // ── Collapse multiple spaces
-          .replace(/ {2,}/g, ' ')
+          .replace(/[ \t]{2,}/g, ' ')
+          // ── Collapse multiple consecutive hyphens into single hyphen
+          .replace(/-{2,}/g, '-')
           .trim()
       }
 
-            // ── PDF setup ──────────────────────────────────────────────────────────
+      // ── PDF setup ──────────────────────────────────────────────────────────
       const doc = new jsPDF()
       const PW       = doc.internal.pageSize.width   // 210 mm
       const PH       = doc.internal.pageSize.height  // 297 mm
@@ -125,10 +131,11 @@ export default function MeetingCard({ meeting, index = 0, onDeleted }) {
         return false
       }
 
-      // Wrapped text helper — returns the new Y after printing
+      // Wrapped text helper — sanitizes text internally and returns the new Y after printing
       const printWrapped = (text, x, startY, maxW, lineH, color = [51, 65, 85]) => {
         doc.setTextColor(...color)
-        const lines = doc.splitTextToSize(String(text || ''), maxW)
+        const safeText = sanitize(text)
+        const lines = doc.splitTextToSize(safeText, maxW)
         lines.forEach((line) => {
           need(lineH + 2)
           doc.text(line, x, Y)
@@ -139,6 +146,7 @@ export default function MeetingCard({ meeting, index = 0, onDeleted }) {
 
       // Section heading helper
       const sectionHeading = (num, title, topGap = 6) => {
+        const cleanTitle = sanitize(title)
         need(14)
         Y += topGap
         doc.setFillColor(245, 243, 255) // light purple tint
@@ -146,7 +154,7 @@ export default function MeetingCard({ meeting, index = 0, onDeleted }) {
         doc.setFont('helvetica', 'bold')
         doc.setFontSize(11)
         doc.setTextColor(88, 28, 135) // purple-900
-        doc.text(num ? `${num}. ${title}` : title, margin + 1, Y)
+        doc.text(num ? `${num}. ${cleanTitle}` : cleanTitle, margin + 1, Y)
         Y += 6
         doc.setFont('helvetica', 'normal')
         doc.setFontSize(9.5)
@@ -176,7 +184,9 @@ export default function MeetingCard({ meeting, index = 0, onDeleted }) {
 
       // Field label + body block
       const fieldBlock = (label, text) => {
-        if (!text || text.trim() === '') return
+        if (!text || String(text).trim() === '') return
+        const cleanText = sanitize(text)
+        if (!cleanText) return
         need(10)
         doc.setFont('helvetica', 'bold')
         doc.setFontSize(9)
@@ -185,14 +195,16 @@ export default function MeetingCard({ meeting, index = 0, onDeleted }) {
         Y += 4.5
         doc.setFont('helvetica', 'normal')
         doc.setFontSize(9.5)
-        printWrapped(sanitize(text), margin + 4, Y, contentW - 4, 5.2)
+        printWrapped(cleanText, margin + 4, Y, contentW - 4, 5.2)
         Y += 2
       }
 
       // Bullet list helper
       const bulletList = (items, indent = 4) => {
+        if (!Array.isArray(items)) return
         items.forEach((item) => {
           const cleanItem = sanitize(item)
+          if (!cleanItem) return
           const lines = doc.splitTextToSize('*  ' + cleanItem, contentW - indent)
           lines.forEach((line, i) => {
             need(5.5)
@@ -203,9 +215,9 @@ export default function MeetingCard({ meeting, index = 0, onDeleted }) {
         })
       }
 
-      // Code block helper
+      // Code block helper with robust multi-page splitting
       const codeBlock = (code) => {
-        if (!code || code.trim() === '') return
+        if (!code || String(code).trim() === '') return
         const cleanCode = sanitize(code)
         const codeLines = cleanCode.split('\n')
         // Expand wrapped lines
@@ -218,20 +230,28 @@ export default function MeetingCard({ meeting, index = 0, onDeleted }) {
         })
 
         const lineH = 4.5
-        const pad = 5
-        const maxLinesPerBox = Math.floor((PH - margin * 2 - 20) / lineH) // max lines that fit one page
+        const pad = 4
         let idx = 0
 
         while (idx < allWrapped.length) {
-          // How many lines fit on this page?
+          // If less than 2 lines fit on this page, start on a fresh page
           const spaceLeft = PH - margin - 12 - Y
-          let fitLines = Math.max(3, Math.floor((spaceLeft - pad * 2) / lineH))
+          if (spaceLeft < pad * 2 + lineH * 2) {
+            stampPageNumber()
+            doc.addPage()
+            pageNum++
+            Y = margin
+          }
+
+          const currentSpaceLeft = PH - margin - 12 - Y
+          let fitLines = Math.floor((currentSpaceLeft - pad * 2) / lineH)
+          if (fitLines < 1) fitLines = 1
           if (fitLines > allWrapped.length - idx) fitLines = allWrapped.length - idx
 
           const batchLines = allWrapped.slice(idx, idx + fitLines)
           const boxH = batchLines.length * lineH + pad * 2
 
-          // Draw background
+          // Draw dark background box
           doc.setFillColor(30, 30, 30)
           doc.roundedRect(margin + 2, Y, contentW - 4, boxH, 2, 2, 'F')
 
@@ -239,7 +259,7 @@ export default function MeetingCard({ meeting, index = 0, onDeleted }) {
           doc.setFont('courier', 'normal')
           doc.setFontSize(8.5)
           doc.setTextColor(187, 255, 187) // light green
-          let cy = Y + pad
+          let cy = Y + pad + lineH * 0.75
           batchLines.forEach((wl) => {
             doc.text(wl, margin + 5, cy)
             cy += lineH
@@ -248,7 +268,7 @@ export default function MeetingCard({ meeting, index = 0, onDeleted }) {
           Y += boxH + 3
           idx += fitLines
 
-          // If more code remains, add a new page
+          // If more code remains, advance page
           if (idx < allWrapped.length) {
             stampPageNumber()
             doc.addPage()
@@ -452,7 +472,7 @@ export default function MeetingCard({ meeting, index = 0, onDeleted }) {
                 doc.setFont('helvetica', 'normal')
                 doc.setFontSize(9.5)
                 doc.setTextColor(51, 65, 85)
-                bulletList(st.importantPoints.map(p => sanitize(p)), 12)
+                bulletList(st.importantPoints, 12)
               }
 
               Y += 2

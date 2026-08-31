@@ -1170,7 +1170,121 @@ export const submitTranscriptChunk = async (req, res) => {
   }
 }
 
-// 14. GENERATE SUMMARY (meeting-type-aware, detail-preserving)
+/**
+ * Call summary LLM with NVIDIA NIM (Nemotron 3 Ultra) as primary provider,
+ * and Groq as optional fallback.
+ * 
+ * Safe rules:
+ * - Reads NVIDIA_API_KEY, NVIDIA_MODEL, NVIDIA_BASE_URL from process.env
+ * - Model default: nvidia/nemotron-3-ultra-550b-a55b
+ * - Base URL default: https://integrate.api.nvidia.com/v1
+ * - Conservative output token limits
+ * - Never log API keys or authentication secrets
+ * - Logs provider=NVIDIA or provider=GROQ_FALLBACK
+ * - Safe single fallback without infinite retry loops
+ */
+const callSummaryLLM = async ({ messages, temperature = 0.2, maxTokens = 6000, transcriptChars = 0, isJson = true }) => {
+  const nvidiaApiKey = process.env.NVIDIA_API_KEY
+  const nvidiaModel = process.env.NVIDIA_MODEL || 'nvidia/nemotron-3-ultra-550b-a55b'
+  const nvidiaBaseUrl = (process.env.NVIDIA_BASE_URL || 'https://integrate.api.nvidia.com/v1').replace(/\/+$/, '')
+  const groqApiKey = process.env.GROQ_API_KEY
+
+  let lastError = null
+
+  // ── 1. Try NVIDIA NIM (Primary Provider) ──────────────────────────────────
+  if (nvidiaApiKey && nvidiaApiKey.trim()) {
+    try {
+      console.log(`[Summary Generation] Dispatching request to primary provider=NVIDIA model=${nvidiaModel} transcript_chars=${transcriptChars}`)
+
+      const payload = {
+        model: nvidiaModel,
+        messages,
+        temperature,
+        max_tokens: maxTokens
+      }
+      if (isJson) {
+        payload.response_format = { type: 'json_object' }
+      }
+
+      const res = await fetch(`${nvidiaBaseUrl}/chat/completions`, {
+        method: 'POST',
+        headers: {
+          'Authorization': `Bearer ${nvidiaApiKey}`,
+          'Content-Type': 'application/json'
+        },
+        body: JSON.stringify(payload)
+      })
+
+      if (res.ok) {
+        const data = await res.json()
+        const content = data.choices?.[0]?.message?.content || ''
+        if (content) {
+          console.log(`[Summary Generation] provider=NVIDIA model=${nvidiaModel} transcript_chars=${transcriptChars} status=success`)
+          return { content, provider: 'NVIDIA' }
+        }
+        throw new Error('NVIDIA API returned empty message content.')
+      } else {
+        const errText = await res.text().catch(() => '')
+        console.warn(`[Summary Generation] provider=NVIDIA model=${nvidiaModel} transcript_chars=${transcriptChars} status=failed http_status=${res.status}`)
+        lastError = new Error(`NVIDIA API HTTP ${res.status}: ${errText.slice(0, 200)}`)
+      }
+    } catch (err) {
+      console.warn(`[Summary Generation] provider=NVIDIA model=${nvidiaModel} transcript_chars=${transcriptChars} status=failed error="${err.message}"`)
+      lastError = err
+    }
+  } else {
+    console.warn('[Summary Generation] NVIDIA_API_KEY is not configured. Checking for fallback provider...')
+    lastError = new Error('NVIDIA_API_KEY not configured')
+  }
+
+  // ── 2. Fallback to Groq (Only if available & safe) ─────────────────────────
+  if (groqApiKey && groqApiKey.trim()) {
+    try {
+      const groqModel = 'openai/gpt-oss-120b'
+      console.log(`[Summary Generation] Attempting fallback provider=GROQ_FALLBACK model=${groqModel} transcript_chars=${transcriptChars}`)
+
+      const payload = {
+        model: groqModel,
+        messages,
+        temperature: Math.min(temperature, 0.1),
+        max_tokens: Math.min(maxTokens, 4000)
+      }
+      if (isJson) {
+        payload.response_format = { type: 'json_object' }
+      }
+
+      const groqRes = await fetch('https://api.groq.com/openai/v1/chat/completions', {
+        method: 'POST',
+        headers: {
+          'Authorization': `Bearer ${groqApiKey}`,
+          'Content-Type': 'application/json'
+        },
+        body: JSON.stringify(payload)
+      })
+
+      if (groqRes.ok) {
+        const groqData = await groqRes.json()
+        const content = groqData.choices?.[0]?.message?.content || ''
+        if (content) {
+          console.log(`[Summary Generation] provider=GROQ_FALLBACK model=${groqModel} transcript_chars=${transcriptChars} status=success`)
+          return { content, provider: 'GROQ_FALLBACK' }
+        }
+        throw new Error('Groq fallback returned empty message content.')
+      } else {
+        const errText = await groqRes.text().catch(() => '')
+        console.error(`[Summary Generation] provider=GROQ_FALLBACK status=failed http_status=${groqRes.status}`)
+        throw new Error(`Groq fallback HTTP ${groqRes.status}: ${errText.slice(0, 200)}`)
+      }
+    } catch (groqErr) {
+      console.error(`[Summary Generation] provider=GROQ_FALLBACK status=failed error="${groqErr.message}"`)
+      throw lastError || groqErr
+    }
+  }
+
+  throw lastError || new Error('No LLM provider available on the server.')
+}
+
+// 14. GENERATE SUMMARY (meeting-type-aware, detail-preserving, NVIDIA primary)
 export const generateSummary = async (req, res) => {
   try {
     const { meetingId } = req.body
@@ -1178,9 +1292,11 @@ export const generateSummary = async (req, res) => {
       return res.status(400).json({ message: 'Meeting ID is required.' })
     }
 
-    const apiKey = process.env.GROQ_API_KEY
-    if (!apiKey) {
-      return res.status(500).json({ message: 'Groq API key not configured on server.' })
+    const nvidiaApiKey = process.env.NVIDIA_API_KEY
+    const groqApiKey = process.env.GROQ_API_KEY
+    if (!nvidiaApiKey && !groqApiKey) {
+      console.error('[Summary Configuration Error] Neither NVIDIA_API_KEY nor GROQ_API_KEY is configured on the server.')
+      return res.status(500).json({ message: 'AI summary generator is not configured on the server.' })
     }
 
     // 1. Fetch transcripts ordered by created_at ASC
@@ -1203,26 +1319,18 @@ export const generateSummary = async (req, res) => {
       .map(c => `${c.speaker_name}: ${c.transcript}`)
       .join('\n')
 
-    console.log('[Summary Generation]')
+    console.log('[Summary Generation Request]')
+    console.log(`  meeting_id=${meetingId}`)
     console.log(`  transcript_chunks=${chunks.length}`)
     console.log(`  transcript_length=${transcriptText.length} chars`)
 
-    const groqHeaders = {
-      'Authorization': `Bearer ${apiKey}`,
-      'Content-Type': 'application/json'
-    }
-
     // ── STEP 1: Classify meeting type ────────────────────────────────────────
-    const classifyRes = await fetch('https://api.groq.com/openai/v1/chat/completions', {
-      method: 'POST',
-      headers: groqHeaders,
-      body: JSON.stringify({
-        model: 'openai/gpt-oss-120b',
-        response_format: { type: 'json_object' },
-        messages: [
-          {
-            role: 'system',
-            content: `You are a meeting classifier. Read the transcript and output ONLY {"meetingType": "<value>"}.
+    let meetingType = 'General Discussion'
+    try {
+      const classifyMessages = [
+        {
+          role: 'system',
+          content: `You are a meeting classifier. Read the transcript and output ONLY {"meetingType": "<value>"}.
 
 Choose exactly one value:
 - "Educational / Lecture" — Any class, lecture, tutorial, study session, or teaching/learning meeting. Signs: explaining OOP, Java, Python, algorithms, data structures, science, math, access modifiers, inheritance, polymorphism, encapsulation, abstraction, or any educational subject. A speaker teaching learners, explaining "what is X", "definition of X", "types of X", "four pillars", "advantages of X". This is the MOST COMMON type — use it whenever someone is teaching or explaining concepts.
@@ -1232,28 +1340,29 @@ Choose exactly one value:
 
 CRITICAL: A Java/OOP/programming lecture IS "Educational / Lecture", NOT "Technical / Development". Teaching sessions are always "Educational / Lecture".
 
-Output ONLY: {"meetingType": "<one of the four values above>"}`
-          },
-          {
-            role: 'user',
-            content: `Transcript (first 5000 chars):\n${transcriptText.slice(0, 5000)}`
-          }
-        ],
-        temperature: 0.0,
-        max_tokens: 50
-      })
-    })
-
-    let meetingType = 'General Discussion'
-    if (classifyRes.ok) {
-      try {
-        const classifyResult = await classifyRes.json()
-        const raw = classifyResult.choices?.[0]?.message?.content || '{}'
-        const parsed = JSON.parse(raw.replace(/```json/gi, '').replace(/```/g, '').trim())
-        if (parsed.meetingType && typeof parsed.meetingType === 'string') {
-          meetingType = parsed.meetingType
+Output ONLY valid JSON: {"meetingType": "<one of the four values above>"}`
+        },
+        {
+          role: 'user',
+          content: `Transcript (first 5000 chars):\n${transcriptText.slice(0, 5000)}`
         }
-      } catch (_) {}
+      ]
+
+      const classifyResult = await callSummaryLLM({
+        messages: classifyMessages,
+        temperature: 0.0,
+        maxTokens: 100,
+        transcriptChars: transcriptText.length,
+        isJson: true
+      })
+
+      const rawClassify = classifyResult.content || '{}'
+      const parsedClassify = JSON.parse(rawClassify.replace(/```json/gi, '').replace(/```/g, '').trim())
+      if (parsedClassify.meetingType && typeof parsedClassify.meetingType === 'string') {
+        meetingType = parsedClassify.meetingType
+      }
+    } catch (classifyErr) {
+      console.warn('[Summary Classification Warning] Defaulting to General Discussion:', classifyErr.message)
     }
 
     console.log('[Summary Type]')
@@ -1266,36 +1375,25 @@ Output ONLY: {"meetingType": "<one of the four values above>"}`
     if (meetingType === 'Educational / Lecture') {
       systemPrompt = `You are an expert educational content analyst and note-taker.
 
-Your task: analyze this educational transcript and produce DETAILED STUDY NOTES in JSON format.
+Your task: analyze this educational transcript and produce DETAILED, HIGHLY STRUCTURED STUDY NOTES in JSON format.
 
-ANTI-HALLUCINATION RULES:
-- ONLY include content ACTUALLY discussed in the transcript. Never invent definitions, examples, code, or analogies.
-- If a concept was explained in detail, preserve ALL that detail. If mentioned briefly, be brief.
-- Do NOT add information that was NOT said in the transcript.
-- If no definition was given for something, write "Not explicitly defined in the meeting." — do NOT make one up.
-- If no example was given, write "" — do NOT fabricate one.
+ANTI-HALLUCINATION RULES (STRICT):
+- ONLY include concepts, definitions, and examples ACTUALLY discussed in the transcript. Never fabricate definitions, code, or analogies.
+- If a topic was mentioned but no definition was given: write "Not explicitly explained in the meeting."
+- If no specific example was discussed: write "No specific example was provided in the meeting." or leave empty string "".
+- Do NOT add outside textbook knowledge that was not mentioned in the transcript.
 
-MANDATORY STRUCTURE RULES:
-1. Create one concept entry per DISTINCT CONCEPT explained by the speaker.
-   - Example: if the speaker explains Abstraction, Encapsulation, Inheritance, and Polymorphism, create 4 SEPARATE concept entries.
-
-2. subtypes[] IS MANDATORY whenever the speaker lists or enumerates items belonging to a concept:
-   - "X has N types/pillars/categories/methods/forms/stages/components/kinds/levels" → you MUST create N subtypes[] entries.
-   - "There are two types of polymorphism" → subtypes[] with 2 entries.
-   - "OOP has four pillars" → subtypes[] with 4 entries.
-   - "Access modifiers are: public, private, protected, default" → subtypes[] with 4 entries.
-   - "Advantages of X are: A, B, C" → subtypes[] with 3 entries.
-   - NEVER describe multiple enumerated items inside a single "explanation" string.
-   - NEVER write "X has two types: A and B, where A is... and B is..." in the explanation field.
-   - If items are enumerated, they MUST go into subtypes[], each with its own name, definition, explanation.
-
-3. Each subtype entry must have its OWN fields filled based on what the speaker said about THAT specific item.
-
-4. Preserve the ORDER in which concepts were introduced.
-
-5. Leave fields as "" or [] when the speaker did not discuss them. Never fill them with invented content.
-
-6. Use plain ASCII hyphens (-) not Unicode dashes. Write "object-oriented" not "object\u00ADoriented".
+MANDATORY ENUMERATION & SUBTYPES RULES:
+1. Whenever the speaker introduces a major concept or pillar (e.g. Abstraction, Encapsulation, Inheritance, Polymorphism, Access Modifiers), create a distinct entry in concepts[].
+2. Whenever the speaker lists multiple types, categories, pillars, forms, methods, stages, components, or classifications:
+   - YOU MUST create separate individual structured entries in subtypes[].
+   - Example 1: "There are two types of polymorphism: method overloading and method overriding" → create 2 individual subtype entries in subtypes[]: one for Method Overloading and one for Method Overriding.
+   - Example 2: "OOP has four pillars: abstraction, encapsulation, inheritance, polymorphism" → create distinct concept entries or subtype entries for all 4 pillars.
+   - Example 3: "Access specifiers have four types: public, private, protected, default" → create 4 individual subtype entries in subtypes[].
+   - NEVER collapse or flatten enumerated items into a single paragraph or explanation string.
+   - NEVER write "Polymorphism has two types: method overloading and method overriding, where..." inside a single explanation field.
+3. Keep definitions, explanations, examples, and important points separate in their own distinct fields.
+4. Use plain ASCII hyphens (-) for hyphenated words: "object-oriented", "compile-time", "runtime", "method-overloading".
 
 REQUIRED JSON SCHEMA:
 {
@@ -1303,25 +1401,25 @@ REQUIRED JSON SCHEMA:
   "overview": "2-4 sentence summary of what the session covered.",
   "concepts": [
     {
-      "name": "Concept Name",
+      "name": "Concept Name (e.g. Object-Oriented Programming)",
       "overview": "1-2 sentence intro if the speaker gave one before sub-items. Empty string otherwise.",
-      "definition": "Definition as given in transcript. Empty string if not defined.",
-      "explanation": "Detailed explanation. Leave EMPTY if the concept's content is fully represented in subtypes[].",
+      "definition": "Definition from transcript. If not explicitly defined, write 'Not explicitly explained in the meeting.'",
+      "explanation": "Detailed explanation from transcript. Leave empty string if fully covered in subtypes.",
       "purpose": "Why it is used / what problem it solves, if discussed. Empty string if not.",
       "characteristics": ["characteristic 1"],
-      "example": "Any real-world example discussed. Empty string if none.",
+      "example": "Real-world or code example if discussed. If not discussed, write 'No specific example was provided in the meeting.'",
       "analogy": "Any analogy used. Empty string if none.",
-      "codeExample": "Code or pseudocode from the transcript. Empty string if none.",
+      "codeExample": "Code or pseudocode mentioned in the transcript. Empty string if none.",
       "importantPoints": ["important point 1"],
       "questionsRaised": ["question or doubt raised, if any"],
       "subtypes": [
         {
-          "name": "1. Subtype Name (e.g. Compile-Time Polymorphism)",
-          "definition": "Definition of this subtype as discussed.",
+          "name": "1. Subtype Name (e.g. Method Overloading)",
+          "definition": "Definition of this subtype as discussed. If not explicitly explained, write 'Not explicitly explained in the meeting.'",
           "explanation": "Detailed explanation of this subtype.",
           "howAchieved": "How this subtype is achieved/implemented (if discussed). Empty string if not.",
-          "example": "Example from the transcript. Empty string if none.",
-          "codeExample": "Code example. Empty string if none.",
+          "example": "Example from the transcript. If none discussed, write 'No specific example was provided in the meeting.'",
+          "codeExample": "Code example from transcript. Empty string if none.",
           "importantPoints": ["important point about this subtype"]
         }
       ]
@@ -1336,41 +1434,7 @@ REQUIRED JSON SCHEMA:
   ],
   "decisionsMade": [],
   "actionItems": []
-}
-
-EXAMPLES OF CORRECT vs WRONG STRUCTURE:
-
-WRONG — enumerated items compressed into explanation:
-{"name": "Polymorphism", "explanation": "Polymorphism has two types: compile-time (method overloading) and runtime (method overriding). Compile-time polymorphism is achieved through..."}
-
-CORRECT — each type is a separate subtype entry:
-{"name": "Polymorphism", "overview": "Polymorphism means one name, multiple forms.", "explanation": "", "subtypes": [
-  {"name": "1. Compile-Time Polymorphism", "definition": "Resolved at compile time.", "howAchieved": "Method overloading", "example": "...", "importantPoints": [...]},
-  {"name": "2. Runtime Polymorphism", "definition": "Resolved at runtime.", "howAchieved": "Method overriding", "example": "...", "importantPoints": [...]}
-]}
-
-WRONG — pillars listed in one paragraph:
-{"name": "Four Pillars of OOP", "explanation": "The four pillars are abstraction, encapsulation, inheritance, and polymorphism. Abstraction means hiding..."}
-
-CORRECT — each pillar is a SEPARATE concept entry:
-[
-  {"name": "Abstraction", "definition": "...", "explanation": "...", "example": "..."},
-  {"name": "Encapsulation", "definition": "...", "explanation": "...", "example": "..."},
-  {"name": "Inheritance", "definition": "...", "explanation": "...", "example": "..."},
-  {"name": "Polymorphism", "overview": "...", "subtypes": [...]}
-]
-
-WRONG — access modifiers in one paragraph:
-{"name": "Access Modifiers", "explanation": "There are four access modifiers: public, private, protected, and default. Public means..."}
-
-CORRECT — each modifier is a subtype:
-{"name": "Access Modifiers", "overview": "Access modifiers control visibility.", "subtypes": [
-  {"name": "1. Public", "definition": "Accessible from anywhere.", "example": "..."},
-  {"name": "2. Private", "definition": "Accessible only within the same class.", "example": "..."},
-  {"name": "3. Protected", "definition": "Accessible within the same package and subclasses.", "example": "..."},
-  {"name": "4. Default", "definition": "Accessible within the same package.", "example": "..."}
-]}`
-
+}`
       expectedSchema = 'educational'
 
     } else if (meetingType === 'Technical / Development') {
@@ -1478,43 +1542,31 @@ REQUIRED JSON SCHEMA:
     }
 
     // ── STEP 3: Generate the summary ──────────────────────────────────────────
-    const groqRes = await fetch('https://api.groq.com/openai/v1/chat/completions', {
-      method: 'POST',
-      headers: groqHeaders,
-      body: JSON.stringify({
-        model: 'openai/gpt-oss-120b',
-        response_format: { type: 'json_object' },
-        messages: [
-          { role: 'system', content: systemPrompt },
-          { role: 'user', content: `Meeting Transcript:\n${transcriptText}` }
-        ],
-        temperature: 0.1,
-        max_tokens: 16384
-      })
+    const summaryLLMResponse = await callSummaryLLM({
+      messages: [
+        { role: 'system', content: systemPrompt },
+        { role: 'user', content: `Meeting Transcript:\n${transcriptText}` }
+      ],
+      temperature: 0.2,
+      maxTokens: 6000,
+      transcriptChars: transcriptText.length,
+      isJson: true
     })
 
-    if (!groqRes.ok) {
-      const errorText = await groqRes.text()
-      console.error('[Summary Error] Groq API returned error:', errorText)
-      return res.status(500).json({ message: 'Unable to generate meeting summary. Please try again.' })
-    }
-
-    const result = await groqRes.json()
-    const rawContent = result.choices?.[0]?.message?.content || ''
-
+    const rawContent = summaryLLMResponse.content || ''
     let parsedSummary = null
     try {
       const cleanJson = rawContent.replace(/```json/gi, '').replace(/```/g, '').trim()
       parsedSummary = JSON.parse(cleanJson)
     } catch (parseErr) {
-      console.warn('[Summary Error] Failed to parse JSON response from Groq:', parseErr.message)
+      console.warn('[Summary Parsing Error] Failed to parse JSON response:', parseErr.message)
     }
 
     if (!parsedSummary || typeof parsedSummary !== 'object') {
       return res.status(500).json({ message: 'Unable to format meeting summary as structured JSON. Please try again.' })
     }
 
-    // ── STEP 4: Sanitize by schema type ──────────────────────────────────────
+    // ── STEP 4: Sanitize & Structure with Safe Fallbacks ─────────────────────
     let finalSummary
 
     if (expectedSchema === 'educational') {
@@ -1578,7 +1630,8 @@ REQUIRED JSON SCHEMA:
         actionItems: []
       }
 
-      console.log('[Summary Generation]')
+      console.log('[Summary Generation Complete]')
+      console.log(`  provider=${summaryLLMResponse.provider}`)
       console.log(`  major_topics=${sanitizedConcepts.length}`)
       console.log(`  summary_sections=${sanitizedConcepts.length + 2}`)
 
@@ -1618,7 +1671,8 @@ REQUIRED JSON SCHEMA:
           : []
       }
 
-      console.log('[Summary Generation]')
+      console.log('[Summary Generation Complete]')
+      console.log(`  provider=${summaryLLMResponse.provider}`)
       console.log(`  major_topics=${finalSummary.topicsDiscussed.length}`)
       console.log(`  summary_sections=${finalSummary.topicsDiscussed.length + finalSummary.technicalDetails.length}`)
 
@@ -1646,12 +1700,13 @@ REQUIRED JSON SCHEMA:
           : []
       }
 
-      console.log('[Summary Generation]')
+      console.log('[Summary Generation Complete]')
+      console.log(`  provider=${summaryLLMResponse.provider}`)
       console.log(`  major_topics=${finalSummary.topicsDiscussed.length}`)
       console.log(`  summary_sections=${finalSummary.topicsDiscussed.length + 1}`)
 
     } else {
-      // General
+      // General Discussion
       finalSummary = {
         meetingType: 'General Discussion',
         overview: typeof parsedSummary.overview === 'string' ? parsedSummary.overview.trim() : '',
@@ -1669,7 +1724,8 @@ REQUIRED JSON SCHEMA:
           : []
       }
 
-      console.log('[Summary Generation]')
+      console.log('[Summary Generation Complete]')
+      console.log(`  provider=${summaryLLMResponse.provider}`)
       console.log(`  major_topics=${finalSummary.topicsDiscussed.length}`)
       console.log(`  summary_sections=${finalSummary.topicsDiscussed.length + 1}`)
     }
@@ -1691,10 +1747,10 @@ REQUIRED JSON SCHEMA:
       return res.status(500).json({ message: 'Failed to save summary to database.' })
     }
 
-    console.log(`[Summary Success] Generated ${meetingType} summary for meeting ${meetingId}`)
+    console.log(`[Summary Success] Saved ${meetingType} summary for meeting ${meetingId}`)
     return res.status(200).json({ summary: finalSummary })
   } catch (err) {
-    console.error('Generate summary error:', err)
+    console.error('[Summary Error] Generate summary caught exception:', err.message)
     return res.status(500).json({ message: 'Unable to generate meeting summary. Please try again.' })
   }
 }
