@@ -56,7 +56,36 @@ export default function MeetingCard({ meeting, index = 0, onDeleted }) {
       const nextSteps    = Array.isArray(summaryObj.nextSteps)       ? summaryObj.nextSteps      : []
       const openQuestions= Array.isArray(summaryObj.openQuestions)   ? summaryObj.openQuestions  : []
 
-      // ── PDF setup ──────────────────────────────────────────────────────────
+      // ── Text sanitizer: normalize Unicode typographic chars to ASCII ─────────
+      // jsPDF standard fonts use WinAnsi encoding (Latin-1). Characters such as
+      // en-dash U+2013, em-dash U+2014, soft-hyphen U+00AD, non-breaking hyphen
+      // U+2011, curly quotes, etc. either disappear or render as garbage glyphs.
+      // AI models frequently output these instead of plain ASCII equivalents.
+      const sanitize = (text) => {
+        if (text == null) return ''
+        return String(text)
+          // ── Hyphens: soft-hyphen (invisible), non-breaking hyphen, Unicode hyphens → ASCII -
+          .replace(/\u00AD/g, '-')   // soft hyphen (U+00AD) — renders invisible, causing "compile time" instead of "compile-time"
+          .replace(/[\u2010\u2011\u2012\u2212\uFE58\uFE63\uFF0D]/g, '-')  // Unicode hyphen variants
+          // ── Dashes → ASCII hyphen (preserve readability)
+          .replace(/[\u2013\u2014\u2015]/g, '-')  // en-dash, em-dash, horizontal bar
+          // ── Smart/curly quotes → straight quotes
+          .replace(/[\u2018\u2019\u02BC]/g, "'")
+          .replace(/[\u201C\u201D\u201E\u201F]/g, '"')
+          // ── Ellipsis → three dots
+          .replace(/\u2026/g, '...')
+          // ── Non-breaking spaces → regular space
+          .replace(/[\u00A0\u202F\u2009\u2007\u2006\u2005\u2004\u2003\u2002\u2001\u2000]/g, ' ')
+          // ── Arrow-like chars
+          .replace(/\u2192/g, '->').replace(/\u2190/g, '<-').replace(/\u2194/g, '<->')
+          // ── Strip any remaining non-Latin-1 (above U+00FF) that jsPDF cannot render
+          .replace(/[^\x00-\xFF]/g, '')
+          // ── Collapse multiple spaces
+          .replace(/ {2,}/g, ' ')
+          .trim()
+      }
+
+            // ── PDF setup ──────────────────────────────────────────────────────────
       const doc = new jsPDF()
       const PW       = doc.internal.pageSize.width   // 210 mm
       const PH       = doc.internal.pageSize.height  // 297 mm
@@ -124,7 +153,7 @@ export default function MeetingCard({ meeting, index = 0, onDeleted }) {
         doc.setFont('helvetica', 'bold')
         doc.setFontSize(10.5)
         doc.setTextColor(15, 23, 42)
-        doc.text(title, margin, Y)
+        doc.text(sanitize(title), margin, Y)
         Y += 1
         doc.setDrawColor(124, 58, 237)
         doc.setLineWidth(0.4)
@@ -148,14 +177,14 @@ export default function MeetingCard({ meeting, index = 0, onDeleted }) {
         Y += 4.5
         doc.setFont('helvetica', 'normal')
         doc.setFontSize(9.5)
-        printWrapped(text, margin + 4, Y, contentW - 4, 5.2)
+        printWrapped(sanitize(text), margin + 4, Y, contentW - 4, 5.2)
         Y += 2
       }
 
       // Bullet list helper
       const bulletList = (items, indent = 4) => {
         items.forEach((item) => {
-          const lines = doc.splitTextToSize(`\u2022  ${item}`, contentW - indent)
+          const lines = doc.splitTextToSize(`\u2022  ${sanitize(item)}`, contentW - indent)
           lines.forEach((line, i) => {
             need(5.5)
             doc.text(line, margin + (i === 0 ? indent : indent + 4), Y)
@@ -168,7 +197,7 @@ export default function MeetingCard({ meeting, index = 0, onDeleted }) {
       // Code block helper
       const codeBlock = (code) => {
         if (!code || code.trim() === '') return
-        const lines = code.split('\n')
+        const lines = sanitize(code).split('\n')
         const boxH = Math.min(lines.length * 5 + 6, 60)
         need(boxH + 4)
         doc.setFillColor(30, 30, 30)
@@ -235,7 +264,7 @@ export default function MeetingCard({ meeting, index = 0, onDeleted }) {
         doc.text(label, margin, Y)
         doc.setFont('helvetica', 'normal')
         doc.setTextColor(51, 65, 85)
-        doc.text(String(value), margin + 30, Y)
+        doc.text(sanitize(String(value)), margin + 30, Y)
         Y += 6.5
       })
       Y += 2
@@ -246,7 +275,7 @@ export default function MeetingCard({ meeting, index = 0, onDeleted }) {
       sectionHeading('1', 'Overview')
       Y += 2
       doc.setFontSize(9.5)
-      printWrapped(overviewText, margin, Y, contentW, 5.2)
+      printWrapped(sanitize(overviewText), margin, Y, contentW, 5.2)
       Y += 4
 
       // ═══════════════════════════════════════════════════════════════════════
@@ -263,7 +292,7 @@ export default function MeetingCard({ meeting, index = 0, onDeleted }) {
         concepts.forEach((c, i) => {
           need(6)
           doc.setFont('helvetica', 'normal')
-          doc.text(`  ${i + 1}.  ${c.name}`, margin + 2, Y)
+          doc.text(`  ${i + 1}.  ${sanitize(c.name)}`, margin + 2, Y)
           Y += 5.5
         })
         Y += 4
@@ -275,9 +304,9 @@ export default function MeetingCard({ meeting, index = 0, onDeleted }) {
         concepts.forEach((concept, idx) => {
           conceptHeading(`${idx + 1}. ${concept.name}`)
 
-          fieldBlock('Definition:', concept.definition)
-          fieldBlock('Explanation:', concept.explanation)
-          fieldBlock('Purpose / Why it is used:', concept.purpose)
+          fieldBlock('Definition:', sanitize(concept.definition))
+          fieldBlock('Explanation:', sanitize(concept.explanation))
+          fieldBlock('Purpose / Why it is used:', sanitize(concept.purpose))
 
           if (concept.characteristics && concept.characteristics.length > 0) {
             need(8)
@@ -292,8 +321,8 @@ export default function MeetingCard({ meeting, index = 0, onDeleted }) {
             bulletList(concept.characteristics, 8)
           }
 
-          fieldBlock('Example:', concept.example)
-          fieldBlock('Real-world Analogy:', concept.analogy)
+          fieldBlock('Example:', sanitize(concept.example))
+          fieldBlock('Real-world Analogy:', sanitize(concept.analogy))
 
           if (concept.codeExample && concept.codeExample.trim()) {
             need(10)
@@ -332,6 +361,72 @@ export default function MeetingCard({ meeting, index = 0, onDeleted }) {
             bulletList(concept.questionsRaised, 8)
           }
 
+          // ── Subtypes (e.g. Compile-Time and Runtime Polymorphism) ──────────────
+          const subtypes = Array.isArray(concept.subtypes) ? concept.subtypes : []
+          if (subtypes.length > 0) {
+            need(10)
+            doc.setFont('helvetica', 'bold')
+            doc.setFontSize(9)
+            doc.setTextColor(71, 85, 105)
+            doc.text('Sub-types / Categories:', margin + 4, Y)
+            Y += 5
+
+            subtypes.forEach((st, si) => {
+              // Sub-type heading
+              need(14)
+              Y += 4
+              doc.setFillColor(237, 233, 254) // light purple
+              doc.roundedRect(margin + 6, Y - 4, contentW - 12, 8, 1, 1, 'F')
+              doc.setFont('helvetica', 'bold')
+              doc.setFontSize(9.5)
+              doc.setTextColor(88, 28, 135)
+              doc.text(sanitize(st.name || `Sub-type ${si + 1}`), margin + 9, Y)
+              Y += 6
+              doc.setFont('helvetica', 'normal')
+              doc.setFontSize(9.5)
+              doc.setTextColor(51, 65, 85)
+
+              fieldBlock('Definition:', sanitize(st.definition))
+              fieldBlock('Explanation:', sanitize(st.explanation))
+              fieldBlock('How it is achieved:', sanitize(st.howAchieved))
+              fieldBlock('Example:', sanitize(st.example))
+
+              if (st.codeExample && st.codeExample.trim()) {
+                need(10)
+                doc.setFont('helvetica', 'bold')
+                doc.setFontSize(9)
+                doc.setTextColor(71, 85, 105)
+                doc.text('Code / Example:', margin + 9, Y)
+                Y += 5
+                doc.setFont('helvetica', 'normal')
+                codeBlock(st.codeExample)
+              }
+
+              if (Array.isArray(st.importantPoints) && st.importantPoints.length > 0) {
+                need(8)
+                doc.setFont('helvetica', 'bold')
+                doc.setFontSize(9)
+                doc.setTextColor(71, 85, 105)
+                doc.text('Important Points:', margin + 9, Y)
+                Y += 5
+                doc.setFont('helvetica', 'normal')
+                doc.setFontSize(9.5)
+                doc.setTextColor(51, 65, 85)
+                bulletList(st.importantPoints.map(p => sanitize(p)), 12)
+              }
+
+              Y += 2
+              if (si < subtypes.length - 1) {
+                need(4)
+                doc.setDrawColor(221, 214, 254)
+                doc.setLineWidth(0.3)
+                doc.line(margin + 12, Y, PW - margin - 12, Y)
+                Y += 3
+              }
+            })
+            Y += 2
+          }
+
           Y += 2
           // Light separator between concepts
           if (idx < concepts.length - 1) {
@@ -367,7 +462,7 @@ export default function MeetingCard({ meeting, index = 0, onDeleted }) {
             doc.setFont('helvetica', 'bold')
             doc.setFontSize(9.5)
             doc.setTextColor(15, 23, 42)
-            doc.text(`\u25B6  ${t.title}`, margin, Y)
+            doc.text(`> ${sanitize(t.title)}`, margin, Y)
             Y += 5
             if (t.description) {
               doc.setFont('helvetica', 'normal')
@@ -465,7 +560,7 @@ export default function MeetingCard({ meeting, index = 0, onDeleted }) {
             doc.setFont('helvetica', 'bold')
             doc.setFontSize(9.5)
             doc.setTextColor(15, 23, 42)
-            doc.text(`\u25B6  ${t.title}`, margin, Y)
+            doc.text(`> ${sanitize(t.title)}`, margin, Y)
             Y += 5
             if (t.description) {
               doc.setFont('helvetica', 'normal')
@@ -530,7 +625,7 @@ export default function MeetingCard({ meeting, index = 0, onDeleted }) {
             doc.setFont('helvetica', 'bold')
             doc.setFontSize(9.5)
             doc.setTextColor(15, 23, 42)
-            doc.text(`\u2022  ${t.title}`, margin, Y)
+            doc.text(`* ${sanitize(t.title)}`, margin, Y)
             Y += 5
             if (t.description) {
               doc.setFont('helvetica', 'normal')

@@ -1222,19 +1222,21 @@ export const generateSummary = async (req, res) => {
         messages: [
           {
             role: 'system',
-            content: `You are a meeting classifier. Analyze the transcript and output ONLY a JSON object with one field "meetingType".
+            content: `You are a meeting classifier. Read the transcript and output ONLY {"meetingType": "<value>"}.
 
-Choose exactly one of these values:
-- "Educational / Lecture" — if the meeting is a class, lecture, tutorial, or teaching session where concepts, theories, or skills are being explained/taught
-- "Technical / Development" — if the meeting is about software engineering, system design, debugging, architecture, code review, or technical problem-solving (but NOT primarily a teaching session)
-- "Business / Professional" — if the meeting is about business strategy, project management, planning, HR, sales, or organizational topics
-- "General Discussion" — if the meeting does not clearly fit any of the above
+Choose exactly one value:
+- "Educational / Lecture" — Any class, lecture, tutorial, study session, or teaching/learning meeting. Signs: explaining OOP, Java, Python, algorithms, data structures, science, math, access modifiers, inheritance, polymorphism, encapsulation, abstraction, or any educational subject. A speaker teaching learners, explaining "what is X", "definition of X", "types of X", "four pillars", "advantages of X". This is the MOST COMMON type — use it whenever someone is teaching or explaining concepts.
+- "Technical / Development" — A team software development meeting (sprint, code review, bug triage, system design) where professionals are NOT primarily teaching concepts to learners.
+- "Business / Professional" — Business strategy, HR, sales, project management.
+- "General Discussion" — LAST RESORT ONLY. Use only when the meeting clearly does not involve teaching OR technical team work OR business matters.
+
+CRITICAL: A Java/OOP/programming lecture IS "Educational / Lecture", NOT "Technical / Development". Teaching sessions are always "Educational / Lecture".
 
 Output ONLY: {"meetingType": "<one of the four values above>"}`
           },
           {
             role: 'user',
-            content: `Transcript (first 3000 chars for classification):\n${transcriptText.slice(0, 3000)}`
+            content: `Transcript (first 5000 chars):\n${transcriptText.slice(0, 5000)}`
           }
         ],
         temperature: 0.0,
@@ -1264,35 +1266,59 @@ Output ONLY: {"meetingType": "<one of the four values above>"}`
     if (meetingType === 'Educational / Lecture') {
       systemPrompt = `You are an expert educational content analyst and note-taker.
 
-Your task is to analyze this educational meeting/lecture transcript and produce DETAILED STUDY NOTES in JSON format.
+Your task: analyze this educational transcript and produce DETAILED STUDY NOTES in JSON format.
 
-CRITICAL RULES:
-1. ONLY include content that is ACTUALLY discussed in the transcript. Do NOT invent definitions, examples, code, or explanations.
-2. If a concept is explained in detail in the transcript, preserve that detail fully.
-3. If a concept is mentioned only briefly, summarize it briefly.
-4. The depth of each concept section must be PROPORTIONAL to how much it was discussed.
-5. Preserve the ORDER in which concepts were introduced.
-6. Do NOT merge separate concepts into one.
+ANTI-HALLUCINATION RULES:
+- ONLY include content ACTUALLY discussed. Never invent definitions, examples, code, or analogies.
+- If a concept was explained in detail, preserve that detail. If mentioned briefly, be brief.
+- Do NOT add information not present in the transcript.
+
+STRUCTURE RULES — READ CAREFULLY:
+1. Create one concept entry per DISTINCT CONCEPT actually explained.
+   - Abstraction, Encapsulation, Inheritance, Polymorphism → 4 SEPARATE concept entries (never merge them).
+   - Compile-time Polymorphism, Runtime Polymorphism → EITHER two separate entries OR one parent with two subtypes[].
+
+2. When the speaker explains multiple TYPES, CATEGORIES, or SUB-ITEMS of a concept (e.g. "there are two types of polymorphism: compile-time and runtime"), use the subtypes[] array.
+   - Each subtype gets its OWN name, definition, explanation, howAchieved, example, codeExample, importantPoints.
+   - NEVER compress "Type 1 is X and Type 2 is Y" into a single explanation paragraph.
+
+3. When the speaker explains access modifiers (public, private, protected, default) separately, create subtypes[] inside the "Access Modifiers" concept with one subtype per modifier.
+
+4. Preserve the ORDER concepts were introduced.
+
+5. Leave fields as "" or [] when not discussed. Never fill them with invented content.
 
 REQUIRED JSON SCHEMA:
 {
   "meetingType": "Educational / Lecture",
-  "overview": "2-4 sentence summary of what the session covered overall.",
+  "overview": "2-4 sentence summary of what the session covered.",
   "concepts": [
     {
-      "name": "Concept Name (exactly as discussed)",
-      "definition": "The definition or explanation given in the session. Empty string if not defined.",
-      "explanation": "Detailed explanation as discussed. Include all important points made. Empty string if not explained.",
-      "purpose": "Why it is used or what problem it solves, if discussed. Empty string if not mentioned.",
-      "characteristics": ["characteristic 1", "characteristic 2"],
-      "example": "Any example discussed in the transcript. Empty string if none.",
-      "analogy": "Any real-world analogy used. Empty string if none.",
-      "codeExample": "Any code or pseudocode shown or described. Use actual code from transcript. Empty string if none.",
-      "importantPoints": ["important point 1", "important point 2"],
-      "questionsRaised": ["Any question or doubt raised about this concept. Empty array if none."]
+      "name": "Concept Name",
+      "overview": "1-2 sentence intro to this concept (only if the speaker gave an intro before explaining sub-items). Empty string otherwise.",
+      "definition": "Definition as given in transcript. Empty string if not defined.",
+      "explanation": "Detailed explanation. Empty string if content is fully in subtypes[].",
+      "purpose": "Why it is used / what problem it solves, if discussed. Empty string if not.",
+      "characteristics": ["characteristic 1"],
+      "example": "Any real-world example discussed. Empty string if none.",
+      "analogy": "Any analogy used. Empty string if none.",
+      "codeExample": "Any code or pseudocode from the transcript. Empty string if none.",
+      "importantPoints": ["important point 1"],
+      "questionsRaised": ["question or doubt raised, if any"],
+      "subtypes": [
+        {
+          "name": "1. Subtype Name (e.g. Compile-Time Polymorphism)",
+          "definition": "Definition of this subtype as discussed.",
+          "explanation": "Detailed explanation of this subtype.",
+          "howAchieved": "How this subtype is achieved/implemented (if discussed). Empty string if not.",
+          "example": "Example of this subtype from the transcript. Empty string if none.",
+          "codeExample": "Code example for this subtype. Empty string if none.",
+          "importantPoints": ["important point about this subtype"]
+        }
+      ]
     }
   ],
-  "keyPoints": ["Overall key takeaway 1", "Overall key takeaway 2"],
+  "keyPoints": ["Overall key takeaway 1", "Key takeaway 2"],
   "topicsDiscussed": [
     {
       "title": "Topic Title",
@@ -1303,9 +1329,27 @@ REQUIRED JSON SCHEMA:
   "actionItems": []
 }
 
-For the "concepts" array: include EVERY distinct concept that was actually explained in the transcript.
-Each concept must have its own entry even if related to others (e.g., Encapsulation and Abstraction are separate entries).
-If a section was not discussed, use empty string "" or empty array [].`
+EXAMPLES OF CORRECT STRUCTURE:
+
+WRONG (do not do this):
+{"name": "Polymorphism", "explanation": "Polymorphism has two types: compile-time (method overloading) and runtime (method overriding)..."}
+
+CORRECT (do this):
+{"name": "Polymorphism", "overview": "Polymorphism means one name multiple forms.", "subtypes": [
+  {"name": "1. Compile-Time Polymorphism", "definition": "...", "howAchieved": "Method overloading", "example": "...", "importantPoints": [...]},
+  {"name": "2. Runtime Polymorphism", "definition": "...", "howAchieved": "Method overriding", "example": "...", "importantPoints": [...]}
+]}
+
+WRONG (do not do this):
+{"name": "Four Pillars of OOP", "explanation": "The four pillars are abstraction, encapsulation, inheritance, and polymorphism..."}
+
+CORRECT (do this — 4 SEPARATE concept entries):
+[
+  {"name": "Abstraction", "definition": "...", "explanation": "...", "example": "..."},
+  {"name": "Encapsulation", "definition": "...", "explanation": "...", "example": "..."},
+  {"name": "Inheritance", "definition": "...", "explanation": "...", "example": "..."},
+  {"name": "Polymorphism", "definition": "...", "overview": "...", "subtypes": [...]}
+]`
 
       expectedSchema = 'educational'
 
@@ -1454,10 +1498,25 @@ REQUIRED JSON SCHEMA:
 
     if (expectedSchema === 'educational') {
       const rawConcepts = Array.isArray(parsedSummary.concepts) ? parsedSummary.concepts : []
+
+      // Helper: normalize a subtype object
+      const sanitizeSubtype = (s) => ({
+        name: String(s.name || '').trim(),
+        definition: String(s.definition || '').trim(),
+        explanation: String(s.explanation || '').trim(),
+        howAchieved: String(s.howAchieved || '').trim(),
+        example: String(s.example || '').trim(),
+        codeExample: String(s.codeExample || '').trim(),
+        importantPoints: Array.isArray(s.importantPoints)
+          ? s.importantPoints.map(x => String(x).trim()).filter(Boolean)
+          : []
+      })
+
       const sanitizedConcepts = rawConcepts
         .filter(c => c && typeof c === 'object' && c.name)
         .map(c => ({
           name: String(c.name || '').trim(),
+          overview: String(c.overview || '').trim(),
           definition: String(c.definition || '').trim(),
           explanation: String(c.explanation || '').trim(),
           purpose: String(c.purpose || '').trim(),
@@ -1472,6 +1531,9 @@ REQUIRED JSON SCHEMA:
             : [],
           questionsRaised: Array.isArray(c.questionsRaised)
             ? c.questionsRaised.map(x => String(x).trim()).filter(Boolean)
+            : [],
+          subtypes: Array.isArray(c.subtypes)
+            ? c.subtypes.filter(s => s && typeof s === 'object' && s.name).map(sanitizeSubtype)
             : []
         }))
 
