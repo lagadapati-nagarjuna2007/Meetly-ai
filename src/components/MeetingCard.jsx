@@ -64,22 +64,29 @@ export default function MeetingCard({ meeting, index = 0, onDeleted }) {
       const sanitize = (text) => {
         if (text == null) return ''
         return String(text)
-          // ── Hyphens: soft-hyphen (invisible), non-breaking hyphen, Unicode hyphens → ASCII -
-          .replace(/\u00AD/g, '-')   // soft hyphen (U+00AD) — renders invisible, causing "compile time" instead of "compile-time"
-          .replace(/[\u2010\u2011\u2012\u2212\uFE58\uFE63\uFF0D]/g, '-')  // Unicode hyphen variants
-          // ── Dashes → ASCII hyphen (preserve readability)
-          .replace(/[\u2013\u2014\u2015]/g, '-')  // en-dash, em-dash, horizontal bar
+          // ── Soft-hyphen (U+00AD) → visible ASCII hyphen
+          // This is the #1 cause of "object oriented" instead of "object-oriented"
+          .replace(/\u00AD/g, '-')
+          // ── Unicode hyphen variants → ASCII hyphen
+          .replace(/[\u2010\u2011\u2012\u2212\uFE58\uFE63\uFF0D]/g, '-')
+          // ── Dashes → ASCII hyphen
+          .replace(/[\u2013\u2014\u2015]/g, '-')
           // ── Smart/curly quotes → straight quotes
           .replace(/[\u2018\u2019\u02BC]/g, "'")
           .replace(/[\u201C\u201D\u201E\u201F]/g, '"')
           // ── Ellipsis → three dots
           .replace(/\u2026/g, '...')
-          // ── Non-breaking spaces → regular space
-          .replace(/[\u00A0\u202F\u2009\u2007\u2006\u2005\u2004\u2003\u2002\u2001\u2000]/g, ' ')
-          // ── Arrow-like chars
+          // ── Bullet → ASCII asterisk (jsPDF WinAnsi cannot render U+2022)
+          .replace(/\u2022/g, '*')
+          // ── Arrows → ASCII equivalents
           .replace(/\u2192/g, '->').replace(/\u2190/g, '<-').replace(/\u2194/g, '<->')
-          // ── Strip any remaining non-Latin-1 (above U+00FF) that jsPDF cannot render
-          .replace(/[^\x00-\xFF]/g, '')
+          // ── Triangles → ASCII
+          .replace(/[\u25B6\u25BA\u25B8]/g, '>')
+          // ── Non-breaking / exotic spaces → regular space
+          .replace(/[\u00A0\u202F\u2009\u2007\u2006\u2005\u2004\u2003\u2002\u2001\u2000]/g, ' ')
+          // ── Strip remaining non-Latin-1 chars that jsPDF WinAnsi encoding cannot render
+          // But first: preserve all printable Latin-1 (U+0020–U+00FF) and common control chars
+          .replace(/[^\x09\x0A\x0D\x20-\x7E\xA0-\xFF]/g, '')
           // ── Collapse multiple spaces
           .replace(/ {2,}/g, ' ')
           .trim()
@@ -148,16 +155,17 @@ export default function MeetingCard({ meeting, index = 0, onDeleted }) {
 
       // Sub-heading helper (concept name inside educational)
       const conceptHeading = (title) => {
+        const cleanTitle = sanitize(title)
         need(16)
         Y += 7
         doc.setFont('helvetica', 'bold')
         doc.setFontSize(10.5)
         doc.setTextColor(15, 23, 42)
-        doc.text(sanitize(title), margin, Y)
+        doc.text(cleanTitle, margin, Y)
         Y += 1
         doc.setDrawColor(124, 58, 237)
         doc.setLineWidth(0.4)
-        doc.line(margin, Y + 1, margin + doc.getTextWidth(title) + 4, Y + 1)
+        doc.line(margin, Y + 1, margin + doc.getTextWidth(cleanTitle) + 4, Y + 1)
         Y += 4
         doc.setFont('helvetica', 'normal')
         doc.setFontSize(9.5)
@@ -184,7 +192,8 @@ export default function MeetingCard({ meeting, index = 0, onDeleted }) {
       // Bullet list helper
       const bulletList = (items, indent = 4) => {
         items.forEach((item) => {
-          const lines = doc.splitTextToSize(`\u2022  ${sanitize(item)}`, contentW - indent)
+          const cleanItem = sanitize(item)
+          const lines = doc.splitTextToSize('*  ' + cleanItem, contentW - indent)
           lines.forEach((line, i) => {
             need(5.5)
             doc.text(line, margin + (i === 0 ? indent : indent + 4), Y)
@@ -197,27 +206,58 @@ export default function MeetingCard({ meeting, index = 0, onDeleted }) {
       // Code block helper
       const codeBlock = (code) => {
         if (!code || code.trim() === '') return
-        const lines = sanitize(code).split('\n')
-        const boxH = Math.min(lines.length * 5 + 6, 60)
-        need(boxH + 4)
-        doc.setFillColor(30, 30, 30)
-        doc.roundedRect(margin + 2, Y, contentW - 4, boxH, 2, 2, 'F')
+        const cleanCode = sanitize(code)
+        const codeLines = cleanCode.split('\n')
+        // Expand wrapped lines
         doc.setFont('courier', 'normal')
         doc.setFontSize(8.5)
-        doc.setTextColor(187, 255, 187) // light green
-        let cy = Y + 5
-        lines.forEach((line) => {
-          if (cy < Y + boxH - 4) {
-            const wrapped = doc.splitTextToSize(line || ' ', contentW - 12)
-            wrapped.forEach((wl) => {
-              if (cy < Y + boxH - 4) {
-                doc.text(wl, margin + 5, cy)
-                cy += 4.5
-              }
-            })
-          }
+        const allWrapped = []
+        codeLines.forEach((line) => {
+          const wrapped = doc.splitTextToSize(line || ' ', contentW - 12)
+          wrapped.forEach((wl) => allWrapped.push(wl))
         })
-        Y += boxH + 3
+
+        const lineH = 4.5
+        const pad = 5
+        const maxLinesPerBox = Math.floor((PH - margin * 2 - 20) / lineH) // max lines that fit one page
+        let idx = 0
+
+        while (idx < allWrapped.length) {
+          // How many lines fit on this page?
+          const spaceLeft = PH - margin - 12 - Y
+          let fitLines = Math.max(3, Math.floor((spaceLeft - pad * 2) / lineH))
+          if (fitLines > allWrapped.length - idx) fitLines = allWrapped.length - idx
+
+          const batchLines = allWrapped.slice(idx, idx + fitLines)
+          const boxH = batchLines.length * lineH + pad * 2
+
+          // Draw background
+          doc.setFillColor(30, 30, 30)
+          doc.roundedRect(margin + 2, Y, contentW - 4, boxH, 2, 2, 'F')
+
+          // Draw text
+          doc.setFont('courier', 'normal')
+          doc.setFontSize(8.5)
+          doc.setTextColor(187, 255, 187) // light green
+          let cy = Y + pad
+          batchLines.forEach((wl) => {
+            doc.text(wl, margin + 5, cy)
+            cy += lineH
+          })
+
+          Y += boxH + 3
+          idx += fitLines
+
+          // If more code remains, add a new page
+          if (idx < allWrapped.length) {
+            stampPageNumber()
+            doc.addPage()
+            pageNum++
+            Y = margin
+          }
+        }
+
+        // Restore font
         doc.setFont('helvetica', 'normal')
         doc.setFontSize(9.5)
         doc.setTextColor(51, 65, 85)
@@ -467,7 +507,7 @@ export default function MeetingCard({ meeting, index = 0, onDeleted }) {
             if (t.description) {
               doc.setFont('helvetica', 'normal')
               doc.setTextColor(51, 65, 85)
-              printWrapped(t.description, margin + 5, Y, contentW - 5, 5.2)
+              printWrapped(sanitize(t.description), margin + 5, Y, contentW - 5, 5.2)
               Y += 2
             }
           })
@@ -489,7 +529,7 @@ export default function MeetingCard({ meeting, index = 0, onDeleted }) {
             doc.setFont('helvetica', 'normal')
             doc.setFontSize(9.5)
             doc.setTextColor(51, 65, 85)
-            printWrapped(td.detail, margin + 4, Y, contentW - 4, 5.2)
+            printWrapped(sanitize(td.detail), margin + 4, Y, contentW - 4, 5.2)
             if (td.codeOrExample && td.codeOrExample.trim()) {
               codeBlock(td.codeOrExample)
             }
@@ -527,8 +567,10 @@ export default function MeetingCard({ meeting, index = 0, onDeleted }) {
           doc.setFont('helvetica', 'normal')
           doc.setFontSize(9.5)
           actions.forEach((a) => {
-            const text = a.assignee ? `${a.assignee}  \u2192  ${a.task}` : a.task
-            const lines = doc.splitTextToSize(`\u2022  ${text}`, contentW)
+            const cleanTask = sanitize(a.task)
+            const cleanAssignee = a.assignee ? sanitize(a.assignee) : ''
+            const text = cleanAssignee ? cleanAssignee + '  ->  ' + cleanTask : cleanTask
+            const lines = doc.splitTextToSize('*  ' + text, contentW)
             lines.forEach((line) => {
               need(5.5)
               doc.text(line, margin + 4, Y)
@@ -565,7 +607,7 @@ export default function MeetingCard({ meeting, index = 0, onDeleted }) {
             if (t.description) {
               doc.setFont('helvetica', 'normal')
               doc.setTextColor(51, 65, 85)
-              printWrapped(t.description, margin + 5, Y, contentW - 5, 5.2)
+              printWrapped(sanitize(t.description), margin + 5, Y, contentW - 5, 5.2)
               Y += 2
             }
           })
@@ -594,8 +636,8 @@ export default function MeetingCard({ meeting, index = 0, onDeleted }) {
           doc.setFont('helvetica', 'normal')
           doc.setFontSize(9.5)
           actions.forEach((a) => {
-            const parts = [a.assignee && `Owner: ${a.assignee}`, a.task, a.deadline && `Due: ${a.deadline}`].filter(Boolean)
-            const lines = doc.splitTextToSize(`\u2022  ${parts.join('  |  ')}`, contentW)
+            const parts = [a.assignee && 'Owner: ' + sanitize(a.assignee), sanitize(a.task), a.deadline && 'Due: ' + sanitize(a.deadline)].filter(Boolean)
+            const lines = doc.splitTextToSize('*  ' + parts.join('  |  '), contentW)
             lines.forEach((line) => { need(5.5); doc.text(line, margin + 4, Y); Y += 5 })
             Y += 0.5
           })
@@ -630,7 +672,7 @@ export default function MeetingCard({ meeting, index = 0, onDeleted }) {
             if (t.description) {
               doc.setFont('helvetica', 'normal')
               doc.setTextColor(51, 65, 85)
-              printWrapped(t.description, margin + 5, Y, contentW - 5, 5.2)
+              printWrapped(sanitize(t.description), margin + 5, Y, contentW - 5, 5.2)
               Y += 2
             }
           })
@@ -659,8 +701,10 @@ export default function MeetingCard({ meeting, index = 0, onDeleted }) {
           doc.setFont('helvetica', 'normal')
           doc.setFontSize(9.5)
           actions.forEach((a) => {
-            const text = a.assignee ? `${a.assignee}  \u2192  ${a.task}` : a.task
-            const lines = doc.splitTextToSize(`\u2022  ${text}`, contentW)
+            const cleanTask = sanitize(a.task)
+            const cleanAssignee = a.assignee ? sanitize(a.assignee) : ''
+            const text = cleanAssignee ? cleanAssignee + '  ->  ' + cleanTask : cleanTask
+            const lines = doc.splitTextToSize('*  ' + text, contentW)
             lines.forEach((line) => { need(5.5); doc.text(line, margin + 4, Y); Y += 5 })
             Y += 0.5
           })

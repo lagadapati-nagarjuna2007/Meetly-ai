@@ -1269,24 +1269,33 @@ Output ONLY: {"meetingType": "<one of the four values above>"}`
 Your task: analyze this educational transcript and produce DETAILED STUDY NOTES in JSON format.
 
 ANTI-HALLUCINATION RULES:
-- ONLY include content ACTUALLY discussed. Never invent definitions, examples, code, or analogies.
-- If a concept was explained in detail, preserve that detail. If mentioned briefly, be brief.
-- Do NOT add information not present in the transcript.
+- ONLY include content ACTUALLY discussed in the transcript. Never invent definitions, examples, code, or analogies.
+- If a concept was explained in detail, preserve ALL that detail. If mentioned briefly, be brief.
+- Do NOT add information that was NOT said in the transcript.
+- If no definition was given for something, write "Not explicitly defined in the meeting." — do NOT make one up.
+- If no example was given, write "" — do NOT fabricate one.
 
-STRUCTURE RULES — READ CAREFULLY:
-1. Create one concept entry per DISTINCT CONCEPT actually explained.
-   - Abstraction, Encapsulation, Inheritance, Polymorphism → 4 SEPARATE concept entries (never merge them).
-   - Compile-time Polymorphism, Runtime Polymorphism → EITHER two separate entries OR one parent with two subtypes[].
+MANDATORY STRUCTURE RULES:
+1. Create one concept entry per DISTINCT CONCEPT explained by the speaker.
+   - Example: if the speaker explains Abstraction, Encapsulation, Inheritance, and Polymorphism, create 4 SEPARATE concept entries.
 
-2. When the speaker explains multiple TYPES, CATEGORIES, or SUB-ITEMS of a concept (e.g. "there are two types of polymorphism: compile-time and runtime"), use the subtypes[] array.
-   - Each subtype gets its OWN name, definition, explanation, howAchieved, example, codeExample, importantPoints.
-   - NEVER compress "Type 1 is X and Type 2 is Y" into a single explanation paragraph.
+2. subtypes[] IS MANDATORY whenever the speaker lists or enumerates items belonging to a concept:
+   - "X has N types/pillars/categories/methods/forms/stages/components/kinds/levels" → you MUST create N subtypes[] entries.
+   - "There are two types of polymorphism" → subtypes[] with 2 entries.
+   - "OOP has four pillars" → subtypes[] with 4 entries.
+   - "Access modifiers are: public, private, protected, default" → subtypes[] with 4 entries.
+   - "Advantages of X are: A, B, C" → subtypes[] with 3 entries.
+   - NEVER describe multiple enumerated items inside a single "explanation" string.
+   - NEVER write "X has two types: A and B, where A is... and B is..." in the explanation field.
+   - If items are enumerated, they MUST go into subtypes[], each with its own name, definition, explanation.
 
-3. When the speaker explains access modifiers (public, private, protected, default) separately, create subtypes[] inside the "Access Modifiers" concept with one subtype per modifier.
+3. Each subtype entry must have its OWN fields filled based on what the speaker said about THAT specific item.
 
-4. Preserve the ORDER concepts were introduced.
+4. Preserve the ORDER in which concepts were introduced.
 
-5. Leave fields as "" or [] when not discussed. Never fill them with invented content.
+5. Leave fields as "" or [] when the speaker did not discuss them. Never fill them with invented content.
+
+6. Use plain ASCII hyphens (-) not Unicode dashes. Write "object-oriented" not "object\u00ADoriented".
 
 REQUIRED JSON SCHEMA:
 {
@@ -1295,14 +1304,14 @@ REQUIRED JSON SCHEMA:
   "concepts": [
     {
       "name": "Concept Name",
-      "overview": "1-2 sentence intro to this concept (only if the speaker gave an intro before explaining sub-items). Empty string otherwise.",
+      "overview": "1-2 sentence intro if the speaker gave one before sub-items. Empty string otherwise.",
       "definition": "Definition as given in transcript. Empty string if not defined.",
-      "explanation": "Detailed explanation. Empty string if content is fully in subtypes[].",
+      "explanation": "Detailed explanation. Leave EMPTY if the concept's content is fully represented in subtypes[].",
       "purpose": "Why it is used / what problem it solves, if discussed. Empty string if not.",
       "characteristics": ["characteristic 1"],
       "example": "Any real-world example discussed. Empty string if none.",
       "analogy": "Any analogy used. Empty string if none.",
-      "codeExample": "Any code or pseudocode from the transcript. Empty string if none.",
+      "codeExample": "Code or pseudocode from the transcript. Empty string if none.",
       "importantPoints": ["important point 1"],
       "questionsRaised": ["question or doubt raised, if any"],
       "subtypes": [
@@ -1311,8 +1320,8 @@ REQUIRED JSON SCHEMA:
           "definition": "Definition of this subtype as discussed.",
           "explanation": "Detailed explanation of this subtype.",
           "howAchieved": "How this subtype is achieved/implemented (if discussed). Empty string if not.",
-          "example": "Example of this subtype from the transcript. Empty string if none.",
-          "codeExample": "Code example for this subtype. Empty string if none.",
+          "example": "Example from the transcript. Empty string if none.",
+          "codeExample": "Code example. Empty string if none.",
           "importantPoints": ["important point about this subtype"]
         }
       ]
@@ -1329,27 +1338,38 @@ REQUIRED JSON SCHEMA:
   "actionItems": []
 }
 
-EXAMPLES OF CORRECT STRUCTURE:
+EXAMPLES OF CORRECT vs WRONG STRUCTURE:
 
-WRONG (do not do this):
-{"name": "Polymorphism", "explanation": "Polymorphism has two types: compile-time (method overloading) and runtime (method overriding)..."}
+WRONG — enumerated items compressed into explanation:
+{"name": "Polymorphism", "explanation": "Polymorphism has two types: compile-time (method overloading) and runtime (method overriding). Compile-time polymorphism is achieved through..."}
 
-CORRECT (do this):
-{"name": "Polymorphism", "overview": "Polymorphism means one name multiple forms.", "subtypes": [
-  {"name": "1. Compile-Time Polymorphism", "definition": "...", "howAchieved": "Method overloading", "example": "...", "importantPoints": [...]},
-  {"name": "2. Runtime Polymorphism", "definition": "...", "howAchieved": "Method overriding", "example": "...", "importantPoints": [...]}
+CORRECT — each type is a separate subtype entry:
+{"name": "Polymorphism", "overview": "Polymorphism means one name, multiple forms.", "explanation": "", "subtypes": [
+  {"name": "1. Compile-Time Polymorphism", "definition": "Resolved at compile time.", "howAchieved": "Method overloading", "example": "...", "importantPoints": [...]},
+  {"name": "2. Runtime Polymorphism", "definition": "Resolved at runtime.", "howAchieved": "Method overriding", "example": "...", "importantPoints": [...]}
 ]}
 
-WRONG (do not do this):
-{"name": "Four Pillars of OOP", "explanation": "The four pillars are abstraction, encapsulation, inheritance, and polymorphism..."}
+WRONG — pillars listed in one paragraph:
+{"name": "Four Pillars of OOP", "explanation": "The four pillars are abstraction, encapsulation, inheritance, and polymorphism. Abstraction means hiding..."}
 
-CORRECT (do this — 4 SEPARATE concept entries):
+CORRECT — each pillar is a SEPARATE concept entry:
 [
   {"name": "Abstraction", "definition": "...", "explanation": "...", "example": "..."},
   {"name": "Encapsulation", "definition": "...", "explanation": "...", "example": "..."},
   {"name": "Inheritance", "definition": "...", "explanation": "...", "example": "..."},
-  {"name": "Polymorphism", "definition": "...", "overview": "...", "subtypes": [...]}
-]`
+  {"name": "Polymorphism", "overview": "...", "subtypes": [...]}
+]
+
+WRONG — access modifiers in one paragraph:
+{"name": "Access Modifiers", "explanation": "There are four access modifiers: public, private, protected, and default. Public means..."}
+
+CORRECT — each modifier is a subtype:
+{"name": "Access Modifiers", "overview": "Access modifiers control visibility.", "subtypes": [
+  {"name": "1. Public", "definition": "Accessible from anywhere.", "example": "..."},
+  {"name": "2. Private", "definition": "Accessible only within the same class.", "example": "..."},
+  {"name": "3. Protected", "definition": "Accessible within the same package and subclasses.", "example": "..."},
+  {"name": "4. Default", "definition": "Accessible within the same package.", "example": "..."}
+]}`
 
       expectedSchema = 'educational'
 
@@ -1468,7 +1488,8 @@ REQUIRED JSON SCHEMA:
           { role: 'system', content: systemPrompt },
           { role: 'user', content: `Meeting Transcript:\n${transcriptText}` }
         ],
-        temperature: 0.1
+        temperature: 0.1,
+        max_tokens: 16384
       })
     })
 
