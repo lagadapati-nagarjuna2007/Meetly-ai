@@ -46,7 +46,17 @@ export default function MeetingCard({ meeting, index = 0, onDeleted }) {
 
       const meetingType  = summaryObj.meetingType  || 'General Discussion'
       const overviewText = summaryObj.overview     || 'No overview available.'
-      const concepts     = Array.isArray(summaryObj.concepts)       ? summaryObj.concepts       : []
+      // New schema uses nodes[]; legacy summaries use concepts[]. Normalize here.
+      const nodes        = Array.isArray(summaryObj.nodes)
+        ? summaryObj.nodes
+        : Array.isArray(summaryObj.concepts)
+          ? summaryObj.concepts.map(c => ({
+              ...c,
+              children: Array.isArray(c.children) ? c.children
+                : Array.isArray(c.subtypes) ? c.subtypes.map(s => ({ ...s, purpose: s.howAchieved || s.purpose || '', children: [] }))
+                : []
+            }))
+          : []
       const topics       = Array.isArray(summaryObj.topicsDiscussed)? summaryObj.topicsDiscussed: []
       const keyPoints    = Array.isArray(summaryObj.keyPoints)      ? summaryObj.keyPoints      : []
       const decisions    = Array.isArray(summaryObj.decisionsMade)  ? summaryObj.decisionsMade  : []
@@ -183,19 +193,20 @@ export default function MeetingCard({ meeting, index = 0, onDeleted }) {
       }
 
       // Field label + body block
-      const fieldBlock = (label, text) => {
+      const fieldBlock = (label, text, xPos) => {
         if (!text || String(text).trim() === '') return
         const cleanText = sanitize(text)
         if (!cleanText) return
+        const x = (xPos !== undefined) ? xPos : margin + 4
         need(10)
         doc.setFont('helvetica', 'bold')
         doc.setFontSize(9)
         doc.setTextColor(71, 85, 105)
-        doc.text(label, margin + 4, Y)
+        doc.text(label, x, Y)
         Y += 4.5
         doc.setFont('helvetica', 'normal')
         doc.setFontSize(9.5)
-        printWrapped(cleanText, margin + 4, Y, contentW - 4, 5.2)
+        printWrapped(cleanText, x, Y, contentW - (x - margin) - 2, 5.2)
         Y += 2
       }
 
@@ -339,9 +350,170 @@ export default function MeetingCard({ meeting, index = 0, onDeleted }) {
       Y += 4
 
       // ═══════════════════════════════════════════════════════════════════════
-      // EDUCATIONAL / LECTURE — concept-by-concept study notes
+      // EDUCATIONAL / LECTURE — generic recursive study notes
       // ═══════════════════════════════════════════════════════════════════════
-      if (meetingType === 'Educational / Lecture' && concepts.length > 0) {
+      if (meetingType === 'Educational / Lecture' && nodes.length > 0) {
+
+        // ── Heading background & text colors per depth level ──────────────────
+        // Each depth gets its own visual style. Deeper = smaller + more indented.
+        // Meaning of the node comes from its own data, NOT from the depth number.
+        const depthStyle = (depth) => {
+          // Indent in mm from left margin
+          const indent   = depth * 6
+          // Font sizes scale down with depth
+          const fontSize = Math.max(8, 11 - depth * 1.2)
+          // Heading fill color (r, g, b) — cycles through a palette at deep levels
+          const fills = [
+            [30, 58, 138],   // depth 0 — dark blue
+            [88, 28, 135],   // depth 1 — purple
+            [5, 78, 59],     // depth 2 — dark teal
+            [120, 53, 15],   // depth 3 — dark amber
+            [15, 23, 42],    // depth 4+ — near-black
+          ]
+          const fill = fills[Math.min(depth, fills.length - 1)]
+          // Heading text color matches fill (will render on a lighter bg)
+          const textColors = [
+            [96, 165, 250],  // depth 0 — light blue
+            [192, 132, 252], // depth 1 — light purple
+            [52, 211, 153],  // depth 2 — teal
+            [251, 191, 36],  // depth 3 — amber
+            [148, 163, 184], // depth 4+ — slate
+          ]
+          const textColor = textColors[Math.min(depth, textColors.length - 1)]
+          // Label text for sub-items (shown only for depth > 0)
+          return { indent, fontSize, fill, textColor }
+        }
+
+        // ── Generic recursive node renderer ────────────────────────────────────
+        // depth: 0 = top-level concept, 1 = child, 2 = grandchild, …
+        // prefix: dotted number string like "1", "1.2", "1.2.3"
+        // siblings: total sibling count (used for separator logic)
+        const renderNode = (node, depth, prefix, isLastSibling) => {
+          const style     = depthStyle(depth)
+          const indent    = margin + style.indent
+          const bodyW     = contentW - style.indent - 2
+          const children  = Array.isArray(node.children) ? node.children : []
+
+          // ── Node heading ──
+          const headingH = 8
+          need(headingH + 4)
+          Y += 4
+
+          // Background bar — height adjusts by depth
+          const barH = Math.max(5, headingH - depth * 0.5)
+          doc.setFillColor(...style.fill)
+          doc.setGlobalAlpha ? doc.setGlobalAlpha(0.15) : null
+          doc.roundedRect(indent, Y - barH + 1, bodyW + 2, barH, 1, 1, 'F')
+          doc.setGlobalAlpha ? doc.setGlobalAlpha(1) : null
+
+          doc.setFont('helvetica', 'bold')
+          doc.setFontSize(style.fontSize)
+          doc.setTextColor(...style.textColor)
+          doc.text(`${prefix}. ${sanitize(node.name)}`, indent + 3, Y)
+          Y += 5
+          doc.setFont('helvetica', 'normal')
+          doc.setFontSize(9.5)
+          doc.setTextColor(51, 65, 85)
+
+          // ── Fields (only rendered if non-empty and not a placeholder) ──
+          const hasContent = (s) => {
+            if (!s || typeof s !== 'string') return false
+            const t = s.trim().toLowerCase()
+            return t.length > 0 && t !== 'not explicitly explained in the meeting.' && t !== 'no specific example was provided in the meeting.'
+          }
+          const labelOf = (key) => ({
+            definition:     'Definition:',
+            explanation:    'Explanation:',
+            purpose:        'Purpose / How it is achieved:',
+            example:        'Example:',
+            analogy:        'Real-world Analogy:',
+          }[key] || key)
+
+          for (const key of ['definition', 'explanation', 'purpose']) {
+            if (hasContent(node[key])) {
+              fieldBlock(labelOf(key), sanitize(node[key]), indent + 2)
+            } else if (node[key] && node[key].trim()) {
+              // Still show "Not explicitly explained..." placeholders in italics
+              need(8)
+              doc.setFont('helvetica', 'bolditalic')
+              doc.setFontSize(8.5)
+              doc.setTextColor(71, 85, 105)
+              doc.text(labelOf(key), indent + 2, Y)
+              Y += 4.5
+              doc.setFont('helvetica', 'italic')
+              doc.setFontSize(9)
+              doc.setTextColor(100, 116, 139)
+              printWrapped(sanitize(node[key]), indent + 4, Y, bodyW - 4, 4.8)
+              Y += 2
+            }
+          }
+
+          if (Array.isArray(node.characteristics) && node.characteristics.length > 0) {
+            need(8)
+            doc.setFont('helvetica', 'bold')
+            doc.setFontSize(9)
+            doc.setTextColor(71, 85, 105)
+            doc.text('Characteristics:', indent + 2, Y)
+            Y += 5
+            doc.setFont('helvetica', 'normal')
+            doc.setFontSize(9.5)
+            doc.setTextColor(51, 65, 85)
+            bulletList(node.characteristics, style.indent + 6)
+          }
+
+          if (hasContent(node.example)) {
+            fieldBlock('Example:', sanitize(node.example), indent + 2)
+          }
+
+          if (hasContent(node.analogy)) {
+            fieldBlock('Real-world Analogy:', sanitize(node.analogy), indent + 2)
+          }
+
+          if (node.codeExample && node.codeExample.trim()) {
+            need(10)
+            doc.setFont('helvetica', 'bold')
+            doc.setFontSize(9)
+            doc.setTextColor(71, 85, 105)
+            doc.text('Code / Example:', indent + 2, Y)
+            Y += 5
+            doc.setFont('helvetica', 'normal')
+            codeBlock(node.codeExample)
+          }
+
+          if (Array.isArray(node.importantPoints) && node.importantPoints.length > 0) {
+            need(8)
+            doc.setFont('helvetica', 'bold')
+            doc.setFontSize(9)
+            doc.setTextColor(71, 85, 105)
+            doc.text('Important Points:', indent + 2, Y)
+            Y += 5
+            doc.setFont('helvetica', 'normal')
+            doc.setFontSize(9.5)
+            doc.setTextColor(51, 65, 85)
+            bulletList(node.importantPoints, style.indent + 6)
+          }
+
+          // ── Recurse into children ──
+          if (children.length > 0) {
+            Y += 2
+            children.forEach((child, ci) => {
+              renderNode(child, depth + 1, `${prefix}.${ci + 1}`, ci === children.length - 1)
+            })
+          }
+
+          // ── Separator between siblings ──
+          Y += 2
+          if (!isLastSibling) {
+            need(4)
+            // Slightly lighter/narrower separator at deeper depths
+            const sepGray = Math.min(226 + depth * 10, 240)
+            doc.setDrawColor(sepGray, sepGray + 2, sepGray + 4)
+            doc.setLineWidth(0.3)
+            const sepIndent = margin + style.indent + 4
+            doc.line(sepIndent, Y, PW - sepIndent, Y)
+            Y += 3
+          }
+        }
 
         // Table of Contents
         need(16)
@@ -349,10 +521,10 @@ export default function MeetingCard({ meeting, index = 0, onDeleted }) {
         Y += 2
         doc.setFontSize(9.5)
         doc.setTextColor(51, 65, 85)
-        concepts.forEach((c, i) => {
+        nodes.forEach((n, i) => {
           need(6)
           doc.setFont('helvetica', 'normal')
-          doc.text(`  ${i + 1}.  ${sanitize(c.name)}`, margin + 2, Y)
+          doc.text(`  ${i + 1}.  ${sanitize(n.name)}`, margin + 2, Y)
           Y += 5.5
         })
         Y += 4
@@ -361,141 +533,8 @@ export default function MeetingCard({ meeting, index = 0, onDeleted }) {
         sectionHeading('3', 'Concept Details')
         Y += 2
 
-        concepts.forEach((concept, idx) => {
-          conceptHeading(`${idx + 1}. ${concept.name}`)
-
-          fieldBlock('Definition:', sanitize(concept.definition))
-          fieldBlock('Explanation:', sanitize(concept.explanation))
-          fieldBlock('Purpose / Why it is used:', sanitize(concept.purpose))
-
-          if (concept.characteristics && concept.characteristics.length > 0) {
-            need(8)
-            doc.setFont('helvetica', 'bold')
-            doc.setFontSize(9)
-            doc.setTextColor(71, 85, 105)
-            doc.text('Characteristics:', margin + 4, Y)
-            Y += 5
-            doc.setFont('helvetica', 'normal')
-            doc.setFontSize(9.5)
-            doc.setTextColor(51, 65, 85)
-            bulletList(concept.characteristics, 8)
-          }
-
-          fieldBlock('Example:', sanitize(concept.example))
-          fieldBlock('Real-world Analogy:', sanitize(concept.analogy))
-
-          if (concept.codeExample && concept.codeExample.trim()) {
-            need(10)
-            doc.setFont('helvetica', 'bold')
-            doc.setFontSize(9)
-            doc.setTextColor(71, 85, 105)
-            doc.text('Code / Example:', margin + 4, Y)
-            Y += 5
-            doc.setFont('helvetica', 'normal')
-            codeBlock(concept.codeExample)
-          }
-
-          if (concept.importantPoints && concept.importantPoints.length > 0) {
-            need(8)
-            doc.setFont('helvetica', 'bold')
-            doc.setFontSize(9)
-            doc.setTextColor(71, 85, 105)
-            doc.text('Important Points:', margin + 4, Y)
-            Y += 5
-            doc.setFont('helvetica', 'normal')
-            doc.setFontSize(9.5)
-            doc.setTextColor(51, 65, 85)
-            bulletList(concept.importantPoints, 8)
-          }
-
-          if (concept.questionsRaised && concept.questionsRaised.length > 0) {
-            need(8)
-            doc.setFont('helvetica', 'bold')
-            doc.setFontSize(9)
-            doc.setTextColor(71, 85, 105)
-            doc.text('Questions / Doubts Raised:', margin + 4, Y)
-            Y += 5
-            doc.setFont('helvetica', 'normal')
-            doc.setFontSize(9.5)
-            doc.setTextColor(100, 116, 139)
-            bulletList(concept.questionsRaised, 8)
-          }
-
-          // ── Subtypes (e.g. Compile-Time and Runtime Polymorphism) ──────────────
-          const subtypes = Array.isArray(concept.subtypes) ? concept.subtypes : []
-          if (subtypes.length > 0) {
-            need(10)
-            doc.setFont('helvetica', 'bold')
-            doc.setFontSize(9)
-            doc.setTextColor(71, 85, 105)
-            doc.text('Sub-types / Categories:', margin + 4, Y)
-            Y += 5
-
-            subtypes.forEach((st, si) => {
-              // Sub-type heading
-              need(14)
-              Y += 4
-              doc.setFillColor(237, 233, 254) // light purple
-              doc.roundedRect(margin + 6, Y - 4, contentW - 12, 8, 1, 1, 'F')
-              doc.setFont('helvetica', 'bold')
-              doc.setFontSize(9.5)
-              doc.setTextColor(88, 28, 135)
-              doc.text(sanitize(st.name || `Sub-type ${si + 1}`), margin + 9, Y)
-              Y += 6
-              doc.setFont('helvetica', 'normal')
-              doc.setFontSize(9.5)
-              doc.setTextColor(51, 65, 85)
-
-              fieldBlock('Definition:', sanitize(st.definition))
-              fieldBlock('Explanation:', sanitize(st.explanation))
-              fieldBlock('How it is achieved:', sanitize(st.howAchieved))
-              fieldBlock('Example:', sanitize(st.example))
-
-              if (st.codeExample && st.codeExample.trim()) {
-                need(10)
-                doc.setFont('helvetica', 'bold')
-                doc.setFontSize(9)
-                doc.setTextColor(71, 85, 105)
-                doc.text('Code / Example:', margin + 9, Y)
-                Y += 5
-                doc.setFont('helvetica', 'normal')
-                codeBlock(st.codeExample)
-              }
-
-              if (Array.isArray(st.importantPoints) && st.importantPoints.length > 0) {
-                need(8)
-                doc.setFont('helvetica', 'bold')
-                doc.setFontSize(9)
-                doc.setTextColor(71, 85, 105)
-                doc.text('Important Points:', margin + 9, Y)
-                Y += 5
-                doc.setFont('helvetica', 'normal')
-                doc.setFontSize(9.5)
-                doc.setTextColor(51, 65, 85)
-                bulletList(st.importantPoints, 12)
-              }
-
-              Y += 2
-              if (si < subtypes.length - 1) {
-                need(4)
-                doc.setDrawColor(221, 214, 254)
-                doc.setLineWidth(0.3)
-                doc.line(margin + 12, Y, PW - margin - 12, Y)
-                Y += 3
-              }
-            })
-            Y += 2
-          }
-
-          Y += 2
-          // Light separator between concepts
-          if (idx < concepts.length - 1) {
-            need(4)
-            doc.setDrawColor(226, 232, 240)
-            doc.setLineWidth(0.3)
-            doc.line(margin + 10, Y, PW - margin - 10, Y)
-            Y += 4
-          }
+        nodes.forEach((node, idx) => {
+          renderNode(node, 0, String(idx + 1), idx === nodes.length - 1)
         })
 
         // Key Takeaways (educational)

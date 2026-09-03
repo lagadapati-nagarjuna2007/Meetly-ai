@@ -310,11 +310,122 @@ export default function Report() {
               </div>
             ) : summaryData ? (
               (() => {
+                const meetingType = summaryData?.meetingType || ''
                 const overview = typeof summaryData === 'string' ? summaryData : (summaryData.overview || 'No overview available.')
                 const topics = Array.isArray(summaryData?.topicsDiscussed) ? summaryData.topicsDiscussed : []
                 const keyPoints = Array.isArray(summaryData?.keyPoints) ? summaryData.keyPoints : []
                 const decisions = Array.isArray(summaryData?.decisionsMade) ? summaryData.decisionsMade : []
                 const actions = Array.isArray(summaryData?.actionItems) ? summaryData.actionItems : []
+
+                // Educational hierarchy: normalize nodes[] or legacy concepts[]
+                const nodes = Array.isArray(summaryData?.nodes)
+                  ? summaryData.nodes
+                  : Array.isArray(summaryData?.concepts)
+                    ? summaryData.concepts.map(c => ({
+                        ...c,
+                        children: Array.isArray(c.children) ? c.children
+                          : Array.isArray(c.subtypes) ? c.subtypes.map(s => ({ ...s, purpose: s.howAchieved || s.purpose || '', children: [] }))
+                          : []
+                      }))
+                    : []
+
+                // Recursive node renderer for the UI
+                const renderSummaryNode = (node, depth, prefix) => {
+                  const children = Array.isArray(node.children) ? node.children : []
+                  const indentClass = depth === 0 ? 'pl-0' : depth === 1 ? 'pl-4' : depth === 2 ? 'pl-8' : 'pl-12'
+                  const borderColors = [
+                    'border-blue-500/50',
+                    'border-purple-500/50',
+                    'border-teal-500/50',
+                    'border-amber-500/50',
+                  ]
+                  const headingColors = [
+                    'text-blue-300',
+                    'text-purple-300',
+                    'text-teal-300',
+                    'text-amber-300',
+                  ]
+                  const borderColor = borderColors[Math.min(depth, borderColors.length - 1)]
+                  const headingColor = headingColors[Math.min(depth, headingColors.length - 1)]
+                  const fontSize = depth === 0 ? 'text-[13px]' : depth === 1 ? 'text-[12px]' : 'text-[11px]'
+                  const hasContent = (s) => s && typeof s === 'string' && s.trim().length > 0
+
+                  return (
+                    <div key={`${prefix}-${depth}`} className={`flex flex-col gap-1.5 ${indentClass} border-l-2 ${borderColor} pl-3`}>
+                      {/* Node name heading */}
+                      <span className={`font-bold ${headingColor} ${fontSize}`}>{prefix}. {node.name}</span>
+
+                      {/* Fields — only shown when non-empty */}
+                      {hasContent(node.definition) && (
+                        <div className="flex flex-col gap-0.5">
+                          <span className="text-[10px] font-bold text-gray-400 uppercase tracking-wider">Definition</span>
+                          <p className="text-gray-200 text-[11px] leading-relaxed">{node.definition}</p>
+                        </div>
+                      )}
+                      {hasContent(node.explanation) && (
+                        <div className="flex flex-col gap-0.5">
+                          <span className="text-[10px] font-bold text-gray-400 uppercase tracking-wider">Explanation</span>
+                          <p className="text-gray-300 text-[11px] leading-relaxed">{node.explanation}</p>
+                        </div>
+                      )}
+                      {hasContent(node.purpose) && (
+                        <div className="flex flex-col gap-0.5">
+                          <span className="text-[10px] font-bold text-gray-400 uppercase tracking-wider">Purpose / How it is achieved</span>
+                          <p className="text-gray-300 text-[11px] leading-relaxed">{node.purpose}</p>
+                        </div>
+                      )}
+                      {Array.isArray(node.characteristics) && node.characteristics.length > 0 && (
+                        <div className="flex flex-col gap-0.5">
+                          <span className="text-[10px] font-bold text-gray-400 uppercase tracking-wider">Characteristics</span>
+                          <ul className="flex flex-col gap-0.5">
+                            {node.characteristics.map((ch, i) => (
+                              <li key={i} className="text-gray-300 text-[11px] flex items-start gap-1.5">
+                                <span className="text-purple-400 font-bold shrink-0">•</span>{ch}
+                              </li>
+                            ))}
+                          </ul>
+                        </div>
+                      )}
+                      {hasContent(node.example) && (
+                        <div className="flex flex-col gap-0.5">
+                          <span className="text-[10px] font-bold text-gray-400 uppercase tracking-wider">Example</span>
+                          <p className="text-gray-300 text-[11px] leading-relaxed italic">{node.example}</p>
+                        </div>
+                      )}
+                      {hasContent(node.analogy) && (
+                        <div className="flex flex-col gap-0.5">
+                          <span className="text-[10px] font-bold text-gray-400 uppercase tracking-wider">Analogy</span>
+                          <p className="text-gray-300 text-[11px] leading-relaxed italic">{node.analogy}</p>
+                        </div>
+                      )}
+                      {hasContent(node.codeExample) && (
+                        <div className="flex flex-col gap-0.5">
+                          <span className="text-[10px] font-bold text-gray-400 uppercase tracking-wider">Code Example</span>
+                          <pre className="text-[10px] bg-slate-900/60 border border-white/5 rounded-lg p-2 overflow-x-auto text-green-300 font-mono leading-relaxed whitespace-pre-wrap">{node.codeExample}</pre>
+                        </div>
+                      )}
+                      {Array.isArray(node.importantPoints) && node.importantPoints.length > 0 && (
+                        <div className="flex flex-col gap-0.5">
+                          <span className="text-[10px] font-bold text-gray-400 uppercase tracking-wider">Important Points</span>
+                          <ul className="flex flex-col gap-0.5">
+                            {node.importantPoints.map((pt, i) => (
+                              <li key={i} className="text-gray-300 text-[11px] flex items-start gap-1.5">
+                                <span className="text-amber-400 font-bold shrink-0">!</span>{pt}
+                              </li>
+                            ))}
+                          </ul>
+                        </div>
+                      )}
+
+                      {/* Recursively render children */}
+                      {children.length > 0 && (
+                        <div className="flex flex-col gap-3 mt-1">
+                          {children.map((child, ci) => renderSummaryNode(child, depth + 1, `${prefix}.${ci + 1}`))}
+                        </div>
+                      )}
+                    </div>
+                  )
+                }
 
                 return (
                   <div className="flex flex-col gap-6">
@@ -323,6 +434,11 @@ export default function Report() {
                       <h2 className="text-sm font-bold text-white tracking-wide flex items-center gap-2">
                         <FileText size={16} className="text-brand-purple" />
                         AI Meeting Summary
+                        {meetingType && (
+                          <span className="text-[10px] font-semibold px-2 py-0.5 rounded-full bg-purple-900/40 border border-purple-500/30 text-purple-300">
+                            {meetingType}
+                          </span>
+                        )}
                       </h2>
                       <button
                         onClick={handleGenerateSummaryInReport}
@@ -341,9 +457,25 @@ export default function Report() {
                       </p>
                     </div>
 
-                    {/* 2. Topics Discussed */}
+                    {/* Educational concept tree — only shown for Educational/Lecture type */}
+                    {meetingType === 'Educational / Lecture' && nodes.length > 0 && (
+                      <div className="flex flex-col gap-4 p-4 bg-white/2 border border-white/5 rounded-2xl">
+                        <h3 className="text-xs font-bold uppercase tracking-wider text-brand-purple">2. Concepts &amp; Hierarchy</h3>
+                        <div className="flex flex-col gap-5">
+                          {nodes.map((node, idx) => (
+                            <div key={idx} className="flex flex-col gap-2 p-3 bg-blue-950/20 border border-blue-500/10 rounded-xl">
+                              {renderSummaryNode(node, 0, String(idx + 1))}
+                            </div>
+                          ))}
+                        </div>
+                      </div>
+                    )}
+
+                    {/* 2/3. Topics Discussed */}
                     <div className="flex flex-col gap-3 p-4 bg-white/2 border border-white/5 rounded-2xl">
-                      <h3 className="text-xs font-bold uppercase tracking-wider text-brand-purple">2. Topics Discussed</h3>
+                      <h3 className="text-xs font-bold uppercase tracking-wider text-brand-purple">
+                        {meetingType === 'Educational / Lecture' ? '3. Topics Discussed' : '2. Topics Discussed'}
+                      </h3>
                       {topics.length === 0 ? (
                         <p className="text-gray-400 italic">None identified.</p>
                       ) : (
@@ -358,9 +490,11 @@ export default function Report() {
                       )}
                     </div>
 
-                    {/* 3. Key Points */}
+                    {/* Key Points */}
                     <div className="flex flex-col gap-3 p-4 bg-white/2 border border-white/5 rounded-2xl">
-                      <h3 className="text-xs font-bold uppercase tracking-wider text-brand-purple">3. Key Points</h3>
+                      <h3 className="text-xs font-bold uppercase tracking-wider text-brand-purple">
+                        {meetingType === 'Educational / Lecture' ? '4. Key Takeaways' : '3. Key Points'}
+                      </h3>
                       {keyPoints.length === 0 ? (
                         <p className="text-gray-400 italic">None identified.</p>
                       ) : (
@@ -375,9 +509,11 @@ export default function Report() {
                       )}
                     </div>
 
-                    {/* 4. Decisions Made */}
+                    {/* Decisions Made */}
                     <div className="flex flex-col gap-3 p-4 bg-white/2 border border-white/5 rounded-2xl">
-                      <h3 className="text-xs font-bold uppercase tracking-wider text-brand-purple">4. Decisions Made</h3>
+                      <h3 className="text-xs font-bold uppercase tracking-wider text-brand-purple">
+                        {meetingType === 'Educational / Lecture' ? '5. Decisions Made' : '4. Decisions Made'}
+                      </h3>
                       {decisions.length === 0 ? (
                         <p className="text-gray-400 italic">None identified.</p>
                       ) : (
@@ -392,9 +528,11 @@ export default function Report() {
                       )}
                     </div>
 
-                    {/* 5. Action Items */}
+                    {/* Action Items */}
                     <div className="flex flex-col gap-3 p-4 bg-white/2 border border-white/5 rounded-2xl">
-                      <h3 className="text-xs font-bold uppercase tracking-wider text-brand-purple">5. Action Items</h3>
+                      <h3 className="text-xs font-bold uppercase tracking-wider text-brand-purple">
+                        {meetingType === 'Educational / Lecture' ? '6. Action Items' : '5. Action Items'}
+                      </h3>
                       {actions.length === 0 ? (
                         <p className="text-gray-400 italic">None identified.</p>
                       ) : (
@@ -409,7 +547,7 @@ export default function Report() {
                                   <span className="text-gray-400">→</span>
                                 </>
                               ) : null}
-                              <span className="text-gray-200 font-medium">{a.task}</span>
+                              <span className="text-gray-200 font-medium">{typeof a === 'string' ? a : a.task}</span>
                             </div>
                           ))}
                         </div>

@@ -1375,63 +1375,74 @@ Output ONLY valid JSON: {"meetingType": "<one of the four values above>"}`
     if (meetingType === 'Educational / Lecture') {
       systemPrompt = `You are an expert educational content analyst and note-taker.
 
-Your task: analyze this educational transcript and produce DETAILED, HIGHLY STRUCTURED STUDY NOTES in JSON format.
+Your task: analyze this educational or explanatory transcript and produce DETAILED, HIGHLY STRUCTURED study notes in JSON format.
 
-ANTI-HALLUCINATION RULES (STRICT):
-- ONLY include concepts, definitions, and examples ACTUALLY discussed in the transcript. Never fabricate definitions, code, or analogies.
-- If a topic was mentioned but no definition was given: write "Not explicitly explained in the meeting."
-- If no specific example was discussed: write "No specific example was provided in the meeting." or leave empty string "".
-- Do NOT add outside textbook knowledge that was not mentioned in the transcript.
+=== CORE PRINCIPLE: GENERIC RECURSIVE HIERARCHY ===
 
-MANDATORY ENUMERATION & SUBTYPES RULES:
-1. Whenever the speaker introduces a major concept or pillar (e.g. Abstraction, Encapsulation, Inheritance, Polymorphism, Access Modifiers), create a distinct entry in concepts[].
-2. Whenever the speaker lists multiple types, categories, pillars, forms, methods, stages, components, or classifications:
-   - YOU MUST create separate individual structured entries in subtypes[].
-   - Example 1: "There are two types of polymorphism: method overloading and method overriding" → create 2 individual subtype entries in subtypes[]: one for Method Overloading and one for Method Overriding.
-   - Example 2: "OOP has four pillars: abstraction, encapsulation, inheritance, polymorphism" → create distinct concept entries or subtype entries for all 4 pillars.
-   - Example 3: "Access specifiers have four types: public, private, protected, default" → create 4 individual subtype entries in subtypes[].
-   - NEVER collapse or flatten enumerated items into a single paragraph or explanation string.
-   - NEVER write "Polymorphism has two types: method overloading and method overriding, where..." inside a single explanation field.
-3. Keep definitions, explanations, examples, and important points separate in their own distinct fields.
-4. Use plain ASCII hyphens (-) for hyphenated words: "object-oriented", "compile-time", "runtime", "method-overloading".
+The transcript may be about ANY subject: programming, math, science, history, law, business, medicine, engineering, or anything else.
+Do NOT assume or expect any specific domain. Extract the structure from what the speaker actually says.
 
-REQUIRED JSON SCHEMA:
+Every concept, category, type, stage, component, method, algorithm, rule, or classification encountered in the transcript is a NODE.
+All nodes share the same structure. A node may contain child nodes. Children may contain their own children. There is no fixed meaning for any depth level — the depth reflects the natural hierarchy in the transcript.
+
+=== ENUMERATION DETECTION ===
+
+When the speaker explicitly introduces multiple items under a topic (using phrases such as "there are N X's", "the types are", "the stages are", "the methods include", "categories are", "the forms are", "the pillars are", "the components are", "the phases are", "the cases are", "the properties are", or any similar phrasing), you MUST:
+1. Create a separate child node for EACH item. Never collapse them into a single description.
+2. If any of those items itself has sub-items, nest those under that child node.
+3. The number of children must match exactly what the speaker says. If speaker says 4, create 4. If speaker says 2, create 2.
+
+=== ANTI-HALLUCINATION RULES (STRICT) ===
+- ONLY include content actually stated in the transcript.
+- If a definition was not given: write "Not explicitly explained in the meeting."
+- If no example was given: write "No specific example was provided in the meeting."
+- Do NOT add textbook knowledge not mentioned by the speaker.
+- Do NOT invent definitions, examples, code, or explanations.
+
+=== FIELD RULES ===
+- definition: The definition as stated by the speaker. Not a paragraph summary.
+- explanation: How the speaker elaborated or explained it. Keep separate from definition.
+- purpose: Why it is used, what problem it solves — only if the speaker mentioned it.
+- characteristics: Bullet list of properties mentioned. Empty array if none.
+- example: A specific example the speaker gave. Quote or paraphrase from transcript.
+- analogy: Any comparison or analogy the speaker used. Empty string if none.
+- codeExample: Verbatim code/pseudocode if the speaker wrote or said it. Empty string if none.
+- importantPoints: Bullet list of notable facts or warnings mentioned. Empty array if none.
+- children: Array of child nodes for any sub-items, sub-types, sub-stages, sub-categories, sub-methods, etc.
+
+=== OUTPUT FORMAT ===
+
 {
   "meetingType": "Educational / Lecture",
   "overview": "2-4 sentence summary of what the session covered.",
-  "concepts": [
+  "nodes": [
     {
-      "name": "Concept Name (e.g. Object-Oriented Programming)",
-      "overview": "1-2 sentence intro if the speaker gave one before sub-items. Empty string otherwise.",
-      "definition": "Definition from transcript. If not explicitly defined, write 'Not explicitly explained in the meeting.'",
-      "explanation": "Detailed explanation from transcript. Leave empty string if fully covered in subtypes.",
-      "purpose": "Why it is used / what problem it solves, if discussed. Empty string if not.",
-      "characteristics": ["characteristic 1"],
-      "example": "Real-world or code example if discussed. If not discussed, write 'No specific example was provided in the meeting.'",
+      "name": "Name of this concept, topic, category, or item as stated in the transcript",
+      "definition": "Definition as stated. If not given: 'Not explicitly explained in the meeting.'",
+      "explanation": "Elaboration by the speaker. Empty string if covered by children.",
+      "purpose": "Why it exists or is used, if mentioned. Empty string otherwise.",
+      "characteristics": ["characteristic 1", "characteristic 2"],
+      "example": "Example from transcript. If none: 'No specific example was provided in the meeting.'",
       "analogy": "Any analogy used. Empty string if none.",
-      "codeExample": "Code or pseudocode mentioned in the transcript. Empty string if none.",
+      "codeExample": "Code or pseudocode if mentioned verbatim. Empty string if none.",
       "importantPoints": ["important point 1"],
-      "questionsRaised": ["question or doubt raised, if any"],
-      "subtypes": [
+      "children": [
         {
-          "name": "1. Subtype Name (e.g. Method Overloading)",
-          "definition": "Definition of this subtype as discussed. If not explicitly explained, write 'Not explicitly explained in the meeting.'",
-          "explanation": "Detailed explanation of this subtype.",
-          "howAchieved": "How this subtype is achieved/implemented (if discussed). Empty string if not.",
-          "example": "Example from the transcript. If none discussed, write 'No specific example was provided in the meeting.'",
-          "codeExample": "Code example from transcript. Empty string if none.",
-          "importantPoints": ["important point about this subtype"]
+          "name": "Child name — a sub-type, sub-stage, sub-method, category item, or nested concept",
+          "definition": "...",
+          "explanation": "...",
+          "purpose": "",
+          "characteristics": [],
+          "example": "...",
+          "analogy": "",
+          "codeExample": "",
+          "importantPoints": [],
+          "children": []
         }
       ]
     }
   ],
   "keyPoints": ["Overall key takeaway 1", "Key takeaway 2"],
-  "topicsDiscussed": [
-    {
-      "title": "Topic Title",
-      "description": "Brief description for table of contents."
-    }
-  ],
   "decisionsMade": [],
   "actionItems": []
 }`
@@ -1570,59 +1581,60 @@ REQUIRED JSON SCHEMA:
     let finalSummary
 
     if (expectedSchema === 'educational') {
-      const rawConcepts = Array.isArray(parsedSummary.concepts) ? parsedSummary.concepts : []
-
-      // Helper: normalize a subtype object
-      const sanitizeSubtype = (s) => ({
-        name: String(s.name || '').trim(),
-        definition: String(s.definition || '').trim(),
-        explanation: String(s.explanation || '').trim(),
-        howAchieved: String(s.howAchieved || '').trim(),
-        example: String(s.example || '').trim(),
-        codeExample: String(s.codeExample || '').trim(),
-        importantPoints: Array.isArray(s.importantPoints)
-          ? s.importantPoints.map(x => String(x).trim()).filter(Boolean)
-          : []
-      })
-
-      const sanitizedConcepts = rawConcepts
-        .filter(c => c && typeof c === 'object' && c.name)
-        .map(c => ({
-          name: String(c.name || '').trim(),
-          overview: String(c.overview || '').trim(),
-          definition: String(c.definition || '').trim(),
-          explanation: String(c.explanation || '').trim(),
-          purpose: String(c.purpose || '').trim(),
-          characteristics: Array.isArray(c.characteristics)
-            ? c.characteristics.map(x => String(x).trim()).filter(Boolean)
-            : [],
-          example: String(c.example || '').trim(),
-          analogy: String(c.analogy || '').trim(),
-          codeExample: String(c.codeExample || '').trim(),
-          importantPoints: Array.isArray(c.importantPoints)
-            ? c.importantPoints.map(x => String(x).trim()).filter(Boolean)
-            : [],
-          questionsRaised: Array.isArray(c.questionsRaised)
-            ? c.questionsRaised.map(x => String(x).trim()).filter(Boolean)
-            : [],
-          subtypes: Array.isArray(c.subtypes)
-            ? c.subtypes.filter(s => s && typeof s === 'object' && s.name).map(sanitizeSubtype)
+      // Recursively normalize any node at arbitrary depth.
+      // Accepts both the new `children[]` key and the legacy `subtypes[]` key.
+      // All nodes share the same fields regardless of depth.
+      const sanitizeNode = (n, depth = 0) => {
+        if (!n || typeof n !== 'object' || !n.name) return null
+        const children = Array.isArray(n.children)
+          ? n.children
+          : Array.isArray(n.subtypes)
+            ? n.subtypes  // legacy compat
             : []
-        }))
+        return {
+          name: String(n.name || '').trim(),
+          definition: String(n.definition || '').trim(),
+          explanation: String(n.explanation || '').trim(),
+          purpose: String(n.purpose || n.howAchieved || '').trim(),
+          characteristics: Array.isArray(n.characteristics)
+            ? n.characteristics.map(x => String(x).trim()).filter(Boolean)
+            : [],
+          example: String(n.example || '').trim(),
+          analogy: String(n.analogy || '').trim(),
+          codeExample: String(n.codeExample || '').trim(),
+          importantPoints: Array.isArray(n.importantPoints)
+            ? n.importantPoints.map(x => String(x).trim()).filter(Boolean)
+            : [],
+          children: children
+            .map(child => sanitizeNode(child, depth + 1))
+            .filter(Boolean)
+        }
+      }
 
-      // Build topicsDiscussed from concepts for backward compatibility
-      const topicsFromConcepts = sanitizedConcepts.map(c => ({
-        title: c.name,
-        description: c.definition || c.explanation?.slice(0, 150) || ''
+      // Accept new `nodes[]` key or legacy `concepts[]` key
+      const rawNodes = Array.isArray(parsedSummary.nodes)
+        ? parsedSummary.nodes
+        : Array.isArray(parsedSummary.concepts)
+          ? parsedSummary.concepts
+          : []
+
+      const sanitizedNodes = rawNodes.map(n => sanitizeNode(n)).filter(Boolean)
+
+      // Count total nested items for diagnostics
+      const countItems = (nodes) => nodes.reduce((sum, n) => sum + 1 + countItems(n.children || []), 0)
+
+      // Build backward-compatible topicsDiscussed from top-level nodes
+      const topicsFromNodes = sanitizedNodes.map(n => ({
+        title: n.name,
+        description: n.definition?.slice(0, 150) || n.explanation?.slice(0, 150) || ''
       }))
 
       finalSummary = {
         meetingType: 'Educational / Lecture',
         overview: typeof parsedSummary.overview === 'string' ? parsedSummary.overview.trim() : '',
-        concepts: sanitizedConcepts,
-        topicsDiscussed: Array.isArray(parsedSummary.topicsDiscussed) && parsedSummary.topicsDiscussed.length > 0
-          ? parsedSummary.topicsDiscussed.map(t => ({ title: String(t.title || '').trim(), description: String(t.description || '').trim() })).filter(t => t.title)
-          : topicsFromConcepts,
+        nodes: sanitizedNodes,
+        // Kept for backward compatibility in Report.jsx flat sections
+        topicsDiscussed: topicsFromNodes,
         keyPoints: Array.isArray(parsedSummary.keyPoints)
           ? parsedSummary.keyPoints.map(k => String(k).trim()).filter(Boolean)
           : [],
@@ -1632,8 +1644,8 @@ REQUIRED JSON SCHEMA:
 
       console.log('[Summary Generation Complete]')
       console.log(`  provider=${summaryLLMResponse.provider}`)
-      console.log(`  major_topics=${sanitizedConcepts.length}`)
-      console.log(`  summary_sections=${sanitizedConcepts.length + 2}`)
+      console.log(`  top_level_nodes=${sanitizedNodes.length}`)
+      console.log(`  total_nested_items=${countItems(sanitizedNodes)}`)
 
     } else if (expectedSchema === 'technical') {
       const technicalDetails = Array.isArray(parsedSummary.technicalDetails)
