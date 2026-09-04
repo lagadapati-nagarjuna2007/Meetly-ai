@@ -55,7 +55,11 @@ app.use('/api/meeting', aiChatRoutes)
 
 // Server Health Check endpoint
 app.get('/health', (req, res) => {
-  res.status(200).json({ status: 'OK', timestamp: new Date() })
+  res.status(200).json({
+    status: 'OK',
+    timestamp: new Date(),
+    classifier_version: '3layer-2026-09-04'
+  })
 })
 
 const httpServer = app.listen(PORT, () => {
