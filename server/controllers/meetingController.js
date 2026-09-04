@@ -1324,34 +1324,159 @@ export const generateSummary = async (req, res) => {
     console.log(`  transcript_chunks=${chunks.length}`)
     console.log(`  transcript_length=${transcriptText.length} chars`)
 
-    // ── STEP 1: Classify meeting type ────────────────────────────────────────
+    // ── STEP 1: Classify meeting type ─────────────────────────────────────────
+    //
+    // Three-layer approach:
+    //   Layer 1 – Generic educational signal heuristic (topic-agnostic, fast)
+    //   Layer 2 – LLM classification (intent-focused, not subject-focused)
+    //   Layer 3 – Heuristic safeguard: override "General Discussion" when
+    //             Layer 1 finds strong educational signals
+    //
+    // IMPORTANT: No hardcoded subjects, technology names, or domain words.
+    // Classification is based purely on INTENT (teaching vs. working).
+    // ────────────────────────────────────────────────────────────────────────
+
+    // ── Layer 1: Generic educational signal heuristic ────────────────────────
+    // Detects topic-agnostic teaching/learning intent from the transcript text.
+    // Returns a signal count and a boolean isEducational determination.
+    const detectEducationalSignals = (text) => {
+      const t = text.toLowerCase()
+      let intentCount = 0
+      let definitionCount = 0
+      let enumerationCount = 0
+      let explanatoryCount = 0
+
+      // Teaching intent phrases — topic-agnostic instructional language
+      const intentPatterns = [
+        /\btoday (we|i|let'?s) (will |are |'re )?(learn|understand|study|discuss|cover|look at|go through|explain|talk about)\b/,
+        /\blet'?s (learn|understand|study|look at|go through|talk about|explore)\b/,
+        /\bi('?ll| will| am going to) (explain|teach|show|demonstrate|walk you through|go over)\b/,
+        /\bthis (session|class|lecture|lesson|tutorial|module|unit)\b/,
+        /\bby the end of (this|today|the session|the class)\b/,
+        /\bpay attention\b/,
+        /\btake (notes?|note of)\b/,
+        /\bany (questions?|doubts?|clarifications?)\b/,
+        /\bdoes (anyone|somebody|everyone) (understand|know|remember|recall|have questions)\b/,
+        /\b(instructor|professor|teacher|trainer|tutor)\b/,
+        /\b(students?|learners?|class|audience)\b.*\b(understand|know|see)\b/,
+        /\bwe can (now|next|also|then|further)\b.*\b(see|learn|understand|look at|discuss|cover)\b/,
+      ]
+
+      // Definition patterns — explicit explanation of concepts
+      const definitionPatterns = [
+        /\b(is|are) (defined|known) as\b/,
+        /\bthe definition of\b/,
+        /\bwhat (is|are) (a |an |the )?\w+/,
+        /\b(basically|simply|essentially|technically|formally) (it|this|that|they) (is|are|means|refers|works)\b/,
+        /\bin other words\b/,
+        /\bto put it (simply|differently|another way)\b/,
+        /\bthink of it as\b/,
+        /\bit means (that|when|if)?\b/,
+        /\bthat is[,:]?\s/,
+        /\bi\.?e\.?\b/,
+      ]
+
+      // Enumeration patterns — teaching structure signals
+      const enumerationPatterns = [
+        /\bthere are (\d+|one|two|three|four|five|six|seven|eight|nine|ten|multiple|several|many|different) (types?|kinds?|forms?|ways?|steps?|stages?|phases?|methods?|components?|parts?|categories?|pillars?|properties?|features?|aspects?|elements?|principles?|rules?|cases?|conditions?|levels?|modes?)\b/,
+        /\bthe (first|second|third|fourth|fifth|sixth|seventh|eighth|ninth|tenth|last|next|final|another|one more) (type|kind|form|way|step|stage|phase|method|category|component|pillar|property|feature)\b/,
+        /\bnumber (one|two|three|four|five|six|1|2|3|4|5|6)[,: ]/,
+        /\bpoint (one|two|three|four|five|1|2|3|4|5)[,: ]/,
+        /\b(examples?|for example|for instance|e\.?g\.?)[,: ]/,
+        /\bsuch as\b/,
+        /\bnamely\b/,
+        /\bfirstly[,: ]/,
+        /\bsecondly[,: ]/,
+      ]
+
+      // Explanatory/analytical language
+      const explanatoryPatterns = [
+        /\bhow (does|do|it|this|that) (work|function|happen|occur|operate|behave)\b/,
+        /\bwhy (is|are|does|do|would|should|can|could|did)\b/,
+        /\bthe (reason|purpose|goal|aim|advantage|benefit|disadvantage|use|usage|application) (is|of|for|behind)\b/,
+        /\bused (for|to|when|in|by)\b/,
+        /\b(helps?|allows?|enables?|prevents?|ensures?|provides?|offers?) (us|you|the .{0,20})\b/,
+        /\bunderstand (how|why|what|when|where)\b/,
+        /\bthe concept of\b/,
+        /\bthe difference between\b/,
+        /\badvantage(s)? of\b/,
+        /\bdisadvantage(s)? of\b/,
+        /\bcompared to\b/,
+      ]
+
+      for (const p of intentPatterns)      { if (p.test(t)) intentCount++ }
+      for (const p of definitionPatterns)  { if (p.test(t)) definitionCount++ }
+      for (const p of enumerationPatterns) { if (p.test(t)) enumerationCount++ }
+      for (const p of explanatoryPatterns) { if (p.test(t)) explanatoryCount++ }
+
+      const totalSignals = intentCount + definitionCount + enumerationCount + explanatoryCount
+      const signals = []
+      if (intentCount > 0)      signals.push(`intent(${intentCount})`)
+      if (definitionCount > 0)  signals.push(`definition(${definitionCount})`)
+      if (enumerationCount > 0) signals.push(`enumeration(${enumerationCount})`)
+      if (explanatoryCount > 0) signals.push(`explanatory(${explanatoryCount})`)
+
+      // Threshold: high confidence = 1 intent + 3+ total, or 2+ defs + 4+ total, or 6+ total
+      const isEducational = (intentCount >= 1 && totalSignals >= 3)
+        || (definitionCount >= 2 && totalSignals >= 4)
+        || (enumerationCount >= 2 && totalSignals >= 3)
+        || (totalSignals >= 6)
+
+      return { intentCount, definitionCount, enumerationCount, explanatoryCount, totalSignals, signals, isEducational }
+    }
+
+    const heuristic = detectEducationalSignals(transcriptText.slice(0, 8000))
+    const heuristicType = heuristic.isEducational ? 'Educational / Lecture' : null
+
+    console.log('[Meeting Classification - Layer 1 Heuristic]')
+    console.log(`  educational_signals=[${heuristic.signals.join(', ')}]`)
+    console.log(`  total_signals=${heuristic.totalSignals}`)
+    console.log(`  heuristic_verdict=${heuristicType || 'non-educational'}`)
+
+    // ── Layer 2: LLM classification (intent-focused) ──────────────────────────
     let meetingType = 'General Discussion'
     try {
       const classifyMessages = [
         {
           role: 'system',
-          content: `You are a meeting classifier. Read the transcript and output ONLY {"meetingType": "<value>"}.
+          content: `You are a meeting intent classifier. Read the transcript and output ONLY {"meetingType": "<value>"}.
+
+Your job is to determine the PRIMARY INTENT of the meeting — not the subject matter.
 
 Choose exactly one value:
-- "Educational / Lecture" — Any class, lecture, tutorial, study session, or teaching/learning meeting. Signs: explaining OOP, Java, Python, algorithms, data structures, science, math, access modifiers, inheritance, polymorphism, encapsulation, abstraction, or any educational subject. A speaker teaching learners, explaining "what is X", "definition of X", "types of X", "four pillars", "advantages of X". This is the MOST COMMON type — use it whenever someone is teaching or explaining concepts.
-- "Technical / Development" — A team software development meeting (sprint, code review, bug triage, system design) where professionals are NOT primarily teaching concepts to learners.
-- "Business / Professional" — Business strategy, HR, sales, project management.
-- "General Discussion" — LAST RESORT ONLY. Use only when the meeting clearly does not involve teaching OR technical team work OR business matters.
 
-CRITICAL: A Java/OOP/programming lecture IS "Educational / Lecture", NOT "Technical / Development". Teaching sessions are always "Educational / Lecture".
+- "Educational / Lecture" — The meeting's primary intent is TEACHING or LEARNING. One or more people are explaining concepts, giving definitions, describing how things work, listing types/stages/steps, demonstrating processes, or answering questions from learners. The subject can be ANYTHING: science, technology, history, law, medicine, cooking, music, finance — it does not matter. If someone is teaching and others are learning, choose this.
 
-Output ONLY valid JSON: {"meetingType": "<one of the four values above>"}`
+- "Technical / Development" — A team of professionals working together on a software project (sprint planning, code review, bug triage, system design, architecture discussion). The intent is to make decisions or coordinate work among team members — NOT to teach concepts to learners.
+
+- "Business / Professional" — Business strategy, HR, sales, finance, project management, client meetings, or organizational planning among colleagues or clients.
+
+- "General Discussion" — LAST RESORT ONLY. Use only when the meeting clearly does not involve teaching/learning, technical team work, or business matters. Ordinary personal conversations, casual chat, or unclassifiable content.
+
+DECISION RULE:
+Ask yourself: "Is someone primarily explaining or teaching something to someone else?"
+- YES → "Educational / Lecture"
+- NO, but it's a team technical work meeting → "Technical / Development"
+- NO, but it's a business meeting → "Business / Professional"
+- None of the above → "General Discussion"
+
+IMPORTANT: The same subject (e.g. programming, networking) can appear in different types:
+- A lecture about programming → "Educational / Lecture"
+- A sprint planning meeting about a programming project → "Technical / Development"
+The difference is INTENT, not SUBJECT.
+
+Output ONLY valid JSON with no explanation: {"meetingType": "<one of the four values above>"}`
         },
         {
           role: 'user',
-          content: `Transcript (first 5000 chars):\n${transcriptText.slice(0, 5000)}`
+          content: `Classify this transcript:\n\n${transcriptText.slice(0, 5000)}`
         }
       ]
 
       const classifyResult = await callSummaryLLM({
         messages: classifyMessages,
         temperature: 0.0,
-        maxTokens: 100,
+        maxTokens: 60,
         transcriptChars: transcriptText.length,
         isJson: true
       })
@@ -1362,11 +1487,30 @@ Output ONLY valid JSON: {"meetingType": "<one of the four values above>"}`
         meetingType = parsedClassify.meetingType
       }
     } catch (classifyErr) {
-      console.warn('[Summary Classification Warning] Defaulting to General Discussion:', classifyErr.message)
+      console.warn('[Summary Classification Warning] LLM classification failed, using heuristic or default:', classifyErr.message)
     }
 
-    console.log('[Summary Type]')
-    console.log(`  type=${meetingType}`)
+    console.log('[Meeting Classification - Layer 2 LLM]')
+    console.log(`  llm_type=${meetingType}`)
+
+    // ── Layer 3: Heuristic safeguard ──────────────────────────────────────────
+    // If the LLM returns "General Discussion" but the heuristic strongly
+    // detected educational signals, override to "Educational / Lecture".
+    // This prevents LLM misclassification for transcripts with clear teaching
+    // intent, without hardcoding any subject or domain knowledge.
+    const llmType = meetingType
+    if (meetingType === 'General Discussion' && heuristic.isEducational) {
+      meetingType = 'Educational / Lecture'
+      console.log('[Meeting Classification - Layer 3 Safeguard]')
+      console.log(`  override: "General Discussion" → "Educational / Lecture"`)
+      console.log(`  reason: heuristic detected ${heuristic.totalSignals} educational signals`)
+      console.log(`  signals=[${heuristic.signals.join(', ')}]`)
+    }
+
+    console.log('[Meeting Classification - Final]')
+    console.log(`  llm_type=${llmType}`)
+    console.log(`  educational_signals=[${heuristic.signals.join(', ')}]`)
+    console.log(`  final_type=${meetingType}`)
 
     // ── STEP 2: Type-specific prompt ──────────────────────────────────────────
     let systemPrompt
