@@ -8,9 +8,12 @@ import {
   useParticipants,
   VideoTrack,
   RoomAudioRenderer,
-  useMaybeRoomContext
+  useMaybeRoomContext,
+  useConnectionState
 } from '@livekit/components-react'
-import { Track, RoomEvent } from 'livekit-client'
+import { Track, RoomEvent, AudioPresets, ConnectionQuality, ConnectionState } from 'livekit-client'
+
+
 import { useMeetings } from '../context/MeetingContext'
 import { useAuth } from '../context/AuthContext'
 import { useToast } from '../components/Toast'
@@ -692,6 +695,28 @@ function MeetingRoomInner() {
         }
         showToast('LiveKit connection error: ' + (errMsg || 'Check your credentials.'), 'error')
       }}
+      // ── LiveKit Room options for connection resilience ──────────────────
+      // dynacast: automatically disables simulcast layers not being viewed,
+      //   reducing upstream bandwidth when network quality degrades.
+      // adaptiveStream: subscriber-side adapts received video quality
+      //   to actual viewport size and available bandwidth.
+      // publishDefaults.simulcast: publish camera in multiple resolution
+      //   layers so the server can route the appropriate layer per subscriber.
+      // publishDefaults.audioPreset speech: dedicated 24 kbps for audio so
+      //   speech remains stable while video quality adjusts down first.
+      // publishDefaults.stopMicTrackOnMute: keep the mic WebRTC track alive
+      //   during mute for seamless unmute after reconnect.
+      // DefaultReconnectPolicy built into the Room retries up to 10 times
+      //   with back-off (0 ms → 300 ms → 1.2 s … 7 s) — no custom loop needed.
+      options={{
+        dynacast: true,
+        adaptiveStream: true,
+        publishDefaults: {
+          simulcast: true,
+          audioPreset: AudioPresets.speech,
+          stopMicTrackOnMute: false
+        }
+      }}
     >
       <MeetingRoomContent
         meetingData={meetingData}
@@ -823,6 +848,53 @@ function MeetingRoomContent({
 
   const roomState = room?.state
   console.log('[MeetingRoomContent Render] roomState:', roomState, 'localParticipant:', !!localParticipant, 'participants count:', participants?.length || 0)
+
+  // ── Connection resilience: reconnect lifecycle ──────────────────────────────
+  // useConnectionState reads from the LiveKitRoom context (no extra room ref needed)
+  // and returns one of: ConnectionState.Connected | Reconnecting | Disconnected | Connecting
+  const connectionState = useConnectionState()
+  const [isReconnecting, setIsReconnecting] = useState(false)
+
+  // Listen for LiveKit's built-in reconnect lifecycle events.
+  // RoomEvent.Reconnecting fires when the DefaultReconnectPolicy starts retrying.
+  // RoomEvent.Reconnected fires when the room comes back successfully.
+  // IMPORTANT: isIntentionalLeaveRef guards these — if the user clicked Leave/End,
+  // we do not show the reconnect banner because the disconnect is intentional.
+  useEffect(() => {
+    if (!room) return
+
+    const onReconnecting = () => {
+      if (isIntentionalLeaveRef?.current) {
+        console.log('[LiveKit Reconnect] Intentional leave in progress — suppressing reconnect banner.')
+        return
+      }
+      console.log('[LiveKit Reconnect] Connection lost. LiveKit DefaultReconnectPolicy is retrying...')
+      setIsReconnecting(true)
+    }
+
+    const onReconnected = () => {
+      console.log('[LiveKit Reconnect] Successfully reconnected to room.')
+      setIsReconnecting(false)
+    }
+
+    const onDisconnected = () => {
+      // Only clear the reconnect banner if we're not in an intentional leave
+      // (intentional leaves already navigate away, so this is a safety clear)
+      if (!isIntentionalLeaveRef?.current) {
+        setIsReconnecting(false)
+      }
+    }
+
+    room.on(RoomEvent.Reconnecting, onReconnecting)
+    room.on(RoomEvent.Reconnected, onReconnected)
+    room.on(RoomEvent.Disconnected, onDisconnected)
+
+    return () => {
+      room.off(RoomEvent.Reconnecting, onReconnecting)
+      room.off(RoomEvent.Reconnected, onReconnected)
+      room.off(RoomEvent.Disconnected, onDisconnected)
+    }
+  }, [room, isIntentionalLeaveRef])
 
   // ─── AI Attendance State Machine (Face-Presence Intervals) ─────────────────
   //
@@ -2602,6 +2674,21 @@ function MeetingRoomContent({
               </div>
             </>
           )}
+        </div>
+      )}
+      {/* ── Connection Reconnecting Banner ─────────────────────────────────────
+          Shown only when LiveKit's DefaultReconnectPolicy is actively retrying
+          (RoomEvent.Reconnecting fired). Dismissed on RoomEvent.Reconnected.
+          NOT shown for intentional Leave/End actions (guarded by isIntentionalLeaveRef).
+          Non-invasive: top bar only, does not block controls.                     */}
+      {isReconnecting && !isIntentionalLeaveRef?.current && (
+        <div
+          role="status"
+          aria-live="polite"
+          className="absolute top-0 left-0 right-0 z-50 flex items-center justify-center gap-2 px-4 py-2 bg-amber-500/90 backdrop-blur-sm text-slate-950 text-[11px] font-bold select-none"
+        >
+          <div className="w-3 h-3 border-2 border-slate-950/40 border-t-slate-950 rounded-full animate-spin shrink-0" />
+          <span>Connection interrupted — reconnecting automatically…</span>
         </div>
       )}
       {/* Top Header Panel */}
