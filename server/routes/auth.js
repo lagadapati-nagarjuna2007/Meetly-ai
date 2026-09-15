@@ -7,7 +7,8 @@ import {
   forgotPassword,
   resetPassword,
   logout,
-  getMe
+  getMe,
+  updateProfile
 } from '../controllers/authController.js'
 import { authenticateToken } from '../middleware/auth.js'
 import rateLimit from 'express-rate-limit'
@@ -35,7 +36,8 @@ router.post('/forgot-password', forgotPasswordLimiter, forgotPassword)
 router.post('/reset-password', verifyOtpLimiter, resetPassword)
 router.post('/logout', logout)
 
-// Protected Session Route
+// Protected Session & Profile Routes
 router.get('/me', authenticateToken, getMe)
+router.put('/profile', authenticateToken, updateProfile)
 
 export default router

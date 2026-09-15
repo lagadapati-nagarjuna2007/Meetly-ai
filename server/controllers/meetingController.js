@@ -297,9 +297,18 @@ export const createMeeting = async (req, res) => {
       return res.status(500).json({ message: 'LiveKit credentials missing on server.' })
     }
 
+    // Fetch latest user profile from DB as the authoritative source for display name
+    const { data: currentUserRecord } = await supabase
+      .from('users')
+      .select('full_name, email')
+      .eq('id', req.user.id)
+      .maybeSingle()
+
+    const displayName = currentUserRecord?.full_name?.trim() || req.user.full_name || req.user.name || 'Anonymous'
+
     const at = new AccessToken(apiKey, apiSecret, {
       identity: req.user.email || req.user.id,
-      name: req.user.full_name || req.user.name,
+      name: displayName,
       metadata: JSON.stringify({ userId: req.user.id, role: 'host' })
     })
 
@@ -554,9 +563,18 @@ export const joinMeeting = async (req, res) => {
       return res.status(500).json({ message: 'LiveKit server credentials missing.' })
     }
 
+    // Fetch latest user profile from DB as the authoritative source for display name
+    const { data: currentUserRecord } = await supabase
+      .from('users')
+      .select('full_name, email')
+      .eq('id', req.user.id)
+      .maybeSingle()
+
+    const displayName = currentUserRecord?.full_name?.trim() || req.user.full_name || req.user.name || 'Anonymous'
+
     const at = new AccessToken(apiKey, apiSecret, {
       identity: req.user.email || req.user.id,
-      name: req.user.full_name || req.user.name,
+      name: displayName,
       metadata: JSON.stringify({ userId: req.user.id, role })
     })
 

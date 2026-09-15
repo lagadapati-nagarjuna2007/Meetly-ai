@@ -453,3 +453,62 @@ export const getMe = async (req, res) => {
     return res.status(500).json({ message: 'Server error while checking session.' })
   }
 }
+
+// 9. UPDATE PROFILE
+export const updateProfile = async (req, res) => {
+  try {
+    const { name } = req.body
+    if (!name || !name.trim()) {
+      return res.status(400).json({ message: 'Name cannot be empty.' })
+    }
+
+    const trimmedName = name.trim()
+    console.log(`[AUTH DEBUG] PUT /profile for User ID: ${req.user.id}, new name: "${trimmedName}"`)
+
+    const updateFields = {
+      full_name: trimmedName,
+      updated_at: new Date().toISOString()
+    }
+
+    const { data: updatedUser, error: updateErr } = await supabase
+      .from('users')
+      .update(updateFields)
+      .eq('id', req.user.id)
+      .select('id, full_name, email')
+      .single()
+
+    if (updateErr) {
+      console.error('[AUTH ERROR] Update profile failed:', updateErr)
+      throw updateErr
+    }
+
+    // Refresh JWT with the new profile name
+    const token = jwt.sign(
+      {
+        id: updatedUser.id,
+        email: updatedUser.email,
+        name: updatedUser.full_name,
+        role: req.user.role || 'Student'
+      },
+      process.env.JWT_SECRET,
+      { expiresIn: '24h' }
+    )
+
+    res.cookie('meetly_token', token, getCookieConfig())
+
+    return res.status(200).json({
+      message: 'Profile updated successfully.',
+      token,
+      user: {
+        id: updatedUser.id,
+        name: updatedUser.full_name,
+        email: updatedUser.email,
+        role: req.user.role || 'Student',
+        avatar: 'https://images.unsplash.com/photo-1535713875002-d1d0cf377fde?auto=format&fit=crop&w=150&h=150&q=80'
+      }
+    })
+  } catch (err) {
+    console.error('Update profile error:', err)
+    return res.status(500).json({ message: 'Server error while updating profile.' })
+  }
+}

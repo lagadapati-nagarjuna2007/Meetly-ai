@@ -205,10 +205,30 @@ export function AuthProvider({ children }) {
     }
   }
 
-  const updateProfile = (name, email) => {
+  const updateProfile = async (name, email) => {
     if (!user) return
     const updated = { ...user, name, email }
     setUser(updated)
+
+    try {
+      const res = await fetch(`${API_URL}/profile`, {
+        method: 'PUT',
+        headers: getAuthHeaders(),
+        body: JSON.stringify({ name, email }),
+        credentials: 'include'
+      })
+      const data = await res.json()
+      if (res.ok && data.token) {
+        sessionStorage.setItem('meetly_auth_token', data.token)
+        if (data.user) {
+          setUser(data.user)
+        }
+      } else if (!res.ok) {
+        console.warn('[AuthContext] Backend profile update returned error:', data.message)
+      }
+    } catch (err) {
+      console.error('[AuthContext] Failed to persist profile update to backend:', err)
+    }
   }
 
   return (

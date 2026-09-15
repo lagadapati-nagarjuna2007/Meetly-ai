@@ -933,6 +933,92 @@ function MeetingRoomContent({
   const isTranscriptActiveRef = useRef(false)
   const activeTranscriptUploadsRef = useRef(0)
 
+  // ─── Unified Physical Camera Architecture ─────────────────────────────────
+  // Exactly ONE physical camera acquisition is shared between AI Attendance and LiveKit.
+  // • AI Attendance captures frames locally via hidden video element.
+  // • LiveKit publishes a cloned track so toggling/muting LiveKit never kills
+  //   the physical camera track needed by Attendance.
+  // • Physical camera is released ONLY when neither Attendance nor LiveKit needs it.
+  const physicalCameraStreamRef = useRef(null)
+  const physicalCameraTrackRef = useRef(null)
+  const acquiringCameraPromiseRef = useRef(null)
+  const attendanceNeedsCameraRef = useRef(false)
+  const meetingCamActiveRef = useRef(false)
+
+  const getOrCreatePhysicalTrack = useCallback(async () => {
+    if (physicalCameraTrackRef.current && physicalCameraTrackRef.current.readyState === 'live') {
+      return physicalCameraTrackRef.current
+    }
+    if (acquiringCameraPromiseRef.current) {
+      return acquiringCameraPromiseRef.current
+    }
+
+    acquiringCameraPromiseRef.current = (async () => {
+      try {
+        console.log('[Camera Architecture] Acquiring single physical camera stream via getUserMedia...')
+        let stream
+        try {
+          stream = await navigator.mediaDevices.getUserMedia({
+            video: { width: { ideal: 1280 }, height: { ideal: 720 }, facingMode: 'user' },
+            audio: false
+          })
+        } catch (firstErr) {
+          const isBusyError = firstErr.name === 'NotReadableError' ||
+                              firstErr.name === 'TrackStartError' ||
+                              (firstErr.message && firstErr.message.toLowerCase().includes('could not start video source'))
+          if (isBusyError) {
+            console.warn('[Camera Architecture] Camera hardware transiently busy, retrying in 400ms...')
+            await new Promise(r => setTimeout(r, 400))
+            stream = await navigator.mediaDevices.getUserMedia({
+              video: { width: { ideal: 1280 }, height: { ideal: 720 }, facingMode: 'user' },
+              audio: false
+            })
+          } else {
+            throw firstErr
+          }
+        }
+
+        physicalCameraStreamRef.current = stream
+        const track = stream.getVideoTracks()[0]
+        physicalCameraTrackRef.current = track
+
+        track.onended = () => {
+          console.warn('[Camera Architecture] Physical camera track ended by hardware/OS')
+          physicalCameraTrackRef.current = null
+          physicalCameraStreamRef.current = null
+        }
+        return track
+      } finally {
+        acquiringCameraPromiseRef.current = null
+      }
+    })()
+
+    return acquiringCameraPromiseRef.current
+  }, [])
+
+  const releasePhysicalCameraIfUnneeded = useCallback(() => {
+    const attendanceNeeds = attendanceNeedsCameraRef.current
+    const meetingNeeds = meetingCamActiveRef.current
+    console.log(`[Camera Architecture] Check release: attendanceNeeds=${attendanceNeeds}, meetingNeeds=${meetingNeeds}`)
+    if (!attendanceNeeds && !meetingNeeds) {
+      if (physicalCameraStreamRef.current) {
+        console.log('[Camera Architecture] Neither Attendance nor LiveKit need camera. Stopping physical tracks.')
+        try {
+          physicalCameraStreamRef.current.getTracks().forEach(track => track.stop())
+        } catch (e) {
+          console.error('[Camera Architecture] Error stopping physical stream tracks:', e)
+        }
+        physicalCameraStreamRef.current = null
+      }
+      if (physicalCameraTrackRef.current) {
+        try {
+          physicalCameraTrackRef.current.stop()
+        } catch (_) {}
+        physicalCameraTrackRef.current = null
+      }
+    }
+  }, [])
+
   /**
    * Compute total face-presence seconds from closed intervals + current open interval.
    * This is the SINGLE SOURCE OF TRUTH for presence duration.
@@ -1002,6 +1088,18 @@ function MeetingRoomContent({
   useEffect(() => {
     userRef.current = user
   }, [user])
+
+  // Synchronize localParticipant name with current user profile name in LiveKit
+  useEffect(() => {
+    if (!localParticipant) return
+    const currentName = (user?.name || user?.full_name || '').trim()
+    if (currentName && localParticipant.name !== currentName) {
+      console.log(`[Participant Sync] Updating localParticipant name from "${localParticipant.name}" to "${currentName}"`)
+      localParticipant.setName(currentName).catch((err) => {
+        console.warn('[Participant Sync] Failed to update localParticipant name via LiveKit:', err)
+      })
+    }
+  }, [localParticipant, user?.name, user?.full_name])
 
   // Guards that prevent the detector and camera loop from being destroyed/recreated
   // mid-meeting whenever meetingData object identity changes (re-render).
@@ -1502,6 +1600,8 @@ function MeetingRoomContent({
   const cleanupResources = () => {
     console.log('[Attendance] Cleaning up attendance resources...')
     stopTranscriptCapture()
+    attendanceNeedsCameraRef.current = false
+    meetingCamActiveRef.current = false
     if (socket.current) {
       console.log('[Cleanup] Disconnecting Socket.IO immediately...')
       try {
@@ -1522,6 +1622,20 @@ function MeetingRoomContent({
         console.error('[Attendance Error] Error closing detector:', e)
       }
       detectorRef.current = null
+    }
+    if (physicalCameraStreamRef.current) {
+      try {
+        physicalCameraStreamRef.current.getTracks().forEach(track => track.stop())
+      } catch (e) {
+        console.error('[Camera Architecture] Error stopping physical tracks on cleanup:', e)
+      }
+      physicalCameraStreamRef.current = null
+    }
+    if (physicalCameraTrackRef.current) {
+      try {
+        physicalCameraTrackRef.current.stop()
+      } catch (_) {}
+      physicalCameraTrackRef.current = null
     }
     if (cameraStreamRef.current) {
       try {
@@ -1865,22 +1979,27 @@ function MeetingRoomContent({
     const startCamera = async () => {
       try {
         setAttendanceCamError(false)
-        console.log('[Attendance] Requesting getUserMedia for local camera stream...')
-        const stream = await navigator.mediaDevices.getUserMedia({
-          video: { width: { ideal: 640 }, height: { ideal: 480 }, facingMode: 'user' },
-          audio: false
-        })
+        attendanceNeedsCameraRef.current = true
+        console.log('[Attendance] Acquiring physical camera via shared camera architecture...')
+        const physicalTrack = await getOrCreatePhysicalTrack()
         if (destroyed) {
-          stream.getTracks().forEach(t => t.stop())
+          attendanceNeedsCameraRef.current = false
+          releasePhysicalCameraIfUnneeded()
           return
         }
-        activeStream = stream
-        attendanceCameraStreamRef.current = stream
+        const attendanceStream = new MediaStream([physicalTrack])
+        activeStream = attendanceStream
+        attendanceCameraStreamRef.current = attendanceStream
 
         // Attach stream to hidden video element
-        video.srcObject = stream
+        video.srcObject = attendanceStream
         videoRef.current = video
-        console.log('[Attendance] Separate camera stream attached to hidden video element.')
+        try {
+          await video.play()
+        } catch (playErr) {
+          console.warn('[Attendance] video.play() warning:', playErr)
+        }
+        console.log('[Attendance] Shared physical camera stream attached to hidden video element.')
 
         // Poll for detector ready (up to 15 s, checking every 200 ms)
         // This handles the race where getUserMedia resolves before the async
@@ -2056,17 +2175,16 @@ function MeetingRoomContent({
 
     return () => {
       destroyed = true
-      console.log('[Attendance] Cleaning up tracking loop and separate camera track')
+      console.log('[Attendance] Cleaning up tracking loop and releasing attendance camera hold')
+      attendanceNeedsCameraRef.current = false
       if (clockInterval) clearInterval(clockInterval)
       if (rafId) cancelAnimationFrame(rafId)
-      if (activeStream) {
-        try { activeStream.getTracks().forEach(track => track.stop()) } catch (_) {}
-      }
       attendanceCameraStreamRef.current = null
       if (video && video.parentNode) video.parentNode.removeChild(video)
       videoRef.current = null
+      releasePhysicalCameraIfUnneeded()
     }
-  }, [attendanceConsent, showToast]) // ← meetingData intentionally REMOVED
+  }, [attendanceConsent, showToast, getOrCreatePhysicalTrack, releasePhysicalCameraIfUnneeded]) // ← meetingData intentionally REMOVED
 
   // beforeunload listener for browser closing / refresh events
   useEffect(() => {
@@ -2378,16 +2496,24 @@ function MeetingRoomContent({
 
         console.log('[Media Init] Room connected! Initializing camera and microphone...')
 
-        // Initialize camera
+        // Initialize camera via shared physical camera architecture
         setCamInitializing(true)
         setCamError(null)
         try {
-          console.log('[Camera Init] Requesting camera access via setCameraEnabled(true)...')
-          await localParticipant.setCameraEnabled(true)
+          console.log('[Camera Init] Requesting camera access via shared camera architecture...')
+          meetingCamActiveRef.current = true
+          const physicalTrack = await getOrCreatePhysicalTrack()
+          const livekitTrack = physicalTrack.clone()
+          await localParticipant.publishTrack(livekitTrack, {
+            source: Track.Source.Camera,
+            simulcast: true
+          })
           setCamActive(true)
           setCamInitializing(false)
-          console.log('[Camera Init] Camera enabled successfully!')
+          console.log('[Camera Init] Camera enabled and published successfully!')
         } catch (err) {
+          meetingCamActiveRef.current = false
+          releasePhysicalCameraIfUnneeded()
           setCamInitializing(false)
           console.error('[Camera Init] Failed to enable camera:', err)
           const errorMsg = getCameraErrorMessage(err)
@@ -2422,7 +2548,7 @@ function MeetingRoomContent({
     }
 
     initRoomSession()
-  }, [room, roomState, localParticipant, meetingData?.meeting_id, activateMeeting, showToast])
+  }, [room, roomState, localParticipant, meetingData?.meeting_id, activateMeeting, showToast, getOrCreatePhysicalTrack, releasePhysicalCameraIfUnneeded])
 
 
 
@@ -2492,11 +2618,37 @@ function MeetingRoomContent({
     try {
       const nextState = !camActive
       console.log(`[Camera Toggle] Setting camera to ${nextState ? 'ON' : 'OFF'}...`)
-      await localParticipant.setCameraEnabled(nextState)
-      setCamActive(nextState)
-      setCamInitializing(false)
-      showToast(nextState ? 'Camera enabled' : 'Camera disabled', 'info')
+      if (nextState) {
+        meetingCamActiveRef.current = true
+        const physicalTrack = await getOrCreatePhysicalTrack()
+        const livekitTrack = physicalTrack.clone()
+        await localParticipant.publishTrack(livekitTrack, {
+          source: Track.Source.Camera,
+          simulcast: true
+        })
+        setCamActive(true)
+        setCamInitializing(false)
+        showToast('Camera enabled', 'info')
+      } else {
+        meetingCamActiveRef.current = false
+        const pub = localParticipant.getTrackPublication(Track.Source.Camera)
+        if (pub && pub.track) {
+          const trackToUnpublish = pub.track
+          await localParticipant.unpublishTrack(trackToUnpublish, false)
+          try {
+            trackToUnpublish.stop()
+          } catch (_) {}
+        }
+        releasePhysicalCameraIfUnneeded()
+        setCamActive(false)
+        setCamInitializing(false)
+        showToast('Camera disabled', 'info')
+      }
     } catch (err) {
+      if (!camActive) {
+        meetingCamActiveRef.current = false
+        releasePhysicalCameraIfUnneeded()
+      }
       setCamInitializing(false)
       console.error('[Camera Toggle] Failed:', err)
       const errorMsg = getCameraErrorMessage(err)
@@ -2762,6 +2914,7 @@ function MeetingRoomContent({
               } catch (e) {}
 
               const isCurrentUser = p?.identity === localParticipant?.identity
+              const displayName = isCurrentUser ? (user?.name || user?.full_name || p.name) : p.name
 
               return (
                 <div
@@ -2789,7 +2942,7 @@ function MeetingRoomContent({
                   ) : (
                     <div className="absolute inset-0 bg-slate-950 flex flex-col items-center justify-center">
                       <div className="w-16 h-16 rounded-full bg-[#7c3aed]/10 border border-[#7c3aed]/20 flex items-center justify-center text-[#8b5cf6] font-bold text-lg">
-                        {p.name?.charAt(0).toUpperCase() || 'P'}
+                        {displayName?.charAt(0).toUpperCase() || 'P'}
                       </div>
                     </div>
                   )}
@@ -2807,7 +2960,7 @@ function MeetingRoomContent({
                     <div className="absolute inset-0 z-15 bg-black/85 backdrop-blur-sm flex flex-col items-center justify-center gap-2 p-4 text-center select-none">
                       <span className="text-3xl animate-pulse">⌛</span>
                       <span className="text-xs font-bold text-amber-300 tracking-wider uppercase">Be Right Back</span>
-                      <span className="text-[10px] text-gray-400 font-medium">{p.name} is temporarily away</span>
+                      <span className="text-[10px] text-gray-400 font-medium">{displayName} is temporarily away</span>
                     </div>
                   )}
 
@@ -2834,7 +2987,7 @@ function MeetingRoomContent({
 
                   {/* Name Tag (Bottom bar) */}
                   <div className="absolute bottom-3 left-3 px-3 py-1.5 rounded-xl bg-black/60 border border-white/5 text-[10px] font-bold text-white z-10 flex items-center gap-1.5">
-                    <span>{p.name} {isCurrentUser && ' (You)'} {role === 'host' && ' (Host)'}</span>
+                    <span>{displayName} {isCurrentUser && ' (You)'} {role === 'host' && ' (Host)'}</span>
                     {raisedHandsMap[p.identity] && <span className="text-amber-400">✋</span>}
                     {participantStatusMap[p.identity] === 'be_right_back' && <span className="text-amber-400">⌛</span>}
                   </div>
@@ -2967,15 +3120,18 @@ function MeetingRoomContent({
                         pUserId = meta.userId || p.identity
                       } catch (e) {}
 
+                      const isCurrentUser = p.identity === localParticipant?.identity
+                      const displayName = isCurrentUser ? (user?.name || user?.full_name || p.name) : p.name
+
                       return (
                         <div key={p.sid || p.identity} className="flex items-center gap-3 p-2 bg-white/2 border border-white/5 rounded-xl justify-between">
                           <div className="flex items-center gap-3 flex-1 min-w-0">
                             <div className="w-8 h-8 rounded-full bg-white/5 flex items-center justify-center text-xs font-bold text-gray-300 shrink-0">
-                              {p.name?.charAt(0).toUpperCase() || 'P'}
+                              {displayName?.charAt(0).toUpperCase() || 'P'}
                             </div>
                             <div className="flex flex-col text-left min-w-0">
                               <span className="text-xs font-semibold text-white truncate flex items-center gap-1.5">
-                                <span>{p.name} {p.identity === localParticipant?.identity && ' (You)'}</span>
+                                <span>{displayName} {isCurrentUser && ' (You)'}</span>
                                 {raisedHandsMap[p.identity] && (
                                   <span className="px-1.5 py-0.5 rounded bg-amber-500/20 border border-amber-500/40 text-amber-300 text-[9px] font-bold shrink-0">
                                     ✋ Hand
