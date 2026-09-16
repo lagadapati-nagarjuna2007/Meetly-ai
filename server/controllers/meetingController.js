@@ -1125,61 +1125,179 @@ export const submitTranscriptChunk = async (req, res) => {
       return res.status(500).json({ message: 'Groq API key not configured on server.' })
     }
 
-    // Prepare native FormData to send to Groq Whisper
-    const formData = new FormData()
-    const audioBlob = new Blob([req.file.buffer], { type: req.file.mimetype || 'audio/webm' })
-    formData.append('file', audioBlob, 'audio.webm')
-    formData.append('model', 'whisper-large-v3')
+    const audioBuffer = req.file.buffer
+    const audioMimeType = req.file.mimetype || 'audio/webm'
 
-    console.log('[Transcript Chunk] Sending audio to Groq Whisper...')
-    const groqRes = await fetch('https://api.groq.com/openai/v1/audio/transcriptions', {
+    // ── STEP 1: Transcription — verbose_json gives us raw text + detected language ──
+    const transcriptFormData = new FormData()
+    const transcriptBlob = new Blob([audioBuffer], { type: audioMimeType })
+    transcriptFormData.append('file', transcriptBlob, 'audio.webm')
+    transcriptFormData.append('model', 'whisper-large-v3')
+    transcriptFormData.append('response_format', 'verbose_json')
+
+    console.log('[Transcript Chunk] Step 1 — Sending audio to Groq Whisper (transcriptions, verbose_json)...')
+    const groqTranscriptRes = await fetch('https://api.groq.com/openai/v1/audio/transcriptions', {
       method: 'POST',
-      headers: {
-        'Authorization': `Bearer ${apiKey}`
-      },
-      body: formData
+      headers: { 'Authorization': `Bearer ${apiKey}` },
+      body: transcriptFormData
     })
 
-    if (!groqRes.ok) {
-      const errorText = await groqRes.text()
-      console.error('[Transcript Chunk Error] Groq API returned error status:', groqRes.status, 'Body:', errorText)
+    if (!groqTranscriptRes.ok) {
+      const errorText = await groqTranscriptRes.text()
+      console.error('[Transcript Chunk Error] Groq transcriptions API returned error status:', groqTranscriptRes.status, 'Body:', errorText)
       return res.status(500).json({ message: 'Failed to transcribe audio chunk.' })
     }
 
-    const result = await groqRes.json()
-    console.log('[Transcript Chunk] Whisper response received successfully')
-    const transcribedText = result.text ? result.text.trim() : ''
-    console.log('[Transcript Chunk] Transcribed text:', transcribedText)
+    const transcriptResult = await groqTranscriptRes.json()
+    console.log('[Transcript Chunk] Whisper transcription response received')
 
-    // Skip empty transcripts or typical silent whisper hallucinations
-    const hallucinations = [
+    // verbose_json returns { text, language, duration, segments[] }
+    const transcribedText = transcriptResult.text ? transcriptResult.text.trim() : ''
+    // language is the full English name of the detected language: "english", "telugu", "hindi", etc.
+    const detectedLanguage = (transcriptResult.language || '').toLowerCase().trim()
+
+    console.log('[Transcript Chunk] Detected language:', detectedLanguage || '(not returned)')
+    console.log('[Transcript Chunk] Raw transcribed text:', transcribedText)
+
+    // ── Skip empty transcripts or typical silent Whisper hallucinations ──────
+    const HALLUCINATIONS = [
       'you', 'thank you', 'subtitles by', 'subtitles', 'thanks for watching',
       'bye', 'hello', 'uh', 'um', 'please subscribe', 'subscribe'
     ]
-    const isHallucination = transcribedText.length < 5 && hallucinations.includes(transcribedText.toLowerCase())
+    const isHallucination = transcribedText.length < 5 && HALLUCINATIONS.includes(transcribedText.toLowerCase())
 
-    if (transcribedText && !isHallucination) {
-      console.log(`[Transcript Chunk] Transcript inserted into Supabase for ${speakerName}: "${transcribedText}"`)
-
-      // Insert into meeting_transcripts
-      const { error: insertErr } = await supabase
-        .from('meeting_transcripts')
-        .insert([
-          {
-            meeting_id: meetingId,
-            speaker_name: speakerName,
-            transcript: transcribedText
-          }
-        ])
-
-      if (insertErr) {
-        console.error('[Transcript Chunk Error] Supabase insert failed:', insertErr)
-        return res.status(500).json({ message: 'Failed to save transcript chunk to database.' })
-      }
-      console.log('[Transcript Chunk] Insert successful')
-    } else {
+    if (!transcribedText || isHallucination) {
       console.log(`[Transcript Chunk] Silence or empty response (isHallucination: ${isHallucination}), skipping DB insert.`)
+      return res.status(200).json({ message: 'Chunk processed successfully.', text: transcribedText })
     }
+
+    // ── STEP 2: Determine if translation is needed ───────────────────────────
+    // Supported non-English languages that trigger the translations endpoint.
+    // Language names come from Whisper verbose_json output (lowercase full names).
+    const TRANSLATE_LANGUAGES = new Set(['telugu', 'hindi'])
+    const needsTranslation = TRANSLATE_LANGUAGES.has(detectedLanguage)
+
+    // ── STEP 2a: Unicode/script-aware corruption guard ───────────────────────
+    // Uses proper Unicode ranges rather than ASCII ratio heuristics.
+    //
+    // "telugu" detection → valid if text has Telugu chars (U+0C00–U+0C7F)
+    //                       OR any Latin characters (mixed Telugu+English is valid)
+    // "hindi"  detection → valid if text has Devanagari chars (U+0900–U+097F)
+    //                       OR any Latin characters (mixed Hindi+English is valid)
+    //
+    // Text with NEITHER the expected script NOR any Latin = suspected wrong-script
+    // hallucination (e.g. Gurmukhi output for a Telugu audio). In that case, we
+    // store the raw text but skip the translations call to avoid translating garbage.
+    //
+    // We explicitly do NOT reject mixed-script text:
+    //   "మనము API deploy చేద్దాం"  → Telugu + Latin = valid, translate
+    //   "Humein backend test karna hai" → Hindi/Latin mix = valid, translate
+    const TELUGU_REGEX     = /[\u0C00-\u0C7F]/u
+    const DEVANAGARI_REGEX = /[\u0900-\u097F]/u
+    const LATIN_REGEX      = /[A-Za-z]/
+
+    let scriptCorruptionSuspected = false
+
+    if (needsTranslation) {
+      if (detectedLanguage === 'telugu') {
+        const hasTeluguChars = TELUGU_REGEX.test(transcribedText)
+        const hasLatinChars  = LATIN_REGEX.test(transcribedText)
+        if (!hasTeluguChars && !hasLatinChars) {
+          scriptCorruptionSuspected = true
+          console.warn('[Transcript Chunk] Script corruption suspected: detected="telugu" but text has no Telugu (U+0C00-U+0C7F) or Latin chars. Storing raw only.')
+          console.warn('[Transcript Chunk] Raw text sample (first 100):', transcribedText.slice(0, 100))
+        } else {
+          console.log(`[Transcript Chunk] Telugu script validation passed — hasTeluguChars:${hasTeluguChars} hasLatinChars:${hasLatinChars}`)
+        }
+      } else if (detectedLanguage === 'hindi') {
+        const hasDevanagariChars = DEVANAGARI_REGEX.test(transcribedText)
+        const hasLatinChars      = LATIN_REGEX.test(transcribedText)
+        if (!hasDevanagariChars && !hasLatinChars) {
+          scriptCorruptionSuspected = true
+          console.warn('[Transcript Chunk] Script corruption suspected: detected="hindi" but text has no Devanagari (U+0900-U+097F) or Latin chars. Storing raw only.')
+          console.warn('[Transcript Chunk] Raw text sample (first 100):', transcribedText.slice(0, 100))
+        } else {
+          console.log(`[Transcript Chunk] Hindi script validation passed — hasDevanagariChars:${hasDevanagariChars} hasLatinChars:${hasLatinChars}`)
+        }
+      }
+    }
+
+    // ── STEP 3: Translation — uses ORIGINAL AUDIO BUFFER, not the transcript text ──
+    // Calls POST /openai/v1/audio/translations which runs whisper-large-v3 on the
+    // original audio directly, producing English output in a single model pass.
+    // This is NOT LLM text translation — corrupted transcript text does NOT affect it.
+    // Technical English terms (API, backend, Python, etc.) are preserved naturally.
+    let englishTranscript = null
+
+    if (needsTranslation && !scriptCorruptionSuspected) {
+      try {
+        console.log(`[Transcript Chunk] Step 3 — Sending ORIGINAL AUDIO to Groq /audio/translations (language: ${detectedLanguage})...`)
+        const translationFormData = new FormData()
+        // CRITICAL: Use the original audio buffer — never the transcribed text
+        const translationBlob = new Blob([audioBuffer], { type: audioMimeType })
+        translationFormData.append('file', translationBlob, 'audio.webm')
+        translationFormData.append('model', 'whisper-large-v3')
+        // Optional prompt: helps preserve technical terms in English output
+        translationFormData.append('prompt', 'Technical meeting: software, APIs, databases, programming, deployment.')
+
+        const groqTranslationRes = await fetch('https://api.groq.com/openai/v1/audio/translations', {
+          method: 'POST',
+          headers: { 'Authorization': `Bearer ${apiKey}` },
+          body: translationFormData
+        })
+
+        if (!groqTranslationRes.ok) {
+          const errText = await groqTranslationRes.text()
+          // Non-fatal: log and continue with raw transcript only
+          console.warn(`[Transcript Chunk] Translation API returned ${groqTranslationRes.status} — storing raw only. Body:`, errText)
+        } else {
+          const translationResult = await groqTranslationRes.json()
+          const translatedText = translationResult.text ? translationResult.text.trim() : ''
+          if (translatedText) {
+            englishTranscript = translatedText
+            console.log(`[Transcript Chunk] Translation success for language="${detectedLanguage}": "${englishTranscript}"`)
+          } else {
+            console.warn('[Transcript Chunk] Translation API returned empty text — storing raw only.')
+          }
+        }
+      } catch (translationErr) {
+        // Translation errors must never break the transcription pipeline
+        console.warn('[Transcript Chunk] Translation call failed (non-fatal) — storing raw only. Error:', translationErr.message)
+        // englishTranscript remains null
+      }
+    } else if (!needsTranslation) {
+      // English (or unrecognized non-Hindi/Telugu): english_transcript = transcript
+      englishTranscript = transcribedText
+      console.log(`[Transcript Chunk] Language="${detectedLanguage || 'unknown'}" — no translation needed; english_transcript = transcript`)
+    } else {
+      // scriptCorruptionSuspected: don't call translations on garbage input
+      console.log('[Transcript Chunk] Skipping translation due to script corruption guard — storing raw only.')
+    }
+
+    // ── STEP 4: Persist to Supabase ──────────────────────────────────────────
+    // meeting_transcripts must have columns: english_transcript (text, nullable), language (text, nullable)
+    console.log(`[Transcript Chunk] Inserting into meeting_transcripts for speaker="${speakerName}"`)
+    console.log(`  transcript: "${transcribedText}"`)
+    console.log(`  english_transcript: ${englishTranscript != null ? `"${englishTranscript}"` : '(null — raw only)'}`)
+    console.log(`  language: "${detectedLanguage || '(not detected)'}"`)
+
+    const { error: insertErr } = await supabase
+      .from('meeting_transcripts')
+      .insert([
+        {
+          meeting_id: meetingId,
+          speaker_name: speakerName,
+          transcript: transcribedText,
+          english_transcript: englishTranscript,  // null when translation unavailable/skipped
+          language: detectedLanguage || null
+        }
+      ])
+
+    if (insertErr) {
+      console.error('[Transcript Chunk Error] Supabase insert failed:', insertErr)
+      return res.status(500).json({ message: 'Failed to save transcript chunk to database.' })
+    }
+    console.log('[Transcript Chunk] Insert successful')
 
     return res.status(200).json({ message: 'Chunk processed successfully.', text: transcribedText })
   } catch (err) {
@@ -1187,6 +1305,7 @@ export const submitTranscriptChunk = async (req, res) => {
     return res.status(500).json({ message: err.message || 'Server error transcribing audio chunk.' })
   }
 }
+
 
 /**
  * Call summary LLM with NVIDIA NIM (Nemotron 3 Ultra) as primary provider,
@@ -1318,9 +1437,11 @@ export const generateSummary = async (req, res) => {
     }
 
     // 1. Fetch transcripts ordered by created_at ASC
+    // Prefer english_transcript (set for English audio or after Telugu/Hindi translation).
+    // Falls back to transcript (raw Whisper output) for old rows or failed translations.
     const { data: chunks, error: fetchErr } = await supabase
       .from('meeting_transcripts')
-      .select('speaker_name, transcript')
+      .select('speaker_name, transcript, english_transcript')
       .eq('meeting_id', meetingId)
       .order('created_at', { ascending: true })
 
@@ -1332,15 +1453,21 @@ export const generateSummary = async (req, res) => {
       })
     }
 
-    // 2. Concatenate transcripts preserving speaker order
+    // 2. Concatenate transcripts preserving speaker order.
+    // Use english_transcript when available (translated or same-as-raw for English).
+    // Fall back to transcript for rows where english_transcript is null (old rows,
+    // failed translations, or script-corruption-guarded chunks).
     const transcriptText = chunks
-      .map(c => `${c.speaker_name}: ${c.transcript}`)
+      .map(c => `${c.speaker_name}: ${c.english_transcript || c.transcript}`)
       .join('\n')
 
     console.log('[Summary Generation Request]')
     console.log(`  meeting_id=${meetingId}`)
     console.log(`  transcript_chunks=${chunks.length}`)
     console.log(`  transcript_length=${transcriptText.length} chars`)
+    // Log how many chunks had english_transcript vs raw fallback
+    const englishChunks = chunks.filter(c => c.english_transcript != null).length
+    console.log(`  english_transcript_chunks=${englishChunks}/${chunks.length} (rest use raw transcript fallback)`)
 
     // ── STEP 1: Classify meeting type ─────────────────────────────────────────
     //

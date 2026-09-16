@@ -163,14 +163,16 @@ export const getMeetingTranscriptText = async (req, res) => {
 
     const { data: chunks, error: fetchErr } = await supabase
       .from('meeting_transcripts')
-      .select('speaker_name, transcript')
+      .select('speaker_name, transcript, english_transcript')
       .eq('meeting_id', targetMeetingId)
       .order('created_at', { ascending: true })
 
     if (fetchErr) throw fetchErr
 
+    // Prefer english_transcript for AI chat context so the LLM sees clean English.
+    // Falls back to raw transcript for old rows or chunks where translation was unavailable.
     const transcriptText = (chunks || [])
-      .map(c => `${c.speaker_name}: ${c.transcript}`)
+      .map(c => `${c.speaker_name}: ${c.english_transcript || c.transcript}`)
       .join('\n')
 
     return res.status(200).json({
