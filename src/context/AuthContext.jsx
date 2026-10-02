@@ -1,4 +1,5 @@
-import { createContext, useContext, useState, useEffect } from 'react'
+import { createContext, useContext, useState, useEffect, useRef } from 'react'
+import { supabase, isSupabaseConfigured } from '../lib/supabase'
 
 const AuthContext = createContext(null)
 const API_URL = `${import.meta.env.VITE_API_URL}/api/auth`
@@ -15,10 +16,68 @@ const getAuthHeaders = () => {
 export function AuthProvider({ children }) {
   const [user, setUser] = useState(null)
   const [isLoading, setIsLoading] = useState(true)
+  const isExchangingRef = useRef(false)
 
-  // 1. Restore session on mount using cookie or bearer credentials
+  // Exchange Supabase OAuth token with Meetly backend to establish Meetly JWT & session
+  const exchangeSupabaseToken = async (accessToken) => {
+    if (isExchangingRef.current) return null
+    isExchangingRef.current = true
+    try {
+      const res = await fetch(`${API_URL}/google`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ supabaseAccessToken: accessToken }),
+        credentials: 'include'
+      })
+
+      const data = await res.json()
+      if (!res.ok) {
+        throw new Error(data.message || 'Google authentication failed on server')
+      }
+
+      if (data.token) {
+        sessionStorage.setItem('meetly_auth_token', data.token)
+      }
+      setUser(data.user)
+      return data.user
+    } finally {
+      isExchangingRef.current = false
+    }
+  }
+
+  // 1. Restore session on mount using Supabase session or Meetly cookie/token
   useEffect(() => {
+    let isMounted = true
+
     const checkSession = async () => {
+      // Check for OAuth cancellation or error params in URL
+      const urlParams = new URLSearchParams(window.location.search)
+      const hashParams = new URLSearchParams(window.location.hash.substring(1))
+      const oauthError = urlParams.get('error_description') || hashParams.get('error_description') || urlParams.get('error')
+      if (oauthError) {
+        console.warn('[AuthContext] OAuth error or cancellation detected:', oauthError)
+        window.history.replaceState({}, document.title, window.location.pathname)
+      }
+
+      // Check for Supabase session (e.g. returning from Google OAuth redirect)
+      try {
+        const { data: { session } } = await supabase.auth.getSession()
+        if (session?.access_token) {
+          const googleUser = await exchangeSupabaseToken(session.access_token)
+          if (googleUser && isMounted) {
+            setUser(googleUser)
+            setIsLoading(false)
+            if (window.location.hash || window.location.search.includes('code=')) {
+              window.history.replaceState({}, document.title, window.location.pathname)
+            }
+            return
+          }
+        }
+      } catch (sbErr) {
+        console.warn('[AuthContext] Supabase session check error:', sbErr)
+      }
+
+      // Existing check: Restore session from Meetly token / cookie
       try {
         const res = await fetch(`${API_URL}/me`, {
           method: 'GET',
@@ -27,18 +86,42 @@ export function AuthProvider({ children }) {
         })
         if (res.ok) {
           const data = await res.json()
-          setUser(data.user)
+          if (isMounted) setUser(data.user)
         } else {
-          setUser(null)
+          if (isMounted) setUser(null)
         }
       } catch (err) {
         console.error('Session check failed:', err)
-        setUser(null)
+        if (isMounted) setUser(null)
       } finally {
-        setIsLoading(false)
+        if (isMounted) setIsLoading(false)
       }
     }
+
     checkSession()
+
+    // Listen for Supabase OAuth state changes (e.g. OAuth login redirect completion)
+    const { data: authListener } = supabase.auth.onAuthStateChange(async (event, session) => {
+      if (event === 'SIGNED_IN' && session?.access_token) {
+        try {
+          const googleUser = await exchangeSupabaseToken(session.access_token)
+          if (googleUser && isMounted) {
+            setUser(googleUser)
+            setIsLoading(false)
+            if (window.location.hash || window.location.search.includes('code=')) {
+              window.history.replaceState({}, document.title, window.location.pathname)
+            }
+          }
+        } catch (err) {
+          console.error('[AuthContext] onAuthStateChange exchange error:', err)
+        }
+      }
+    })
+
+    return () => {
+      isMounted = false
+      authListener?.subscription?.unsubscribe()
+    }
   }, [])
 
   // 2. SIGN IN
@@ -200,9 +283,35 @@ export function AuthProvider({ children }) {
     } catch (err) {
       console.error('Logout request error:', err)
     } finally {
+      try {
+        await supabase.auth.signOut()
+      } catch (sbErr) {
+        console.warn('[AuthContext] Supabase signOut error:', sbErr)
+      }
       sessionStorage.removeItem('meetly_auth_token')
       setUser(null)
     }
+  }
+
+  // 9. GOOGLE SIGN IN VIA SUPABASE OAUTH
+  const signInWithGoogle = async () => {
+    if (!isSupabaseConfigured) {
+      throw new Error('Google Sign-In is not configured yet. Please ensure VITE_SUPABASE_ANON_KEY is set in your environment.')
+    }
+
+    const { data, error } = await supabase.auth.signInWithOAuth({
+      provider: 'google',
+      options: {
+        redirectTo: window.location.origin
+      }
+    })
+
+    if (error) {
+      console.error('[AuthContext] signInWithOAuth error:', error)
+      throw error
+    }
+
+    return data
   }
 
   const updateProfile = async (name, email) => {
@@ -243,7 +352,8 @@ export function AuthProvider({ children }) {
         forgotPassword,
         resetPassword,
         logout,
-        updateProfile
+        updateProfile,
+        signInWithGoogle
       }}
     >
       {children}

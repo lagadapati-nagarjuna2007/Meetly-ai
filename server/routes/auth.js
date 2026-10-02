@@ -4,6 +4,7 @@ import {
   verifyOtp,
   resendOtp,
   login,
+  googleLogin,
   forgotPassword,
   resetPassword,
   logout,
@@ -23,6 +24,7 @@ const limitHandler = (req, res) => {
 // Route-specific rate limiters
 const signupLimiter = rateLimit({ windowMs: 60 * 1000, max: 5, handler: limitHandler })
 const loginLimiter = rateLimit({ windowMs: 60 * 1000, max: 5, handler: limitHandler })
+const googleLimiter = rateLimit({ windowMs: 60 * 1000, max: 10, handler: limitHandler })
 const forgotPasswordLimiter = rateLimit({ windowMs: 60 * 1000, max: 3, handler: limitHandler })
 const resendOtpLimiter = rateLimit({ windowMs: 60 * 1000, max: 1, handler: limitHandler })
 const verifyOtpLimiter = rateLimit({ windowMs: 60 * 1000, max: 5, handler: limitHandler })
@@ -32,6 +34,7 @@ router.post('/signup', signupLimiter, signup)
 router.post('/verify-otp', verifyOtpLimiter, verifyOtp)
 router.post('/resend-otp', resendOtpLimiter, resendOtp)
 router.post('/login', loginLimiter, login)
+router.post('/google', googleLimiter, googleLogin)
 router.post('/forgot-password', forgotPasswordLimiter, forgotPassword)
 router.post('/reset-password', verifyOtpLimiter, resetPassword)
 router.post('/logout', logout)

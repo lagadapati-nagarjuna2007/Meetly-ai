@@ -1,3 +1,4 @@
+import crypto from 'crypto'
 import bcrypt from 'bcrypt'
 import jwt from 'jsonwebtoken'
 import { supabase } from '../config/supabase.js'
@@ -512,3 +513,105 @@ export const updateProfile = async (req, res) => {
     return res.status(500).json({ message: 'Server error while updating profile.' })
   }
 }
+
+// 10. GOOGLE OAUTH LOGIN / SIGNUP
+export const googleLogin = async (req, res) => {
+  try {
+    const { supabaseAccessToken } = req.body
+
+    if (!supabaseAccessToken) {
+      return res.status(400).json({ message: 'Google authentication token is required.' })
+    }
+
+    // 1. Verify token with Supabase Auth server
+    const { data: { user: sbUser }, error: sbErr } = await supabase.auth.getUser(supabaseAccessToken)
+
+    if (sbErr || !sbUser || !sbUser.email) {
+      console.warn('[AUTH GOOGLE] Token verification failed:', sbErr?.message)
+      return res.status(401).json({ message: 'Google authentication session expired or invalid. Please try again.' })
+    }
+
+    const emailLower = sbUser.email.toLowerCase()
+    const fullName = (
+      sbUser.user_metadata?.full_name ||
+      sbUser.user_metadata?.name ||
+      sbUser.email.split('@')[0]
+    ).trim()
+    const avatar = (
+      sbUser.user_metadata?.avatar_url ||
+      sbUser.user_metadata?.picture ||
+      'https://images.unsplash.com/photo-1535713875002-d1d0cf377fde?auto=format&fit=crop&w=150&h=150&q=80'
+    )
+
+    console.log(`[AUTH GOOGLE] Verified Google user: ${emailLower} (${fullName})`)
+
+    // 2. Check if user already exists in Meetly 'users' table
+    let { data: user, error: fetchErr } = await supabase
+      .from('users')
+      .select('*')
+      .eq('email', emailLower)
+      .maybeSingle()
+
+    if (fetchErr) throw fetchErr
+
+    // 3. If user doesn't exist, create user record using existing schema
+    if (!user) {
+      console.log(`[AUTH GOOGLE] New user detected. Creating Meetly profile for ${emailLower}`)
+      // password_hash has NOT NULL constraint in database. Generate secure random hash.
+      const randomSecret = crypto.randomUUID()
+      const passwordHash = await bcrypt.hash(randomSecret, 10)
+
+      const { data: newUser, error: createErr } = await supabase
+        .from('users')
+        .insert([
+          {
+            full_name: fullName,
+            email: emailLower,
+            password_hash: passwordHash
+          }
+        ])
+        .select('*')
+        .single()
+
+      if (createErr) {
+        console.error('[AUTH GOOGLE] Error creating new user record:', createErr)
+        throw createErr
+      }
+
+      user = newUser
+      console.log(`[AUTH GOOGLE] New user record created with ID: ${user.id}`)
+    } else {
+      console.log(`[AUTH GOOGLE] Existing user matched with ID: ${user.id}`)
+    }
+
+    // 4. Generate standard Meetly JWT token (consistent with existing login)
+    const token = jwt.sign(
+      {
+        id: user.id,
+        email: user.email,
+        name: user.full_name,
+        role: 'Student'
+      },
+      process.env.JWT_SECRET,
+      { expiresIn: '24h' }
+    )
+
+    // 5. Set secure HTTP-only cookie
+    res.cookie('meetly_token', token, getCookieConfig())
+
+    return res.status(200).json({
+      token,
+      user: {
+        id: user.id,
+        name: user.full_name,
+        email: user.email,
+        role: 'Student',
+        avatar
+      }
+    })
+  } catch (err) {
+    console.error('[AUTH GOOGLE Error]:', err)
+    return res.status(500).json({ message: 'Server error during Google sign-in.' })
+  }
+}
+
