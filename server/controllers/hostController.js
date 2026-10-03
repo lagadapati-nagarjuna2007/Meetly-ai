@@ -137,7 +137,8 @@ export const assignHost = async (req, res) => {
 
     // Validate: participant must be currently connected (socket presence)
     const roomUserSockets = req.app.get('roomUserSockets')
-    const userSockets = roomUserSockets?.get(meeting.room_name)?.get(userId)
+    const userKey = String(userId).trim().toLowerCase()
+    const userSockets = roomUserSockets?.get(meeting.room_name)?.get(userKey)
     const isConnected = userSockets && userSockets.size > 0
     if (!isConnected) {
       return res.status(400).json({

@@ -94,6 +94,79 @@ class MeetingErrorBoundary extends React.Component {
   }
 }
 
+// UUID validation helper
+const isUuid = (val) => {
+  if (!val || typeof val !== 'string') return false
+  return /^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$/.test(val.trim())
+}
+
+/**
+ * Robust participant user_id resolver.
+ * Priority:
+ *  1. p.metadata JSON (contains { userId, role })
+ *  2. p.identity (if already a valid UUID)
+ *  3. p.userId (if property directly exists and is a UUID)
+ *  4. dbParticipants lookup by email or user_id
+ */
+const resolveParticipantUserId = (p, dbParticipantsList = []) => {
+  if (!p) return null
+  // 1. Try parsing metadata (from LiveKit token)
+  if (p.metadata) {
+    try {
+      const meta = typeof p.metadata === 'string' ? JSON.parse(p.metadata) : p.metadata
+      if (meta?.userId && isUuid(meta.userId)) {
+        return meta.userId
+      }
+    } catch (e) {}
+  }
+  // 2. Check if identity itself is a valid UUID
+  if (p.identity && isUuid(p.identity)) {
+    return p.identity
+  }
+  // 3. Check if userId property directly exists on participant
+  if (p.userId && isUuid(p.userId)) {
+    return p.userId
+  }
+  // 4. Fallback: match p.identity against dbParticipants list (by user.email or user_id)
+  if (Array.isArray(dbParticipantsList) && dbParticipantsList.length > 0) {
+    const pIdent = String(p.identity || '').trim().toLowerCase()
+    const matched = dbParticipantsList.find(dbP => {
+      const dbEmail = String(dbP.user?.email || '').trim().toLowerCase()
+      const dbUid = String(dbP.user_id || '').trim().toLowerCase()
+      return (dbEmail && pIdent && dbEmail === pIdent) || (dbUid && pIdent && dbUid === pIdent)
+    })
+    if (matched?.user_id && isUuid(matched.user_id)) {
+      return matched.user_id
+    }
+  }
+  return null
+}
+
+/**
+ * Returns human-readable display name for a given user UUID.
+ */
+const getDisplayNameForUserId = (uid, livekitParticipants = [], dbParticipantsList = []) => {
+  if (!uid) return null
+  const targetUid = String(uid).trim().toLowerCase()
+
+  // First check in LiveKit participants
+  for (const p of (livekitParticipants || [])) {
+    const pUid = resolveParticipantUserId(p, dbParticipantsList)
+    if (pUid && pUid.toLowerCase() === targetUid) {
+      return p.name || p.identity || targetUid
+    }
+  }
+
+  // Fallback to dbParticipants
+  if (Array.isArray(dbParticipantsList)) {
+    const dbP = dbParticipantsList.find(p => String(p.user_id).trim().toLowerCase() === targetUid)
+    if (dbP?.user?.full_name) return dbP.user.full_name
+    if (dbP?.user?.email) return dbP.user.email
+  }
+
+  return uid
+}
+
 // Export main MeetingRoom component wrapped with Error Boundary
 export default function MeetingRoom() {
   return (
@@ -160,6 +233,7 @@ function MeetingRoomInner() {
   const [attendanceConsent, setAttendanceConsent] = useState(null)
   const joinAttemptedRef = useRef(false)
   const isIntentionalLeaveRef = useRef(false)
+  const [dbParticipants, setDbParticipants] = useState([])
 
   const [chatMessages, setChatMessages] = useState([
     { name: 'System', text: 'Welcome to the meeting room. Chat messages and AI queries are enabled.' }
@@ -233,6 +307,9 @@ function MeetingRoomInner() {
           active_host_id: data.meeting?.active_host_id
         })
         setMeetingData(data.meeting)
+        if (data.participants) {
+          setDbParticipants(data.participants)
+        }
         console.log('[MEETING DATA AFTER API STATE UPDATE]', {
           host_id: data.meeting?.host_id,
           assigned_host_id: data.meeting?.assigned_host_id,
@@ -818,6 +895,7 @@ function MeetingRoomInner() {
         waitingRequests={waitingRequests}
         fetchWaitingRequests={fetchWaitingRequests}
         isIntentionalLeaveRef={isIntentionalLeaveRef}
+        dbParticipants={dbParticipants}
       />
       <RoomAudioRenderer />
     </LiveKitRoom>
@@ -874,7 +952,8 @@ function MeetingRoomContent({
   handleLeaveWithAttendanceRef,
   waitingRequests,
   fetchWaitingRequests,
-  isIntentionalLeaveRef
+  isIntentionalLeaveRef,
+  dbParticipants = []
 }) {
   const navigate = useNavigate()
   const room = useMaybeRoomContext()
@@ -3211,12 +3290,19 @@ function MeetingRoomContent({
                   ) : (
                     filteredParticipants.map((p) => {
                       let role = 'participant'
-                      let pUserId = p.identity
+                      let pUserId = resolveParticipantUserId(p, dbParticipants) || p.identity
                       try {
                         const meta = JSON.parse(p?.metadata || '{}')
                         role = meta.role || 'participant'
-                        pUserId = meta.userId || p.identity
                       } catch (e) {}
+
+                      if (pUserId && activeHostId && String(pUserId).toLowerCase() === String(activeHostId).toLowerCase()) {
+                        role = (pUserId && originalHostId && String(pUserId).toLowerCase() === String(originalHostId).toLowerCase())
+                          ? 'host'
+                          : 'active host'
+                      } else if (pUserId && assignedHostId && String(pUserId).toLowerCase() === String(assignedHostId).toLowerCase()) {
+                        role = 'assigned host'
+                      }
 
                       const isCurrentUser = p.identity === localParticipant?.identity
                       const displayName = isCurrentUser ? (user?.name || user?.full_name || p.name) : p.name
@@ -3417,9 +3503,9 @@ function MeetingRoomContent({
                         <div className="flex flex-col">
                           <span className="text-[10px] text-gray-400">Active Host</span>
                           <span className="text-xs font-semibold text-white">
-                            {activeHostId === currentUserId
+                            {activeHostId && currentUserId && String(activeHostId).trim().toLowerCase() === String(currentUserId).trim().toLowerCase()
                               ? 'You (Original Host)'
-                              : participants?.find(p => p.identity === activeHostId || p.identity?.includes(activeHostId))?.name || activeHostId || '—'}
+                              : getDisplayNameForUserId(activeHostId, participants, dbParticipants) || '—'}
                           </span>
                         </div>
                         <span className="text-[10px] text-emerald-400 bg-emerald-500/10 border border-emerald-500/20 px-2 py-0.5 rounded-full">Active</span>
@@ -3431,7 +3517,7 @@ function MeetingRoomContent({
                           <span className="text-[10px] text-gray-400">Assigned Host</span>
                           <span className="text-xs font-semibold text-white truncate">
                             {assignedHostId
-                              ? (participants?.find(p => p.identity === assignedHostId || p.identity?.includes(assignedHostId))?.name || assignedHostId)
+                              ? (getDisplayNameForUserId(assignedHostId, participants, dbParticipants) || assignedHostId)
                               : <span className="text-gray-500 font-normal italic">None designated</span>}
                           </span>
                         </div>
@@ -3496,51 +3582,78 @@ function MeetingRoomContent({
                           </div>
                           {(participants || [])
                             .filter(p => {
-                              const pid = p.identity || ''
-                              return pid !== currentUserId && !pid.includes(currentUserId || '__NONE__')
+                              const pUserId = resolveParticipantUserId(p, dbParticipants)
+                              const origHost = String(originalHostId || currentUserId || '').trim().toLowerCase()
+                              return pUserId && pUserId.toLowerCase() !== origHost
                             })
-                            .map((p) => (
-                              <button
-                                key={p.identity}
-                                onClick={async () => {
-                                  setHostActionLoading(true)
-                                  setShowHostPicker(false)
-                                  try {
-                                    const token = typeof window !== 'undefined' ? sessionStorage.getItem('meetly_auth_token') : null
-                                    const headers = { 'Content-Type': 'application/json' }
-                                    if (token) headers['Authorization'] = `Bearer ${token}`
-                                    const res = await fetch(
-                                      `${import.meta.env.VITE_API_URL || 'http://localhost:5000'}/api/meetings/${meetingData.meeting_id}/assign-host`,
-                                      {
-                                        method: 'POST',
-                                        headers,
-                                        credentials: 'include',
-                                        body: JSON.stringify({ userId: p.identity })
+                            .map((p) => {
+                              const pUserId = resolveParticipantUserId(p, dbParticipants)
+                              const isCurrentlyAssigned = Boolean(assignedHostId) && Boolean(pUserId) &&
+                                String(pUserId).trim().toLowerCase() === String(assignedHostId).trim().toLowerCase()
+                              return (
+                                <button
+                                  key={p.sid || p.identity || pUserId}
+                                  onClick={async () => {
+                                    const targetUserId = resolveParticipantUserId(p, dbParticipants)
+                                    console.log('[ASSIGN HOST PARTICIPANT DEBUG]', {
+                                      participant: p,
+                                      resolvedUserId: targetUserId,
+                                      userId: p?.userId,
+                                      id: p?.id,
+                                      identity: p?.identity,
+                                      sid: p?.sid,
+                                      name: p?.name,
+                                      metadata: p?.metadata
+                                    })
+                                    if (!targetUserId || !isUuid(targetUserId)) {
+                                      showToast('Could not resolve participant user ID (UUID).', 'error')
+                                      return
+                                    }
+                                    setHostActionLoading(true)
+                                    setShowHostPicker(false)
+                                    try {
+                                      const token = typeof window !== 'undefined' ? sessionStorage.getItem('meetly_auth_token') : null
+                                      const headers = { 'Content-Type': 'application/json' }
+                                      if (token) headers['Authorization'] = `Bearer ${token}`
+                                      const res = await fetch(
+                                        `${import.meta.env.VITE_API_URL || 'http://localhost:5000'}/api/meetings/${meetingData.meeting_id}/assign-host`,
+                                        {
+                                          method: 'POST',
+                                          headers,
+                                          credentials: 'include',
+                                          body: JSON.stringify({ userId: targetUserId })
+                                        }
+                                      )
+                                      const data = await res.json()
+                                      if (!res.ok) {
+                                        showToast(data.message || 'Failed to assign host.', 'error')
+                                      } else {
+                                        showToast(data.message || 'Host assigned successfully.', 'success')
+                                        setMeetingData((prev) => prev ? { ...prev, assigned_host_id: targetUserId } : null)
                                       }
-                                    )
-                                    const data = await res.json()
-                                    if (!res.ok) showToast(data.message || 'Failed to assign host.', 'error')
-                                  } catch {
-                                    showToast('Error assigning host.', 'error')
-                                  } finally {
-                                    setHostActionLoading(false)
-                                  }
-                                }}
-                                disabled={hostActionLoading}
-                                className="flex items-center gap-2 p-2 bg-slate-800/60 hover:bg-slate-700/60 border border-white/5 rounded-lg text-left transition-all cursor-pointer disabled:opacity-50 w-full"
-                              >
-                                <div className="w-6 h-6 rounded-full bg-purple-700 flex items-center justify-center text-[10px] font-bold text-white shrink-0">
-                                  {(p.name || p.identity || '?')[0].toUpperCase()}
-                                </div>
-                                <span className="text-xs text-white font-medium truncate">{p.name || p.identity}</span>
-                                {p.identity === assignedHostId && (
-                                  <span className="ml-auto text-[9px] text-purple-400 shrink-0">current</span>
-                                )}
-                              </button>
-                            ))}
+                                    } catch {
+                                      showToast('Error assigning host.', 'error')
+                                    } finally {
+                                      setHostActionLoading(false)
+                                    }
+                                  }}
+                                  disabled={hostActionLoading}
+                                  className="flex items-center gap-2 p-2 bg-slate-800/60 hover:bg-slate-700/60 border border-white/5 rounded-lg text-left transition-all cursor-pointer disabled:opacity-50 w-full"
+                                >
+                                  <div className="w-6 h-6 rounded-full bg-purple-700 flex items-center justify-center text-[10px] font-bold text-white shrink-0">
+                                    {(p.name || p.identity || '?')[0].toUpperCase()}
+                                  </div>
+                                  <span className="text-xs text-white font-medium truncate">{p.name || p.identity}</span>
+                                  {isCurrentlyAssigned && (
+                                    <span className="ml-auto text-[9px] text-purple-400 shrink-0">current</span>
+                                  )}
+                                </button>
+                              )
+                            })}
                           {(participants || []).filter(p => {
-                            const pid = p.identity || ''
-                            return pid !== currentUserId && !pid.includes(currentUserId || '__NONE__')
+                            const pUserId = resolveParticipantUserId(p, dbParticipants)
+                            const origHost = String(originalHostId || currentUserId || '').trim().toLowerCase()
+                            return pUserId && pUserId.toLowerCase() !== origHost
                           }).length === 0 && (
                             <p className="text-[11px] text-gray-500 italic">No other participants in the meeting.</p>
                           )}
