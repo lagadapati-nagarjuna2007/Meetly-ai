@@ -150,8 +150,8 @@ export const getMeetingTranscriptText = async (req, res) => {
     }
 
     const query = isUuid(meetingId)
-      ? supabase.from('meetings').select('meeting_id').eq('meeting_id', meetingId)
-      : supabase.from('meetings').select('meeting_id').eq('meeting_code', meetingId.trim().toUpperCase())
+      ? supabase.from('meetings').select('meeting_id, host_id, meeting_status').eq('meeting_id', meetingId)
+      : supabase.from('meetings').select('meeting_id, host_id, meeting_status').eq('meeting_code', meetingId.trim().toUpperCase())
 
     const { data: meeting, error: mtgErr } = await query.maybeSingle()
     if (mtgErr) throw mtgErr
@@ -160,6 +160,29 @@ export const getMeetingTranscriptText = async (req, res) => {
     }
 
     const targetMeetingId = meeting.meeting_id
+    const isOriginalHost = String(meeting.host_id || '').toLowerCase() === String(req.user?.id || '').toLowerCase()
+
+    if (meeting.meeting_status === 'Ended') {
+      // Completed meeting: Only the permanent Original Host can access transcript history
+      if (!isOriginalHost) {
+        return res.status(403).json({ success: false, message: 'Access denied. Only the Original Host can access completed meeting transcripts.' })
+      }
+    } else {
+      // Live meeting: Either the Original Host or a participant can fetch transcript for AI chat
+      if (!isOriginalHost) {
+        const { data: part, error: partErr } = await supabase
+          .from('participants')
+          .select('participant_id')
+          .eq('meeting_id', targetMeetingId)
+          .eq('user_id', req.user?.id)
+          .maybeSingle()
+
+        if (partErr) throw partErr
+        if (!part) {
+          return res.status(403).json({ success: false, message: 'Access denied. You do not belong to this meeting.' })
+        }
+      }
+    }
 
     const { data: chunks, error: fetchErr } = await supabase
       .from('meeting_transcripts')

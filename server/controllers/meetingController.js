@@ -956,12 +956,12 @@ export const renameMeeting = async (req, res) => {
   }
 }
 
-// 10. DELETE MEETING (Hard Delete - Host only)
+// 10. DELETE MEETING (Hard Delete - Original Host only)
 export const deleteMeeting = async (req, res) => {
   try {
     const { id } = req.params
 
-    const auth = await authorizeHost(id, req.user.id)
+    const auth = await authorizeHost(id, req.user.id, 'ownership')
     if (!auth.passed) {
       return res.status(auth.status).json({ message: auth.message })
     }
@@ -1011,23 +1011,26 @@ export const getRecentMeetings = async (req, res) => {
         host:host_id ( full_name )
       `)
       .eq('is_deleted', false)
+      .eq('meeting_status', 'Ended')
       .eq('host_id', req.user.id)
       .order('started_at', { ascending: false })
 
     if (fetchMtgErr) throw fetchMtgErr
 
     const formatted = meetings.map((m) => {
-      const date = new Date(m.started_at || m.created_at)
+      const start = new Date(m.started_at || m.created_at)
+      const end = m.ended_at ? new Date(m.ended_at) : new Date()
+      const diffMins = Math.max(1, Math.round((end - start) / 60000))
       return {
         id: m.meeting_code,
         dbId: m.meeting_id,
         name: m.meeting_title,
         host: m.host?.full_name || 'Organizer',
         hostId: m.host_id,
-        date: date.toLocaleDateString('en-US', { month: 'short', day: 'numeric', year: 'numeric' }),
-        time: date.toLocaleTimeString('en-US', { hour: '2-digit', minute: '2-digit' }),
-        duration: m.meeting_status === 'Ended' ? 'Completed' : m.meeting_status,
-        status: m.meeting_status === 'Ended' ? 'Completed' : 'Live',
+        date: start.toLocaleDateString('en-US', { month: 'short', day: 'numeric', year: 'numeric' }),
+        time: start.toLocaleTimeString('en-US', { hour: '2-digit', minute: '2-digit' }),
+        duration: m.ended_at ? `${diffMins} min` : 'Completed',
+        status: 'Completed',
         type: m.meeting_type,
         enableAiAnalyzer: m.enable_ai_analyzer,
         enableAiAttendance: m.enable_ai_attendance
@@ -1447,6 +1450,12 @@ export const generateSummary = async (req, res) => {
     const { meetingId } = req.body
     if (!meetingId) {
       return res.status(400).json({ message: 'Meeting ID is required.' })
+    }
+
+    // Ownership authorization: Only the Original Host can generate summary for completed meeting
+    const auth = await authorizeHost(meetingId, req.user.id, 'ownership')
+    if (!auth.passed) {
+      return res.status(auth.status).json({ message: auth.message })
     }
 
     const nvidiaApiKey = process.env.NVIDIA_API_KEY
@@ -2084,6 +2093,12 @@ export const getSummary = async (req, res) => {
       return res.status(400).json({ message: 'Meeting ID is required.' })
     }
 
+    // Ownership authorization: Only the Original Host can access the meeting summary
+    const auth = await authorizeHost(meetingId, req.user.id, 'ownership')
+    if (!auth.passed) {
+      return res.status(auth.status).json({ message: auth.message })
+    }
+
     const { data: record, error: fetchErr } = await supabase
       .from('meeting_ai_summaries')
       .select('summary')
@@ -2337,12 +2352,12 @@ export const getAttendanceReport = async (req, res) => {
       return res.status(400).json({ message: 'Meeting ID is required.' })
     }
 
-    // Fetch the meeting to find host_id and timestamps
-    const { data: meeting, error: mErr } = await supabase
-      .from('meetings')
-      .select('host_id, started_at, ended_at, created_at')
-      .eq('meeting_id', meetingId)
-      .maybeSingle()
+    // Ownership authorization: Only the Original Host can access the attendance report
+    const auth = await authorizeHost(meetingId, req.user.id, 'ownership')
+    if (!auth.passed) {
+      return res.status(auth.status).json({ message: auth.message })
+    }
+    const meeting = auth.meeting
 
     const hostId = meeting?.host_id
 
@@ -2442,17 +2457,25 @@ export const deleteAttendanceRecords = async (req, res) => {
       return res.status(400).json({ message: 'Meeting ID is required.' })
     }
 
+    // Ownership authorization: Only the Original Host can delete attendance records
+    const auth = await authorizeHost(meetingId, req.user?.id, 'ownership')
+    if (!auth.passed) {
+      return res.status(auth.status).json({ message: auth.message })
+    }
+
+    const targetMeetingId = auth.meeting.meeting_id
+
     const { error } = await supabase
       .from('meeting_attendance')
       .delete()
-      .eq('meeting_id', meetingId)
+      .eq('meeting_id', targetMeetingId)
 
     if (error) {
       console.error('[Attendance Error] Failed to delete records from DB:', error)
       return res.status(500).json({ message: 'Failed to delete attendance logs.' })
     }
 
-    console.log('[Attendance] Attendance deleted successfully for meeting:', meetingId)
+    console.log('[Attendance] Attendance deleted successfully for meeting:', targetMeetingId)
     return res.status(200).json({ message: 'Attendance records cleared.' })
   } catch (err) {
     console.error('[Attendance Error] Unexpected exception deleting attendance:', err)

@@ -1,5 +1,6 @@
 import { useState, useEffect } from 'react'
 import { useParams, useSearchParams, useNavigate } from 'react-router-dom'
+import { useAuth } from '../context/AuthContext'
 import { useMeetings } from '../context/MeetingContext'
 import { useToast } from '../components/Toast'
 import {
@@ -20,11 +21,13 @@ export default function Report() {
   const { id } = useParams()
   const [searchParams] = useSearchParams()
   const navigate = useNavigate()
+  const { user } = useAuth()
   const { meetings, fetchMeetingSummary, generateMeetingSummary } = useMeetings()
   const { showToast } = useToast()
 
-  // Find meeting report data
-  const meeting = meetings.find(m => m.id === id) || meetings[0]
+  // Find meeting report data (do NOT fall back to meetings[0])
+  const meeting = meetings.find(m => m.id === id || m.dbId === id)
+  const isOwner = meeting && (!meeting.hostId || !user?.id || String(meeting.hostId).toLowerCase() === String(user.id).toLowerCase())
 
   // Pre-selected tab from query search parameter or default to 'attendance'
   const initialTab = searchParams.get('tab') || 'attendance'
@@ -81,10 +84,10 @@ export default function Report() {
     }
   }
 
-  if (!meeting) {
+  if (!meeting || !isOwner) {
     return (
       <div className="flex flex-col items-center justify-center py-20 text-center gap-3">
-        <span className="text-sm font-semibold text-gray-400">Meeting report not found</span>
+        <span className="text-sm font-semibold text-gray-400">Meeting report not found or access denied</span>
         <button onClick={() => navigate('/')} className="text-brand-purple hover:underline text-xs font-semibold">
           Return to dashboard
         </button>
@@ -93,9 +96,9 @@ export default function Report() {
   }
 
   // Filter transcript
-  const filteredTranscript = meeting.transcript.filter(t =>
-    t.speaker.toLowerCase().includes(searchTranscript.toLowerCase()) ||
-    t.text.toLowerCase().includes(searchTranscript.toLowerCase())
+  const filteredTranscript = (meeting.transcript || []).filter(t =>
+    (t.speaker || '').toLowerCase().includes(searchTranscript.toLowerCase()) ||
+    (t.text || '').toLowerCase().includes(searchTranscript.toLowerCase())
   )
 
   const tabs = [

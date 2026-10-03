@@ -31,8 +31,14 @@ export default function History() {
     setEndedMeetings((prev) => prev.filter((m) => m.dbId !== deletedDbId))
   }
 
-  // Combine live/active meetings and historical ended meetings
-  const allMeetings = [...meetings, ...endedMeetings]
+  // Combine live/active meetings and historical ended meetings (deduplicated)
+  const seenMeetingIds = new Set()
+  const allMeetings = [...meetings, ...endedMeetings].filter((m) => {
+    const key = m.dbId || m.id
+    if (!key || seenMeetingIds.has(key)) return false
+    seenMeetingIds.add(key)
+    return true
+  })
 
   // Filter list based on search and selected categories
   const filteredMeetings = allMeetings.filter((m) => {
