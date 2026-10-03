@@ -115,8 +115,17 @@ export function MeetingProvider({ children }) {
         token: data.livekitToken,
         livekitUrl: data.livekitUrl,
         enableAiAnalyzer: data.meeting.enable_ai_analyzer,
-        enableAiAttendance: data.meeting.enable_ai_attendance
+        enableAiAttendance: data.meeting.enable_ai_attendance,
+        active_host_id: data.meeting?.active_host_id || data.meeting?.host_id,
+        assigned_host_id: data.meeting?.assigned_host_id || null
       }
+
+      console.log('[ACTIVE MTG UPDATE DEBUG]', {
+        meeting_id: activeMtg.dbId,
+        host_id: activeMtg.host_id,
+        assigned_host_id: activeMtg.assigned_host_id,
+        active_host_id: activeMtg.active_host_id
+      })
 
       setCurrentMeeting(activeMtg)
       setLivekitToken(data.livekitToken)
@@ -182,8 +191,17 @@ export function MeetingProvider({ children }) {
         type: data.meeting.meeting_type,
         roomName: data.roomName || data.meeting.room_name,
         token: data.token,
-        livekitUrl: data.livekitUrl
+        livekitUrl: data.livekitUrl,
+        active_host_id: data.meeting?.active_host_id || data.meeting?.host_id,
+        assigned_host_id: data.meeting?.assigned_host_id || null
       }
+
+      console.log('[ACTIVE MTG UPDATE DEBUG]', {
+        meeting_id: activeMtg.dbId,
+        host_id: activeMtg.host_id,
+        assigned_host_id: activeMtg.assigned_host_id,
+        active_host_id: activeMtg.active_host_id
+      })
 
       setCurrentMeeting(activeMtg)
       setLivekitToken(data.token)

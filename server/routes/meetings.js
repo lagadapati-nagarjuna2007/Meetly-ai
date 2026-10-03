@@ -21,6 +21,11 @@ import {
   deleteAttendanceRecords
 } from '../controllers/meetingController.js'
 import {
+  getHostStatus,
+  assignHost,
+  removeAssignedHost
+} from '../controllers/hostController.js'
+import {
   getPendingRequests,
   acceptJoinRequest,
   rejectJoinRequest,
@@ -71,6 +76,12 @@ router.get('/participants/:meetingId', getMeetingParticipants)
 // Parameter-based endpoints (backward compatibility and dashboard controls)
 router.get('/', getRecentMeetings)
 router.get('/history', getMeetingHistory)
+
+// Host Management routes — must be before /:id catch-all
+router.get('/:meetingId/host-status', getHostStatus)
+router.post('/:meetingId/assign-host', assignHost)
+router.delete('/:meetingId/assigned-host', removeAssignedHost)
+
 router.get('/:id', getMeetingDetails)
 router.put('/:id', renameMeeting)
 router.delete('/:id', deleteMeeting)

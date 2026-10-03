@@ -7,11 +7,21 @@ const isUuid = (val) => {
 }
 
 /**
- * Shared helper to verify if the authenticated user is the meeting host.
- * Resolves the meeting from database and checks authorization.
+ * Shared helper to verify host authorization for meeting operations.
+ *
+ * mode = 'manage'   (default) — checks userId === meeting.active_host_id
+ *                               Used by all meeting-management endpoints (mute, remove, ban, end, lock, etc.)
+ *                               Does NOT fall back to host_id. The Original Host passes because they
+ *                               are normally also the Active Host. If they have disconnected and
+ *                               another user became active_host_id, the disconnected Original Host
+ *                               will correctly fail.
+ *
+ * mode = 'ownership'          — checks userId === meeting.host_id only
+ *                               Used exclusively by host-assignment endpoints (assign, remove assigned host).
+ *
  * Returns { passed: boolean, meeting: object, status: number, message: string }
  */
-export const authorizeHost = async (meetingIdOrCode, userId) => {
+export const authorizeHost = async (meetingIdOrCode, userId, mode = 'manage') => {
   try {
     if (!meetingIdOrCode) {
       return {
@@ -55,25 +65,54 @@ export const authorizeHost = async (meetingIdOrCode, userId) => {
       }
     }
 
-    // Convert both to string and lowercase to avoid any type/casing mismatch
-    const hostIdStr = String(meeting.host_id).trim().toLowerCase()
     const userIdStr = String(userId).trim().toLowerCase()
-    const passed = hostIdStr === userIdStr
 
-    console.log(`\n==================================================`)
-    console.log(`[HOST AUTH DEBUG]\naction: host_authorization_check\nauthenticatedUserId: ${userId}\nmeetingId: ${meeting.meeting_id}\nmeetingHostId: ${meeting.host_id}\nisHost: ${passed}`)
-    console.log(`Meeting Host ID: ${meeting.host_id}`)
-    console.log(`Authenticated User ID: ${userId}`)
-    console.log(`Meeting Code: ${meeting.meeting_code}`)
-    console.log(`Authorization Passed: ${passed}`)
-    console.log(`==================================================\n`)
+    let passed = false
+    let authorizedId = null
 
-    if (!passed) {
-      return {
-        passed: false,
-        status: 403,
-        message: `Unauthorized. Only the meeting host can perform this action. (Host: ${hostIdStr}, User: ${userIdStr})`,
-        meeting
+    if (mode === 'ownership') {
+      // Ownership: only the permanent Original Host (host_id) is allowed.
+      // Used for assign-host and remove-assigned-host operations.
+      authorizedId = String(meeting.host_id || '').trim().toLowerCase()
+      passed = authorizedId === userIdStr
+
+      console.log(`\n==================================================`)
+      console.log(`[HOST AUTH DEBUG] mode=ownership\nauthenticatedUserId: ${userId}\nmeetingId: ${meeting.meeting_id}\noriginalHostId: ${meeting.host_id}\npassed: ${passed}`)
+      console.log(`==================================================\n`)
+
+      if (!passed) {
+        return {
+          passed: false,
+          status: 403,
+          message: `Unauthorized. Only the Original Host can perform this action. (OriginalHost: ${authorizedId}, User: ${userIdStr})`,
+          meeting
+        }
+      }
+    } else {
+      // Management: only the current Active Host (active_host_id) is allowed.
+      // Does NOT fall back to host_id. The Original Host naturally passes when
+      // active_host_id === host_id (normal state). When disconnected, they fail correctly.
+      //
+      // NOTE: if active_host_id is NULL (e.g., meeting has no active host yet after migration),
+      // we fall back to host_id to prevent breaking existing meetings that were created
+      // before active_host_id was populated.
+      const activeHostId = meeting.active_host_id
+        ? String(meeting.active_host_id).trim().toLowerCase()
+        : String(meeting.host_id || '').trim().toLowerCase()
+
+      passed = activeHostId === userIdStr
+
+      console.log(`\n==================================================`)
+      console.log(`[HOST AUTH DEBUG] mode=manage\nauthenticatedUserId: ${userId}\nmeetingId: ${meeting.meeting_id}\nactiveHostId: ${meeting.active_host_id || '(null→fallback to host_id)'}\noriginalHostId: ${meeting.host_id}\npassed: ${passed}`)
+      console.log(`==================================================\n`)
+
+      if (!passed) {
+        return {
+          passed: false,
+          status: 403,
+          message: `Unauthorized. Only the Active Host can perform this action. (ActiveHost: ${activeHostId}, User: ${userIdStr})`,
+          meeting
+        }
       }
     }
 

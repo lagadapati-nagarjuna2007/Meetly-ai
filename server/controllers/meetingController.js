@@ -236,6 +236,8 @@ export const createMeeting = async (req, res) => {
     }
 
     // Step 4: Insert meeting into DB with status 'Waiting' (Host created, waiting for LiveKit connect)
+    console.log(`[HOST CREATE DEBUG]\nhost_id: ${req.user.id}\nactive_host_id: ${req.user.id}`)
+
     const { data: meeting, error: meetingErr } = await supabase
       .from('meetings')
       .insert([
@@ -252,7 +254,10 @@ export const createMeeting = async (req, res) => {
           enable_ai_attendance: !!enableAiAttendance,
           // Explicitly set auto_admit=true so joinMeeting never gets NULL and
           // can't accidentally route participants to the waiting room
-          auto_admit: true
+          auto_admit: true,
+          // Initialize Active Host as the meeting creator (Original Host)
+          active_host_id: req.user.id,
+          assigned_host_id: null
         }
       ])
       .select()
@@ -262,6 +267,8 @@ export const createMeeting = async (req, res) => {
       console.error('[Create Error] Failed to insert meeting into DB:', meetingErr)
       throw meetingErr
     }
+
+    console.log(`[HOST CREATE RESULT]\nhost_id: ${meeting?.host_id}\nactive_host_id: ${meeting?.active_host_id}`)
 
     createdMeetingId = meeting.meeting_id
     console.log(`[Create Success] Inserted meeting ${code} (${createdMeetingId}) with status 'Waiting'`)
@@ -593,6 +600,9 @@ export const joinMeeting = async (req, res) => {
 
     const muteAllEnabled = isMuteAllEnabled(meeting.meeting_id) || isMuteAllEnabled(meeting.meeting_code)
 
+    // active_host_id fallback: if the column is NULL (pre-migration), treat Original Host as Active Host
+    const activeHostId = meeting.active_host_id || meeting.host_id
+
     return res.status(200).json({
       message: 'Joined meeting successfully.',
       token,
@@ -600,6 +610,8 @@ export const joinMeeting = async (req, res) => {
       livekitUrl: livekitUrl || 'ws://localhost:7880',
       meeting: {
         ...meeting,
+        active_host_id: activeHostId,
+        assigned_host_id: meeting.assigned_host_id || null,
         mute_all_enabled: muteAllEnabled
       }
     })
@@ -859,9 +871,17 @@ export const getMeetingDetails = async (req, res) => {
 
     const muteAllEnabled = isMuteAllEnabled(meeting.meeting_id) || isMuteAllEnabled(meeting.meeting_code)
 
+    // active_host_id fallback: if the column is NULL (pre-migration rows or column doesn't exist yet),
+    // treat the Original Host as the Active Host. This keeps the UI working before the migration runs.
+    const activeHostId = meeting.active_host_id || meeting.host_id
+
+    console.log(`[MEETING DETAILS DEBUG]\nmeeting_id: ${meeting.meeting_id}\nhost_id: ${meeting.host_id}\nassigned_host_id: ${meeting.assigned_host_id}\nactive_host_id: ${activeHostId}`)
+
     return res.status(200).json({
       meeting: {
         ...meeting,
+        active_host_id: activeHostId,
+        assigned_host_id: meeting.assigned_host_id || null,
         mute_all_enabled: muteAllEnabled
       },
       participants

@@ -124,9 +124,28 @@ function MeetingRoomInner() {
   const navigate = useNavigate()
 
   const [meetingData, setMeetingData] = useState(null)
-  const meetingHostId = meetingData?.host_id || meetingData?.hostId
-  const currentUserId = user?.id
-  const isHost = Boolean(currentUserId) && Boolean(meetingHostId) && String(currentUserId).trim().toLowerCase() === String(meetingHostId).trim().toLowerCase()
+  const originalHostId = meetingData?.host_id || meetingData?.hostId
+  const assignedHostId = meetingData?.assigned_host_id
+  const activeHostId   = meetingData?.active_host_id
+  const currentUserId  = user?.id
+
+  const isOriginalHost = Boolean(currentUserId) && Boolean(originalHostId) &&
+    String(currentUserId).trim().toLowerCase() === String(originalHostId).trim().toLowerCase()
+
+  const isAssignedHost = Boolean(currentUserId) && Boolean(assignedHostId) &&
+    String(currentUserId).trim().toLowerCase() === String(assignedHostId).trim().toLowerCase()
+
+  const isActiveHost = Boolean(currentUserId) && Boolean(activeHostId) &&
+    String(currentUserId).trim().toLowerCase() === String(activeHostId).trim().toLowerCase()
+
+  // canManageMeeting: current Active Host only (Active Host = meeting-management authority)
+  const canManageMeeting = isActiveHost
+
+  // canManageHostAssignment: Original Host only (can assign/change/remove Assigned Host)
+  const canManageHostAssignment = isOriginalHost
+
+  // Legacy alias for all existing code that references isHost — bound to canManageMeeting
+  const isHost = canManageMeeting
 
   const isHostRef = useRef(isHost)
   useEffect(() => {
@@ -208,7 +227,17 @@ function MeetingRoomInner() {
           setTimeout(() => { if (isMounted) navigate('/') }, 3000)
           return
         }
+        console.log('[MEETING DATA FROM API]', {
+          host_id: data.meeting?.host_id,
+          assigned_host_id: data.meeting?.assigned_host_id,
+          active_host_id: data.meeting?.active_host_id
+        })
         setMeetingData(data.meeting)
+        console.log('[MEETING DATA AFTER API STATE UPDATE]', {
+          host_id: data.meeting?.host_id,
+          assigned_host_id: data.meeting?.assigned_host_id,
+          active_host_id: data.meeting?.active_host_id
+        })
       } catch (err) {
         if (!isMounted) return
         console.error('[MeetingRoom useEffect 1] Failed to load meeting details:', err)
@@ -402,7 +431,8 @@ function MeetingRoomInner() {
       })
 
       // Register room
-      socket.current.emit('join_room', meetingData.room_name)
+      // Pass userId so server can track per-user socket presence (multi-tab aware)
+      socket.current.emit('join_room', { roomName: meetingData.room_name, userId: user?.id })
 
       // WebSocket listeners
       socket.current.on('receive_message', (msg) => {
@@ -506,6 +536,51 @@ function MeetingRoomInner() {
           return next
         })
       })
+      // ── Host Management socket events ────────────────────────────────────────
+      // Server is the authoritative source — frontend only syncs state from these events.
+
+      socket.current.on('host_assigned', ({ assignedHostId, assignedHostName, activeHostId, originalHostId }) => {
+        console.log(`[SOCKET HOST STATE DEBUG]\nevent: host_assigned\noriginalHostId: ${originalHostId}\nassignedHostId: ${assignedHostId}\nactiveHostId: ${activeHostId}`)
+        setMeetingData((prev) => prev ? {
+          ...prev,
+          assigned_host_id: assignedHostId
+          // active_host_id is NOT changed by host_assigned — per plan
+        } : null)
+        showToast(`${assignedHostName || 'A participant'} has been designated as Assigned Host.`, 'info')
+      })
+
+      socket.current.on('host_removed', ({ activeHostId, originalHostId }) => {
+        console.log(`[SOCKET HOST STATE DEBUG]\nevent: host_removed\noriginalHostId: ${originalHostId}\nassignedHostId: null\nactiveHostId: ${activeHostId}`)
+        setMeetingData((prev) => prev ? {
+          ...prev,
+          assigned_host_id: null
+        } : null)
+        showToast('Assigned Host designation has been removed.', 'info')
+      })
+
+      socket.current.on('active_host_changed', ({ activeHostId, activeHostName, assignedHostId, originalHostId }) => {
+        console.log(`[SOCKET HOST STATE DEBUG]\nevent: active_host_changed\noriginalHostId: ${originalHostId}\nassignedHostId: ${assignedHostId}\nactiveHostId: ${activeHostId}`)
+        if (!activeHostId) return
+        setMeetingData((prev) => prev ? {
+          ...prev,
+          active_host_id: activeHostId,
+          assigned_host_id: assignedHostId !== undefined ? assignedHostId : prev.assigned_host_id
+        } : null)
+        showToast(`${activeHostName || 'A participant'} is now the Active Host.`, 'info')
+      })
+
+      socket.current.on('original_host_reconnected', ({ activeHostId, activeHostName, assignedHostId, originalHostId }) => {
+        console.log(`[SOCKET HOST STATE DEBUG]\nevent: original_host_reconnected\noriginalHostId: ${originalHostId}\nassignedHostId: ${assignedHostId}\nactiveHostId: ${activeHostId}`)
+        if (!activeHostId) return
+        setMeetingData((prev) => prev ? {
+          ...prev,
+          active_host_id: activeHostId,
+          assigned_host_id: assignedHostId !== undefined ? assignedHostId : prev.assigned_host_id
+        } : null)
+        showToast(`${activeHostName || 'The original host'} has rejoined and regained host control.`, 'info')
+      })
+      // ── End Host Management socket events ────────────────────────────────────
+
     } catch (socketErr) {
       console.error('[MeetingRoomInner useEffect socket] Socket.IO initialization error:', socketErr)
     }
@@ -840,11 +915,30 @@ function MeetingRoomContent({
     { sender: 'bot', text: 'I am tracking the meeting. You can ask me to summarize the current discussion.' }
   ])
 
-  const meetingHostId = meetingData?.host_id || meetingData?.hostId
-  const currentUserId = user?.id
-  const isHost = Boolean(currentUserId) && Boolean(meetingHostId) && String(currentUserId).trim().toLowerCase() === String(meetingHostId).trim().toLowerCase()
+  const originalHostId = meetingData?.host_id || meetingData?.hostId
+  const assignedHostId = meetingData?.assigned_host_id
+  const activeHostId   = meetingData?.active_host_id
+  const currentUserId  = user?.id
 
-  console.log(`[HOST UI DEBUG]\nuserId: ${currentUserId}\nmeetingHostId: ${meetingHostId}\nisHost: ${isHost}\nsecurityTabVisible: ${isHost}`)
+  const isOriginalHost = Boolean(currentUserId) && Boolean(originalHostId) &&
+    String(currentUserId).trim().toLowerCase() === String(originalHostId).trim().toLowerCase()
+
+  const isAssignedHost = Boolean(currentUserId) && Boolean(assignedHostId) &&
+    String(currentUserId).trim().toLowerCase() === String(assignedHostId).trim().toLowerCase()
+
+  const isActiveHost = Boolean(currentUserId) && Boolean(activeHostId) &&
+    String(currentUserId).trim().toLowerCase() === String(activeHostId).trim().toLowerCase()
+
+  // canManageMeeting: Active Host only
+  const canManageMeeting = isActiveHost
+
+  // canManageHostAssignment: Original Host only
+  const canManageHostAssignment = isOriginalHost
+
+  // Legacy alias — all existing isHost references remain valid
+  const isHost = canManageMeeting
+
+  console.log(`[HOST UI DEBUG]\nuserId: ${currentUserId}\noriginalHostId: ${originalHostId}\nassignedHostId: ${assignedHostId}\nactiveHostId: ${activeHostId}\nisOriginalHost: ${isOriginalHost}\nisAssignedHost: ${isAssignedHost}\nisActiveHost: ${isActiveHost}\ncanManageMeeting: ${canManageMeeting}\ncanManageHostAssignment: ${canManageHostAssignment}`)
 
   const roomState = room?.state
   console.log('[MeetingRoomContent Render] roomState:', roomState, 'localParticipant:', !!localParticipant, 'participants count:', participants?.length || 0)
@@ -854,6 +948,10 @@ function MeetingRoomContent({
   // and returns one of: ConnectionState.Connected | Reconnecting | Disconnected | Connecting
   const connectionState = useConnectionState()
   const [isReconnecting, setIsReconnecting] = useState(false)
+
+  // ── Host Management UI state ─────────────────────────────────────────────────
+  const [showHostPicker, setShowHostPicker] = useState(false)
+  const [hostActionLoading, setHostActionLoading] = useState(false)
 
   // Listen for LiveKit's built-in reconnect lifecycle events.
   // RoomEvent.Reconnecting fires when the DefaultReconnectPolicy starts retrying.
@@ -3306,6 +3404,150 @@ function MeetingRoomContent({
                       )}
                     </div>
                   </div>
+
+                  {/* ── HOST MANAGEMENT — visible only to Original Host ── */}
+                  {canManageHostAssignment && (
+                    <div className="flex flex-col gap-2 border-t border-white/5 pt-3 mt-1">
+                      <h3 className="text-xs font-bold text-purple-300 select-none flex items-center gap-1.5">
+                        <span>👑</span> Host Management
+                      </h3>
+
+                      {/* Active Host indicator */}
+                      <div className="flex items-center justify-between p-2.5 bg-purple-950/20 border border-purple-500/20 rounded-xl">
+                        <div className="flex flex-col">
+                          <span className="text-[10px] text-gray-400">Active Host</span>
+                          <span className="text-xs font-semibold text-white">
+                            {activeHostId === currentUserId
+                              ? 'You (Original Host)'
+                              : participants?.find(p => p.identity === activeHostId || p.identity?.includes(activeHostId))?.name || activeHostId || '—'}
+                          </span>
+                        </div>
+                        <span className="text-[10px] text-emerald-400 bg-emerald-500/10 border border-emerald-500/20 px-2 py-0.5 rounded-full">Active</span>
+                      </div>
+
+                      {/* Assigned Host row */}
+                      <div className="flex items-center justify-between p-2.5 bg-white/2 border border-white/5 rounded-xl gap-2">
+                        <div className="flex flex-col min-w-0">
+                          <span className="text-[10px] text-gray-400">Assigned Host</span>
+                          <span className="text-xs font-semibold text-white truncate">
+                            {assignedHostId
+                              ? (participants?.find(p => p.identity === assignedHostId || p.identity?.includes(assignedHostId))?.name || assignedHostId)
+                              : <span className="text-gray-500 font-normal italic">None designated</span>}
+                          </span>
+                        </div>
+                        <div className="flex gap-1.5 shrink-0">
+                          {assignedHostId ? (
+                            <>
+                              <button
+                                onClick={() => setShowHostPicker(true)}
+                                disabled={hostActionLoading}
+                                className="px-2 py-1 bg-slate-700 hover:bg-slate-600 text-white rounded text-[10px] font-bold cursor-pointer transition-all disabled:opacity-50"
+                              >
+                                Change
+                              </button>
+                              <button
+                                onClick={async () => {
+                                  setHostActionLoading(true)
+                                  try {
+                                    const token = typeof window !== 'undefined' ? sessionStorage.getItem('meetly_auth_token') : null
+                                    const headers = { 'Content-Type': 'application/json' }
+                                    if (token) headers['Authorization'] = `Bearer ${token}`
+                                    const res = await fetch(
+                                      `${import.meta.env.VITE_API_URL || 'http://localhost:5000'}/api/meetings/${meetingData.meeting_id}/assigned-host`,
+                                      { method: 'DELETE', headers, credentials: 'include' }
+                                    )
+                                    const data = await res.json()
+                                    if (!res.ok) showToast(data.message || 'Failed to remove assigned host.', 'error')
+                                  } catch {
+                                    showToast('Error removing assigned host.', 'error')
+                                  } finally {
+                                    setHostActionLoading(false)
+                                  }
+                                }}
+                                disabled={hostActionLoading}
+                                className="px-2 py-1 bg-red-700 hover:bg-red-600 text-white rounded text-[10px] font-bold cursor-pointer transition-all disabled:opacity-50"
+                              >
+                                Remove
+                              </button>
+                            </>
+                          ) : (
+                            <button
+                              onClick={() => setShowHostPicker(true)}
+                              disabled={hostActionLoading}
+                              className="px-2.5 py-1 bg-purple-700 hover:bg-purple-600 text-white rounded text-[10px] font-bold cursor-pointer transition-all disabled:opacity-50"
+                            >
+                              + Add Host
+                            </button>
+                          )}
+                        </div>
+                      </div>
+
+                      {/* Participant picker */}
+                      {showHostPicker && (
+                        <div className="flex flex-col gap-1.5 p-2.5 bg-slate-900/60 border border-purple-500/20 rounded-xl">
+                          <div className="flex items-center justify-between mb-1">
+                            <span className="text-[10px] text-gray-400 font-semibold">Select a participant as Assigned Host</span>
+                            <button
+                              onClick={() => setShowHostPicker(false)}
+                              className="text-gray-500 hover:text-white text-[10px] cursor-pointer"
+                            >
+                              ✕
+                            </button>
+                          </div>
+                          {(participants || [])
+                            .filter(p => {
+                              const pid = p.identity || ''
+                              return pid !== currentUserId && !pid.includes(currentUserId || '__NONE__')
+                            })
+                            .map((p) => (
+                              <button
+                                key={p.identity}
+                                onClick={async () => {
+                                  setHostActionLoading(true)
+                                  setShowHostPicker(false)
+                                  try {
+                                    const token = typeof window !== 'undefined' ? sessionStorage.getItem('meetly_auth_token') : null
+                                    const headers = { 'Content-Type': 'application/json' }
+                                    if (token) headers['Authorization'] = `Bearer ${token}`
+                                    const res = await fetch(
+                                      `${import.meta.env.VITE_API_URL || 'http://localhost:5000'}/api/meetings/${meetingData.meeting_id}/assign-host`,
+                                      {
+                                        method: 'POST',
+                                        headers,
+                                        credentials: 'include',
+                                        body: JSON.stringify({ userId: p.identity })
+                                      }
+                                    )
+                                    const data = await res.json()
+                                    if (!res.ok) showToast(data.message || 'Failed to assign host.', 'error')
+                                  } catch {
+                                    showToast('Error assigning host.', 'error')
+                                  } finally {
+                                    setHostActionLoading(false)
+                                  }
+                                }}
+                                disabled={hostActionLoading}
+                                className="flex items-center gap-2 p-2 bg-slate-800/60 hover:bg-slate-700/60 border border-white/5 rounded-lg text-left transition-all cursor-pointer disabled:opacity-50 w-full"
+                              >
+                                <div className="w-6 h-6 rounded-full bg-purple-700 flex items-center justify-center text-[10px] font-bold text-white shrink-0">
+                                  {(p.name || p.identity || '?')[0].toUpperCase()}
+                                </div>
+                                <span className="text-xs text-white font-medium truncate">{p.name || p.identity}</span>
+                                {p.identity === assignedHostId && (
+                                  <span className="ml-auto text-[9px] text-purple-400 shrink-0">current</span>
+                                )}
+                              </button>
+                            ))}
+                          {(participants || []).filter(p => {
+                            const pid = p.identity || ''
+                            return pid !== currentUserId && !pid.includes(currentUserId || '__NONE__')
+                          }).length === 0 && (
+                            <p className="text-[11px] text-gray-500 italic">No other participants in the meeting.</p>
+                          )}
+                        </div>
+                      )}
+                    </div>
+                  )}
                 </div>
               )}
 

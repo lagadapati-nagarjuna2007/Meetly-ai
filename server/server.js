@@ -76,36 +76,288 @@ const io = new Server(httpServer, {
 })
 app.set('io', io)
 
-// Active socket room tracking map: roomName -> Set of socket IDs
+// Active socket room tracking — multi-tab/multi-socket aware.
+// roomSockets: Map<roomName, Set<socketId>>  — tracks all socket IDs per room (for cleanup trigger)
+// roomUserSockets: Map<roomName, Map<userId, Set<socketId>>>  — tracks which users are connected per room
+// A user is considered disconnected only when their Set<socketId>.size === 0.
 const roomSockets = new Map()
+const roomUserSockets = new Map()
+
+// Expose roomUserSockets on app so hostController can read connection state for validation
+app.set('roomUserSockets', roomUserSockets)
+
+// Grace period timers: Map<roomName, { timer, originalHostId, activeHostId }>
+// Started when the Active Host's last socket disconnects. Cancelled if they reconnect.
+const hostGracePeriodTimers = new Map()
+
+/**
+ * Returns true if a userId has at least one connected socket in the given room.
+ */
+const isUserConnected = (roomName, userId) => {
+  if (!roomName || !userId) return false
+  const userMap = roomUserSockets.get(roomName)
+  if (!userMap) return false
+  const sockets = userMap.get(String(userId).trim().toLowerCase())
+  return sockets ? sockets.size > 0 : false
+}
+
+/**
+ * Adds a socket ID to the presence maps for a user in a room.
+ */
+const addSocketPresence = (roomName, userId, socketId) => {
+  if (!roomName || !userId || !socketId) return
+
+  // roomSockets — flat set of all socket IDs per room
+  if (!roomSockets.has(roomName)) roomSockets.set(roomName, new Set())
+  roomSockets.get(roomName).add(socketId)
+
+  // roomUserSockets — per-user set of socket IDs
+  if (!roomUserSockets.has(roomName)) roomUserSockets.set(roomName, new Map())
+  const userMap = roomUserSockets.get(roomName)
+  const userKey = String(userId).trim().toLowerCase()
+  if (!userMap.has(userKey)) userMap.set(userKey, new Set())
+  userMap.get(userKey).add(socketId)
+}
+
+/**
+ * Removes a socket ID from the presence maps.
+ * Returns true if the user is now fully disconnected from the room (no sockets left).
+ */
+const removeSocketPresence = (roomName, userId, socketId) => {
+  if (!roomName || !socketId) return true
+
+  // roomSockets
+  const sockets = roomSockets.get(roomName)
+  if (sockets) {
+    sockets.delete(socketId)
+    if (sockets.size === 0) roomSockets.delete(roomName)
+  }
+
+  // roomUserSockets
+  if (!userId) return true
+  const userMap = roomUserSockets.get(roomName)
+  if (!userMap) return true
+  const userKey = String(userId).trim().toLowerCase()
+  const userSockets = userMap.get(userKey)
+  if (userSockets) {
+    userSockets.delete(socketId)
+    if (userSockets.size === 0) {
+      userMap.delete(userKey)
+      if (userMap.size === 0) roomUserSockets.delete(roomName)
+      return true // user is now fully disconnected
+    }
+  }
+  return false // user still has other sockets
+}
+
+/**
+ * Host transfer algorithm.
+ * Called after grace period expires. Re-checks presence and DB state before transferring.
+ *
+ * @param {string} roomName
+ * @param {string} originalHostId  - meeting.host_id
+ * @param {string} disconnectedActiveHostId - the active_host_id that triggered the grace period
+ * @param {object} io  - Socket.IO server instance
+ */
+const performHostTransfer = async (roomName, originalHostId, disconnectedActiveHostId, io) => {
+  try {
+    console.log(`[HostTransfer] Grace period expired for room ${roomName}. Starting race-safe transfer.`)
+
+    // Step 1: Re-check presence — confirm Original Host is still disconnected
+    if (isUserConnected(roomName, originalHostId)) {
+      console.log(`[HostTransfer] ABORTED — Original Host ${originalHostId} has reconnected. No transfer needed.`)
+      return
+    }
+
+    // Step 2: Re-read meeting state from DB
+    const { data: meeting, error } = await supabase
+      .from('meetings')
+      .select('meeting_id, host_id, assigned_host_id, active_host_id, meeting_status, room_name')
+      .eq('room_name', roomName)
+      .maybeSingle()
+
+    if (error || !meeting) {
+      console.log(`[HostTransfer] ABORTED — Could not read meeting for room ${roomName}.`)
+      return
+    }
+
+    // Only transfer for active/waiting meetings
+    if (meeting.meeting_status === 'Ended' || meeting.meeting_status === 'Locked') {
+      console.log(`[HostTransfer] ABORTED — Meeting ${meeting.meeting_id} status is ${meeting.meeting_status}. No transfer.`)
+      return
+    }
+
+    // Step 3: Confirm active_host_id still points to the disconnected host
+    const currentActiveHost = String(meeting.active_host_id || meeting.host_id || '').trim().toLowerCase()
+    const expectedDisconnected = String(disconnectedActiveHostId || '').trim().toLowerCase()
+    if (currentActiveHost !== expectedDisconnected) {
+      console.log(`[HostTransfer] ABORTED — active_host_id changed (now ${meeting.active_host_id}) since grace period started. Transfer already handled.`)
+      return
+    }
+
+    // Step 4: Determine new Active Host
+    let newActiveHostId = null
+
+    // 4a. Check if Assigned Host is currently connected
+    if (meeting.assigned_host_id && isUserConnected(roomName, meeting.assigned_host_id)) {
+      newActiveHostId = meeting.assigned_host_id
+      console.log(`[HostTransfer] Assigned Host ${newActiveHostId} is connected — transferring to them.`)
+    }
+
+    // 4b. If not, find earliest eligible connected participant
+    if (!newActiveHostId) {
+      const { data: participants } = await supabase
+        .from('participants')
+        .select('user_id, joined_at')
+        .eq('meeting_id', meeting.meeting_id)
+        .eq('participant_status', 'joined')
+        .order('joined_at', { ascending: true })
+
+      if (participants && participants.length > 0) {
+        const origHostLower = String(meeting.host_id || '').trim().toLowerCase()
+        const assignedHostLower = meeting.assigned_host_id
+          ? String(meeting.assigned_host_id).trim().toLowerCase()
+          : null
+
+        for (const p of participants) {
+          const pId = String(p.user_id || '').trim().toLowerCase()
+          // Exclude Original Host and the disconnected Assigned Host
+          if (pId === origHostLower) continue
+          if (assignedHostLower && pId === assignedHostLower && !isUserConnected(roomName, p.user_id)) continue
+
+          if (isUserConnected(roomName, p.user_id)) {
+            newActiveHostId = p.user_id
+            console.log(`[HostTransfer] Auto-selected earliest connected participant ${newActiveHostId} as new Active Host.`)
+            break
+          }
+        }
+      }
+    }
+
+    // 4c. No eligible participant — follow existing cleanup
+    if (!newActiveHostId) {
+      console.log(`[HostTransfer] No eligible connected participant found for room ${roomName}. Existing cleanup will handle.`)
+      return
+    }
+
+    // Step 5: Update DB
+    const { error: updateErr } = await supabase
+      .from('meetings')
+      .update({ active_host_id: newActiveHostId, updated_at: new Date().toISOString() })
+      .eq('meeting_id', meeting.meeting_id)
+
+    if (updateErr) {
+      console.error(`[HostTransfer] DB update failed:`, updateErr)
+      return
+    }
+
+    console.log(`[HostTransfer] active_host_id updated: ${disconnectedActiveHostId} → ${newActiveHostId} for meeting ${meeting.meeting_id}`)
+
+    // Step 6: Fetch name and emit events
+    const { data: newHostUser } = await supabase
+      .from('users')
+      .select('full_name')
+      .eq('id', newActiveHostId)
+      .maybeSingle()
+
+    if (io) {
+      const payload = {
+        originalHostId: meeting.host_id,
+        assignedHostId: meeting.assigned_host_id || null,
+        activeHostId: newActiveHostId,
+        activeHostName: newHostUser?.full_name || newActiveHostId
+      }
+      io.to(roomName).emit('active_host_changed', payload)
+      console.log(`[HostTransfer] Emitted 'active_host_changed' to room ${roomName}.`)
+    }
+  } catch (err) {
+    console.error(`[HostTransfer] Unexpected error:`, err)
+  }
+}
 
 io.on('connection', (socket) => {
   let currentRoom = null
+  let currentUserId = null
 
-  // Join Room
-  socket.on('join_room', (roomName) => {
+  // Join Room — handles both new joins and reconnects
+  socket.on('join_room', (data) => {
+    // Support both legacy string and new object payload { roomName, userId }
+    const roomName = typeof data === 'string' ? data : data?.roomName
+    const joinedUserId = typeof data === 'object' ? data?.userId : null
+
+    if (!roomName) return
+
     currentRoom = roomName
+    currentUserId = joinedUserId || null
     socket.join(roomName)
 
-    if (!roomSockets.has(roomName)) {
-      roomSockets.set(roomName, new Set())
+    // Update multi-socket presence maps
+    if (joinedUserId) {
+      addSocketPresence(roomName, joinedUserId, socket.id)
+      console.log(`[Socket Connected] Socket ${socket.id} (user=${joinedUserId}) joined room ${roomName}.`)
+    } else {
+      // Legacy join without userId — only update flat roomSockets for cleanup trigger
+      if (!roomSockets.has(roomName)) roomSockets.set(roomName, new Set())
+      roomSockets.get(roomName).add(socket.id)
+      console.log(`[Socket Connected] Socket ${socket.id} (no userId) joined room ${roomName}.`)
     }
-    roomSockets.get(roomName).add(socket.id)
-    console.log(`[Socket Connected] Socket ${socket.id} joined room ${roomName}. Total sockets: ${roomSockets.get(roomName).size}`)
 
     // Cancel pending cleanup for this room if any participant joins
     supabase
       .from('meetings')
-      .select('meeting_id')
+      .select('meeting_id, host_id, assigned_host_id, active_host_id')
       .eq('room_name', roomName)
       .maybeSingle()
-      .then(({ data }) => {
-        if (data) {
-          cancelCleanup(data.meeting_id)
+      .then(async ({ data: meeting }) => {
+        if (!meeting) return
+        cancelCleanup(meeting.meeting_id)
+
+        // --- Reconnect detection: Original Host ---
+        if (joinedUserId && String(joinedUserId).toLowerCase() === String(meeting.host_id || '').toLowerCase()) {
+          // Cancel any pending grace period for this room
+          const gracePending = hostGracePeriodTimers.get(roomName)
+          if (gracePending) {
+            clearTimeout(gracePending.timer)
+            hostGracePeriodTimers.delete(roomName)
+            console.log(`[HostTransfer] Grace period CANCELLED — Original Host ${joinedUserId} reconnected to room ${roomName}.`)
+          }
+
+          // If active_host_id is not the Original Host, or a grace period was pending, restore active_host_id
+          const currentActiveHost = String(meeting.active_host_id || '').toLowerCase()
+          const origHostLower = String(meeting.host_id || '').toLowerCase()
+          const needsRestore = Boolean(gracePending) || (currentActiveHost !== origHostLower)
+
+          if (needsRestore) {
+            const { error: updateErr } = await supabase
+              .from('meetings')
+              .update({ active_host_id: meeting.host_id, updated_at: new Date().toISOString() })
+              .eq('meeting_id', meeting.meeting_id)
+
+            if (!updateErr) {
+              const { data: hostUser } = await supabase
+                .from('users')
+                .select('full_name')
+                .eq('id', meeting.host_id)
+                .maybeSingle()
+
+              const payload = {
+                originalHostId: meeting.host_id,
+                assignedHostId: meeting.assigned_host_id || null,
+                activeHostId: meeting.host_id,
+                activeHostName: hostUser?.full_name || meeting.host_id
+              }
+              io.to(roomName).emit('active_host_changed', payload)
+              io.to(roomName).emit('original_host_reconnected', payload)
+              console.log(`[HostTransfer] Original Host ${joinedUserId} reconnected — active_host_id restored. Emitted active_host_changed + original_host_reconnected.`)
+            }
+          }
+          // If active_host_id is already the Original Host and no grace period was active,
+          // no host transfer event is needed (normal join/refresh).
         }
+        // Assigned Host reconnect is silent — they simply become eligible for future transfers again
       })
       .catch((err) => {
-        console.error('[Socket Join Cleanup Error]:', err)
+        console.error('[Socket Join Error]:', err)
       })
   })
 
@@ -177,26 +429,83 @@ io.on('connection', (socket) => {
     io.to(roomName).emit('meeting_ended')
   })
 
-  // Socket Disconnect
+  // Socket Disconnect — multi-socket-aware with grace period + race-safe host transfer
   socket.on('disconnect', () => {
-    if (currentRoom && roomSockets.has(currentRoom)) {
-      const sockets = roomSockets.get(currentRoom)
-      sockets.delete(socket.id)
-      console.log(`[Socket Disconnected] Socket ${socket.id} left room ${currentRoom}. Remaining sockets: ${sockets.size}`)
+    if (!currentRoom) return
 
-      // If room is now empty of socket connections, schedule check to clean up meeting if no participants remain
-      if (sockets.size === 0) {
-        roomSockets.delete(currentRoom)
-        const roomToClean = currentRoom
-        
+    const roomName = currentRoom
+    const disconnectedUserId = currentUserId
+
+    // Update presence maps — returns true if user is now fully disconnected
+    const userFullyDisconnected = removeSocketPresence(roomName, disconnectedUserId, socket.id)
+
+    if (disconnectedUserId) {
+      console.log(`[Socket Disconnected] Socket ${socket.id} (user=${disconnectedUserId}) left room ${roomName}. User fully disconnected: ${userFullyDisconnected}`)
+    } else {
+      console.log(`[Socket Disconnected] Socket ${socket.id} (no userId) left room ${roomName}.`)
+    }
+
+    // --- Host Grace Period: only start if user is fully disconnected ---
+    if (userFullyDisconnected && disconnectedUserId) {
+      supabase
+        .from('meetings')
+        .select('meeting_id, meeting_code, host_id, assigned_host_id, active_host_id, meeting_status, room_name')
+        .eq('room_name', roomName)
+        .maybeSingle()
+        .then((result) => {
+          const meeting = result?.data
+          if (!meeting) return
+          if (meeting.meeting_status === 'Ended' || meeting.meeting_status === 'Locked') return
+
+          const activeHostId = meeting.active_host_id || meeting.host_id
+          const disconnectedLower = String(disconnectedUserId).toLowerCase()
+          const activeHostLower = String(activeHostId || '').toLowerCase()
+
+          // Only start grace period if the disconnected user IS the current Active Host
+          if (disconnectedLower === activeHostLower) {
+            // Cancel any pre-existing grace timer for this room
+            const existing = hostGracePeriodTimers.get(roomName)
+            if (existing) {
+              clearTimeout(existing.timer)
+            }
+
+            console.log(`[HostTransfer] Active Host ${disconnectedUserId} disconnected from room ${roomName}. Starting 30s grace period.`)
+
+            const timer = setTimeout(() => {
+              hostGracePeriodTimers.delete(roomName)
+              performHostTransfer(roomName, meeting.host_id, activeHostId, io)
+            }, 30000)
+
+            hostGracePeriodTimers.set(roomName, {
+              timer,
+              originalHostId: meeting.host_id,
+              activeHostId
+            })
+          }
+
+          // Trigger existing room-empty cleanup if no sockets remain
+          const remainingSockets = roomSockets.get(roomName)
+          if (!remainingSockets || remainingSockets.size === 0) {
+            if (meeting.meeting_status === 'Active' || meeting.meeting_status === 'Waiting') {
+              scheduleCleanup(meeting.meeting_id, meeting.meeting_code, roomName)
+            }
+          }
+        })
+        .catch((err) => {
+          console.error('[Socket Disconnect Error]:', err)
+        })
+    } else if (!disconnectedUserId) {
+      // Legacy path (no userId on socket) — fall back to old room-empty cleanup check
+      const sockets = roomSockets.get(roomName)
+      if (!sockets || sockets.size === 0) {
         supabase
           .from('meetings')
           .select('meeting_id, meeting_code, meeting_status')
-          .eq('room_name', roomToClean)
+          .eq('room_name', roomName)
           .maybeSingle()
           .then(({ data: meeting }) => {
             if (meeting && (meeting.meeting_status === 'Active' || meeting.meeting_status === 'Waiting')) {
-              scheduleCleanup(meeting.meeting_id, meeting.meeting_code, roomToClean)
+              scheduleCleanup(meeting.meeting_id, meeting.meeting_code, roomName)
             }
           })
           .catch((err) => {
