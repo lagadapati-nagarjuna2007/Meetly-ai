@@ -322,10 +322,17 @@ io.on('connection', (socket) => {
             console.log(`[HostTransfer] Grace period CANCELLED — Original Host ${joinedUserId} reconnected to room ${roomName}.`)
           }
 
-          // If active_host_id is not the Original Host, or a grace period was pending, restore active_host_id
+          // Only restore active_host_id when the Original Host actually disconnected and is now reconnecting.
+          // Do NOT restore if the Original Host is continuously present (e.g., socket re-join after page refresh)
+          // and intentionally assigned B as the Active Host — gracePending being set is the indicator
+          // that A was truly absent. Without it, A was present the whole time and B's assignment stands.
           const currentActiveHost = String(meeting.active_host_id || '').toLowerCase()
           const origHostLower = String(meeting.host_id || '').toLowerCase()
-          const needsRestore = Boolean(gracePending) || (currentActiveHost !== origHostLower)
+
+          // needsRestore is true ONLY when there was a real disconnection (gracePending timer existed).
+          // If gracePending is false but active_host_id !== host_id, the Original Host intentionally
+          // delegated Active Host to someone else — do NOT override that.
+          const needsRestore = Boolean(gracePending)
 
           if (needsRestore) {
             const { error: updateErr } = await supabase
@@ -350,9 +357,28 @@ io.on('connection', (socket) => {
               io.to(roomName).emit('original_host_reconnected', payload)
               console.log(`[HostTransfer] Original Host ${joinedUserId} reconnected — active_host_id restored. Emitted active_host_changed + original_host_reconnected.`)
             }
+          } else if (currentActiveHost === origHostLower) {
+            // Original Host was already the active host and no grace period was pending — normal join/refresh, nothing to do.
+            console.log(`[HostTransfer] Original Host ${joinedUserId} joined room ${roomName} — already active host, no restore needed.`)
+          } else {
+            // Original Host joined but active_host_id points to someone else (e.g., B after intentional assignment).
+            // No grace period was active, so this is a normal join while B is intentionally the Active Host.
+            // Emit original_host_reconnected so clients know A is back, but keep active_host_id as B.
+            const { data: hostUser } = await supabase
+              .from('users')
+              .select('full_name')
+              .eq('id', meeting.host_id)
+              .maybeSingle()
+
+            const payload = {
+              originalHostId: meeting.host_id,
+              assignedHostId: meeting.assigned_host_id || null,
+              activeHostId: meeting.active_host_id,  // B remains active
+              activeHostName: hostUser?.full_name || meeting.host_id
+            }
+            io.to(roomName).emit('original_host_reconnected', payload)
+            console.log(`[HostTransfer] Original Host ${joinedUserId} joined room ${roomName} while ${meeting.active_host_id} is Active Host — no restore. B continues.`)
           }
-          // If active_host_id is already the Original Host and no grace period was active,
-          // no host transfer event is needed (normal join/refresh).
         }
         // Assigned Host reconnect is silent — they simply become eligible for future transfers again
       })
@@ -461,7 +487,10 @@ io.on('connection', (socket) => {
           const disconnectedLower = String(disconnectedUserId).toLowerCase()
           const activeHostLower = String(activeHostId || '').toLowerCase()
 
-          // Only start grace period if the disconnected user IS the current Active Host
+          // Only start grace period if the disconnected user IS the current Active Host.
+          // CASE 3 note: If A assigned B (active_host_id = B) and then A leaves, disconnectedLower = A but
+          // activeHostLower = B, so this outer condition is FALSE — no grace period starts automatically.
+          // B continues as Active Host uninterrupted. No additional guard needed here.
           if (disconnectedLower === activeHostLower) {
             // Cancel any pre-existing grace timer for this room
             const existing = hostGracePeriodTimers.get(roomName)

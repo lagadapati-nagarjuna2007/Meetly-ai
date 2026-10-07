@@ -147,39 +147,54 @@ export const assignHost = async (req, res) => {
       })
     }
 
-    // Update: set assigned_host_id only — do NOT touch active_host_id
+    // Update: set BOTH assigned_host_id AND active_host_id immediately.
+    // Assigning a host is an IMMEDIATE Active Host transfer — do not wait for Original Host to leave.
     const { error: updateErr } = await supabase
       .from('meetings')
-      .update({ assigned_host_id: userId, updated_at: new Date().toISOString() })
+      .update({
+        assigned_host_id: userId,
+        active_host_id: userId,
+        updated_at: new Date().toISOString()
+      })
       .eq('meeting_id', meeting.meeting_id)
 
     if (updateErr) throw updateErr
 
     // Fetch names for socket payload
-    const [assignedHostName, activeHostName] = await Promise.all([
+    const [assignedHostName, originalHostName] = await Promise.all([
       getUserName(userId),
-      getUserName(meeting.active_host_id)
+      getUserName(meeting.host_id)
     ])
 
-    // Emit host_assigned to all participants in the room
     const io = req.app.get('io')
     if (io) {
+      // Emit host_assigned so all clients know the designated backup changed
       io.to(meeting.room_name).emit('host_assigned', {
         originalHostId: meeting.host_id,
+        originalHostName: originalHostName || null,
         assignedHostId: userId,
         assignedHostName: assignedHostName || userId,
-        activeHostId: meeting.active_host_id,
-        activeHostName: activeHostName || null
+        activeHostId: userId,
+        activeHostName: assignedHostName || userId
+      })
+
+      // Emit active_host_changed so all clients immediately switch Active Host controls
+      io.to(meeting.room_name).emit('active_host_changed', {
+        originalHostId: meeting.host_id,
+        assignedHostId: userId,
+        activeHostId: userId,
+        activeHostName: assignedHostName || userId
       })
     }
 
-    console.log(`[HostController] assignHost: meeting=${meeting.meeting_id} assignedHost=${userId} (assigned by originalHost=${req.user.id}). active_host_id unchanged.`)
+    console.log(`[HostController] assignHost: meeting=${meeting.meeting_id} assignedHost=${userId} activeHost=${userId} (assigned by originalHost=${req.user.id}). IMMEDIATE active host transfer.`)
 
     return res.status(200).json({
       success: true,
-      message: `${assignedHostName || userId} has been designated as the Assigned Host.`,
+      message: `${assignedHostName || userId} is now the Active Host.`,
       assigned_host_id: userId,
-      assigned_host_name: assignedHostName
+      assigned_host_name: assignedHostName,
+      active_host_id: userId
     })
   } catch (err) {
     console.error('[HostController] assignHost error:', err)
@@ -190,7 +205,7 @@ export const assignHost = async (req, res) => {
 /**
  * DELETE /api/meetings/:meetingId/assigned-host
  * Clears the Assigned Host designation.
- * Does NOT change active_host_id.
+ * If the Assigned Host was also the Active Host, restores active_host_id to the Original Host.
  * Authorization: ownership — only meeting.host_id may call this.
  */
 export const removeAssignedHost = async (req, res) => {
@@ -219,30 +234,60 @@ export const removeAssignedHost = async (req, res) => {
       })
     }
 
-    // Update: clear assigned_host_id only — do NOT touch active_host_id
+    // Determine whether the Assigned Host was also the Active Host
+    const assignedWasActive = meeting.assigned_host_id &&
+      String(meeting.assigned_host_id).toLowerCase() === String(meeting.active_host_id || '').toLowerCase()
+
+    // Build the DB update: always clear assigned_host_id.
+    // If they were the Active Host, restore active_host_id to the Original Host.
+    const updatePayload = {
+      assigned_host_id: null,
+      updated_at: new Date().toISOString()
+    }
+    if (assignedWasActive) {
+      updatePayload.active_host_id = meeting.host_id
+    }
+
     const { error: updateErr } = await supabase
       .from('meetings')
-      .update({ assigned_host_id: null, updated_at: new Date().toISOString() })
+      .update(updatePayload)
       .eq('meeting_id', meeting.meeting_id)
 
     if (updateErr) throw updateErr
 
-    // Emit host_removed to all participants in the room
+    const newActiveHostId = assignedWasActive ? meeting.host_id : meeting.active_host_id
     const io = req.app.get('io')
     if (io) {
-      const activeHostName = await getUserName(meeting.active_host_id)
+      const [newActiveHostName, originalHostName] = await Promise.all([
+        getUserName(newActiveHostId),
+        getUserName(meeting.host_id)
+      ])
+
+      // Emit host_removed so all clients clear assignedHostId
       io.to(meeting.room_name).emit('host_removed', {
         originalHostId: meeting.host_id,
-        activeHostId: meeting.active_host_id,
-        activeHostName: activeHostName || null
+        originalHostName: originalHostName || null,
+        activeHostId: newActiveHostId,
+        activeHostName: newActiveHostName || null
       })
+
+      // If active host changed, emit active_host_changed so all clients sync permissions immediately
+      if (assignedWasActive) {
+        io.to(meeting.room_name).emit('active_host_changed', {
+          originalHostId: meeting.host_id,
+          assignedHostId: null,
+          activeHostId: meeting.host_id,
+          activeHostName: originalHostName || meeting.host_id
+        })
+      }
     }
 
-    console.log(`[HostController] removeAssignedHost: meeting=${meeting.meeting_id} clearedAssignedHost=${meeting.assigned_host_id} (by originalHost=${req.user.id}). active_host_id unchanged.`)
+    console.log(`[HostController] removeAssignedHost: meeting=${meeting.meeting_id} clearedAssignedHost=${meeting.assigned_host_id} assignedWasActive=${assignedWasActive} newActiveHostId=${newActiveHostId} (by originalHost=${req.user.id}).`)
 
     return res.status(200).json({
       success: true,
-      message: 'Assigned Host designation has been removed.'
+      message: 'Assigned Host designation has been removed.',
+      active_host_id: newActiveHostId
     })
   } catch (err) {
     console.error('[HostController] removeAssignedHost error:', err)

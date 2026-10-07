@@ -620,17 +620,20 @@ function MeetingRoomInner() {
         console.log(`[SOCKET HOST STATE DEBUG]\nevent: host_assigned\noriginalHostId: ${originalHostId}\nassignedHostId: ${assignedHostId}\nactiveHostId: ${activeHostId}`)
         setMeetingData((prev) => prev ? {
           ...prev,
-          assigned_host_id: assignedHostId
-          // active_host_id is NOT changed by host_assigned — per plan
+          assigned_host_id: assignedHostId,
+          // Immediately reflect the active host transfer — assigning B makes B the Active Host
+          active_host_id: activeHostId || prev.active_host_id
         } : null)
-        showToast(`${assignedHostName || 'A participant'} has been designated as Assigned Host.`, 'info')
+        showToast(`${assignedHostName || 'A participant'} is now the Active Host.`, 'info')
       })
 
       socket.current.on('host_removed', ({ activeHostId, originalHostId }) => {
         console.log(`[SOCKET HOST STATE DEBUG]\nevent: host_removed\noriginalHostId: ${originalHostId}\nassignedHostId: null\nactiveHostId: ${activeHostId}`)
         setMeetingData((prev) => prev ? {
           ...prev,
-          assigned_host_id: null
+          assigned_host_id: null,
+          // Restore active_host_id if the server reverted it (e.g., Original Host regains control)
+          active_host_id: activeHostId || prev.active_host_id
         } : null)
         showToast('Assigned Host designation has been removed.', 'info')
       })
@@ -654,7 +657,14 @@ function MeetingRoomInner() {
           active_host_id: activeHostId,
           assigned_host_id: assignedHostId !== undefined ? assignedHostId : prev.assigned_host_id
         } : null)
-        showToast(`${activeHostName || 'The original host'} has rejoined and regained host control.`, 'info')
+        // Show different message depending on whether Original Host regained control or B continues
+        const activeIsOriginalHost = originalHostId && activeHostId &&
+          String(activeHostId).toLowerCase() === String(originalHostId).toLowerCase()
+        if (activeIsOriginalHost) {
+          showToast(`${activeHostName || 'The original host'} has rejoined and regained host control.`, 'info')
+        } else {
+          showToast('The original host has rejoined the meeting.', 'info')
+        }
       })
       // ── End Host Management socket events ────────────────────────────────────
 
@@ -3503,9 +3513,15 @@ function MeetingRoomContent({
                         <div className="flex flex-col">
                           <span className="text-[10px] text-gray-400">Active Host</span>
                           <span className="text-xs font-semibold text-white">
-                            {activeHostId && currentUserId && String(activeHostId).trim().toLowerCase() === String(currentUserId).trim().toLowerCase()
-                              ? 'You (Original Host)'
-                              : getDisplayNameForUserId(activeHostId, participants, dbParticipants) || '—'}
+                            {(() => {
+                              if (!activeHostId) return '—'
+                              const activeIsCurrentUser = String(activeHostId).trim().toLowerCase() === String(currentUserId).trim().toLowerCase()
+                              const activeIsOriginalHost = String(activeHostId).trim().toLowerCase() === String(originalHostId).trim().toLowerCase()
+                              if (activeIsCurrentUser) {
+                                return activeIsOriginalHost ? 'You (Original Host)' : 'You (Active Host)'
+                              }
+                              return getDisplayNameForUserId(activeHostId, participants, dbParticipants) || '—'
+                            })()}
                           </span>
                         </div>
                         <span className="text-[10px] text-emerald-400 bg-emerald-500/10 border border-emerald-500/20 px-2 py-0.5 rounded-full">Active</span>
@@ -3629,7 +3645,12 @@ function MeetingRoomContent({
                                         showToast(data.message || 'Failed to assign host.', 'error')
                                       } else {
                                         showToast(data.message || 'Host assigned successfully.', 'success')
-                                        setMeetingData((prev) => prev ? { ...prev, assigned_host_id: targetUserId } : null)
+                                        // Update both assigned_host_id AND active_host_id immediately — assigning is an immediate transfer
+                                        setMeetingData((prev) => prev ? {
+                                          ...prev,
+                                          assigned_host_id: targetUserId,
+                                          active_host_id: data.active_host_id || targetUserId
+                                        } : null)
                                       }
                                     } catch {
                                       showToast('Error assigning host.', 'error')
