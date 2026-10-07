@@ -211,14 +211,16 @@ function MeetingRoomInner() {
   const isActiveHost = Boolean(currentUserId) && Boolean(activeHostId) &&
     String(currentUserId).trim().toLowerCase() === String(activeHostId).trim().toLowerCase()
 
-  // canManageMeeting: current Active Host only (Active Host = meeting-management authority)
-  const canManageMeeting = isActiveHost
+  // canManageMeeting: Original Host or Active Host can manage meeting
+  const canManageMeeting = isOriginalHost || isActiveHost
 
   // canManageHostAssignment: Original Host only (can assign/change/remove Assigned Host)
   const canManageHostAssignment = isOriginalHost
 
   // Legacy alias for all existing code that references isHost — bound to canManageMeeting
   const isHost = canManageMeeting
+
+  console.log(`[HOST UI STATE]\ncurrentUserId: ${currentUserId}\nhost_id: ${originalHostId}\nassigned_host_id: ${assignedHostId}\nactive_host_id: ${activeHostId}\nisOriginalHost: ${isOriginalHost}\nisAssignedHost: ${isAssignedHost}\nisActiveHost: ${isActiveHost}\ncanManageMeeting: ${canManageMeeting}\ncanManageHostAssignment: ${canManageHostAssignment}`)
 
   const isHostRef = useRef(isHost)
   useEffect(() => {
@@ -617,46 +619,66 @@ function MeetingRoomInner() {
       // Server is the authoritative source — frontend only syncs state from these events.
 
       socket.current.on('host_assigned', ({ assignedHostId, assignedHostName, activeHostId, originalHostId }) => {
-        console.log(`[SOCKET HOST STATE DEBUG]\nevent: host_assigned\noriginalHostId: ${originalHostId}\nassignedHostId: ${assignedHostId}\nactiveHostId: ${activeHostId}`)
-        setMeetingData((prev) => prev ? {
-          ...prev,
-          assigned_host_id: assignedHostId,
-          // Immediately reflect the active host transfer — assigning B makes B the Active Host
-          active_host_id: activeHostId || prev.active_host_id
-        } : null)
+        console.log(`[HOST UI STATE] immediately before host_assigned\nhost_id: ${originalHostId}\nassignedHostId: ${assignedHostId}\nactiveHostId: ${activeHostId}`)
+        setMeetingData((prev) => {
+          const next = prev ? {
+            ...prev,
+            host_id: prev.host_id || originalHostId,
+            assigned_host_id: assignedHostId,
+            // Immediately reflect the active host transfer — assigning B makes B the Active Host
+            active_host_id: activeHostId || prev.active_host_id
+          } : null
+          console.log(`[HOST UI STATE] immediately after host_assigned meetingData update\nhost_id: ${next?.host_id}\nassigned_host_id: ${next?.assigned_host_id}\nactive_host_id: ${next?.active_host_id}`)
+          return next
+        })
         showToast(`${assignedHostName || 'A participant'} is now the Active Host.`, 'info')
       })
 
       socket.current.on('host_removed', ({ activeHostId, originalHostId }) => {
-        console.log(`[SOCKET HOST STATE DEBUG]\nevent: host_removed\noriginalHostId: ${originalHostId}\nassignedHostId: null\nactiveHostId: ${activeHostId}`)
-        setMeetingData((prev) => prev ? {
-          ...prev,
-          assigned_host_id: null,
-          // Restore active_host_id if the server reverted it (e.g., Original Host regains control)
-          active_host_id: activeHostId || prev.active_host_id
-        } : null)
+        console.log(`[HOST UI STATE] immediately before host_removed\nhost_id: ${originalHostId}\nactiveHostId: ${activeHostId}`)
+        setMeetingData((prev) => {
+          const next = prev ? {
+            ...prev,
+            host_id: prev.host_id || originalHostId,
+            assigned_host_id: null,
+            // Restore active_host_id if the server reverted it (e.g., Original Host regains control)
+            active_host_id: activeHostId || prev.active_host_id
+          } : null
+          console.log(`[HOST UI STATE] immediately after host_removed meetingData update\nhost_id: ${next?.host_id}\nassigned_host_id: ${next?.assigned_host_id}\nactive_host_id: ${next?.active_host_id}`)
+          return next
+        })
         showToast('Assigned Host designation has been removed.', 'info')
       })
 
       socket.current.on('active_host_changed', ({ activeHostId, activeHostName, assignedHostId, originalHostId }) => {
-        console.log(`[SOCKET HOST STATE DEBUG]\nevent: active_host_changed\noriginalHostId: ${originalHostId}\nassignedHostId: ${assignedHostId}\nactiveHostId: ${activeHostId}`)
+        console.log(`[HOST UI STATE] immediately before active_host_changed\nhost_id: ${originalHostId}\nassignedHostId: ${assignedHostId}\nactiveHostId: ${activeHostId}`)
         if (!activeHostId) return
-        setMeetingData((prev) => prev ? {
-          ...prev,
-          active_host_id: activeHostId,
-          assigned_host_id: assignedHostId !== undefined ? assignedHostId : prev.assigned_host_id
-        } : null)
+        setMeetingData((prev) => {
+          const next = prev ? {
+            ...prev,
+            host_id: prev.host_id || originalHostId,
+            active_host_id: activeHostId,
+            assigned_host_id: assignedHostId !== undefined ? assignedHostId : prev.assigned_host_id
+          } : null
+          console.log(`[HOST UI STATE] immediately after active_host_changed meetingData update\nhost_id: ${next?.host_id}\nassigned_host_id: ${next?.assigned_host_id}\nactive_host_id: ${next?.active_host_id}`)
+          return next
+        })
         showToast(`${activeHostName || 'A participant'} is now the Active Host.`, 'info')
       })
 
       socket.current.on('original_host_reconnected', ({ activeHostId, activeHostName, assignedHostId, originalHostId }) => {
-        console.log(`[SOCKET HOST STATE DEBUG]\nevent: original_host_reconnected\noriginalHostId: ${originalHostId}\nassignedHostId: ${assignedHostId}\nactiveHostId: ${activeHostId}`)
+        console.log(`[HOST UI STATE] immediately before original_host_reconnected\nhost_id: ${originalHostId}\nassignedHostId: ${assignedHostId}\nactiveHostId: ${activeHostId}`)
         if (!activeHostId) return
-        setMeetingData((prev) => prev ? {
-          ...prev,
-          active_host_id: activeHostId,
-          assigned_host_id: assignedHostId !== undefined ? assignedHostId : prev.assigned_host_id
-        } : null)
+        setMeetingData((prev) => {
+          const next = prev ? {
+            ...prev,
+            host_id: prev.host_id || originalHostId,
+            active_host_id: activeHostId,
+            assigned_host_id: assignedHostId !== undefined ? assignedHostId : prev.assigned_host_id
+          } : null
+          console.log(`[HOST UI STATE] immediately after original_host_reconnected meetingData update\nhost_id: ${next?.host_id}\nassigned_host_id: ${next?.assigned_host_id}\nactive_host_id: ${next?.active_host_id}`)
+          return next
+        })
         // Show different message depending on whether Original Host regained control or B continues
         const activeIsOriginalHost = originalHostId && activeHostId &&
           String(activeHostId).toLowerCase() === String(originalHostId).toLowerCase()
@@ -1018,8 +1040,8 @@ function MeetingRoomContent({
   const isActiveHost = Boolean(currentUserId) && Boolean(activeHostId) &&
     String(currentUserId).trim().toLowerCase() === String(activeHostId).trim().toLowerCase()
 
-  // canManageMeeting: Active Host only
-  const canManageMeeting = isActiveHost
+  // canManageMeeting: Original Host or Active Host can manage meeting
+  const canManageMeeting = isOriginalHost || isActiveHost
 
   // canManageHostAssignment: Original Host only
   const canManageHostAssignment = isOriginalHost
@@ -1027,7 +1049,7 @@ function MeetingRoomContent({
   // Legacy alias — all existing isHost references remain valid
   const isHost = canManageMeeting
 
-  console.log(`[HOST UI DEBUG]\nuserId: ${currentUserId}\noriginalHostId: ${originalHostId}\nassignedHostId: ${assignedHostId}\nactiveHostId: ${activeHostId}\nisOriginalHost: ${isOriginalHost}\nisAssignedHost: ${isAssignedHost}\nisActiveHost: ${isActiveHost}\ncanManageMeeting: ${canManageMeeting}\ncanManageHostAssignment: ${canManageHostAssignment}`)
+  console.log(`[HOST UI STATE]\ncurrentUserId: ${currentUserId}\nhost_id: ${originalHostId}\nassigned_host_id: ${assignedHostId}\nactive_host_id: ${activeHostId}\nisOriginalHost: ${isOriginalHost}\nisAssignedHost: ${isAssignedHost}\nisActiveHost: ${isActiveHost}\ncanManageMeeting: ${canManageMeeting}\ncanManageHostAssignment: ${canManageHostAssignment}`)
 
   const roomState = room?.state
   console.log('[MeetingRoomContent Render] roomState:', roomState, 'localParticipant:', !!localParticipant, 'participants count:', participants?.length || 0)
@@ -3306,10 +3328,10 @@ function MeetingRoomContent({
                         role = meta.role || 'participant'
                       } catch (e) {}
 
-                      if (pUserId && activeHostId && String(pUserId).toLowerCase() === String(activeHostId).toLowerCase()) {
-                        role = (pUserId && originalHostId && String(pUserId).toLowerCase() === String(originalHostId).toLowerCase())
-                          ? 'host'
-                          : 'active host'
+                      if (pUserId && originalHostId && String(pUserId).toLowerCase() === String(originalHostId).toLowerCase()) {
+                        role = 'host'
+                      } else if (pUserId && activeHostId && String(pUserId).toLowerCase() === String(activeHostId).toLowerCase()) {
+                        role = 'active host'
                       } else if (pUserId && assignedHostId && String(pUserId).toLowerCase() === String(assignedHostId).toLowerCase()) {
                         role = 'assigned host'
                       }
@@ -3559,7 +3581,20 @@ function MeetingRoomContent({
                                       { method: 'DELETE', headers, credentials: 'include' }
                                     )
                                     const data = await res.json()
-                                    if (!res.ok) showToast(data.message || 'Failed to remove assigned host.', 'error')
+                                    if (!res.ok) {
+                                      showToast(data.message || 'Failed to remove assigned host.', 'error')
+                                    } else {
+                                      setMeetingData((prev) => {
+                                        const next = prev ? {
+                                          ...prev,
+                                          assigned_host_id: null,
+                                          active_host_id: data.active_host_id || prev.host_id
+                                        } : null
+                                        console.log(`[HOST UI STATE] immediately after removeAssignedHost click meetingData update\nhost_id: ${next?.host_id}\nassigned_host_id: ${next?.assigned_host_id}\nactive_host_id: ${next?.active_host_id}`)
+                                        return next
+                                      })
+                                      showToast(data.message || 'Assigned Host designation has been removed.', 'success')
+                                    }
                                   } catch {
                                     showToast('Error removing assigned host.', 'error')
                                   } finally {
@@ -3646,11 +3681,15 @@ function MeetingRoomContent({
                                       } else {
                                         showToast(data.message || 'Host assigned successfully.', 'success')
                                         // Update both assigned_host_id AND active_host_id immediately — assigning is an immediate transfer
-                                        setMeetingData((prev) => prev ? {
-                                          ...prev,
-                                          assigned_host_id: targetUserId,
-                                          active_host_id: data.active_host_id || targetUserId
-                                        } : null)
+                                        setMeetingData((prev) => {
+                                          const next = prev ? {
+                                            ...prev,
+                                            assigned_host_id: targetUserId,
+                                            active_host_id: data.active_host_id || targetUserId
+                                          } : null
+                                          console.log(`[HOST UI STATE] immediately after assignHost click meetingData update\nhost_id: ${next?.host_id}\nassigned_host_id: ${next?.assigned_host_id}\nactive_host_id: ${next?.active_host_id}`)
+                                          return next
+                                        })
                                       }
                                     } catch {
                                       showToast('Error assigning host.', 'error')
