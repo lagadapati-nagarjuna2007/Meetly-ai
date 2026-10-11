@@ -59,6 +59,58 @@ export default function ExpandedParticipantStage({
     }
   }, [zoom])
 
+  // Floating self-view thumbnail state in fullscreen
+  const [thumbPos, setThumbPos] = useState({ x: 0, y: 0 })
+  const [isThumbDragging, setIsThumbDragging] = useState(false)
+  const thumbDragRef = useRef({ startX: 0, startY: 0, initialX: 0, initialY: 0 })
+
+  // Reset thumbnail position when entering or exiting fullscreen
+  useEffect(() => {
+    if (!isFullscreen) {
+      setThumbPos({ x: 0, y: 0 })
+      setIsThumbDragging(false)
+    }
+  }, [isFullscreen])
+
+  // Dragging handlers for floating self-view thumbnail
+  const handleThumbPointerDown = (e) => {
+    if (e.button !== 0) return
+    e.stopPropagation()
+    setIsThumbDragging(true)
+    thumbDragRef.current = {
+      startX: e.clientX,
+      startY: e.clientY,
+      initialX: thumbPos.x,
+      initialY: thumbPos.y
+    }
+    try {
+      e.currentTarget.setPointerCapture(e.pointerId)
+    } catch (_) {}
+  }
+
+  const handleThumbPointerMove = (e) => {
+    if (!isThumbDragging) return
+    e.stopPropagation()
+    const dx = e.clientX - thumbDragRef.current.startX
+    const dy = e.clientY - thumbDragRef.current.startY
+    setThumbPos({
+      x: thumbDragRef.current.initialX + dx,
+      y: thumbDragRef.current.initialY + dy
+    })
+  }
+
+  const handleThumbPointerUp = (e) => {
+    if (isThumbDragging) {
+      e.stopPropagation()
+      setIsThumbDragging(false)
+      try {
+        if (e.currentTarget.hasPointerCapture(e.pointerId)) {
+          e.currentTarget.releasePointerCapture(e.pointerId)
+        }
+      } catch (_) {}
+    }
+  }
+
   const handleZoomIn = useCallback(() => {
     setZoom((prev) => {
       const next = ZOOM_PRESETS.find((z) => z > prev)
@@ -370,6 +422,50 @@ export default function ExpandedParticipantStage({
         {activeReaction && (
           <div className="absolute bottom-6 left-1/2 -translate-x-1/2 z-20 px-4 py-2 rounded-3xl bg-black/85 border border-purple-500/50 text-white font-bold text-5xl shadow-2xl animate-bounce pointer-events-none">
             {activeReaction}
+          </div>
+        )}
+
+        {/* Floating Self-View Thumbnail (Bottom-Left in Fullscreen, Zoom Workplace style) */}
+        {isFullscreen && !isCurrentUser && localParticipant && (
+          <div
+            role="region"
+            aria-label="Your floating camera preview"
+            onPointerDown={handleThumbPointerDown}
+            onPointerMove={handleThumbPointerMove}
+            onPointerUp={handleThumbPointerUp}
+            onPointerCancel={handleThumbPointerUp}
+            style={{
+              transform: `translate3d(${thumbPos.x}px, ${thumbPos.y}px, 0px)`
+            }}
+            className={`absolute bottom-6 left-6 z-35 w-44 h-28 sm:w-52 sm:h-32 md:w-56 md:h-36 rounded-2xl border border-white/20 bg-slate-950/90 shadow-2xl backdrop-blur-md overflow-hidden flex flex-col justify-end transition-shadow ${
+              isThumbDragging ? 'cursor-grabbing shadow-purple-500/30' : 'cursor-grab'
+            }`}
+          >
+            {localParticipant.isCameraEnabled ? (
+              <VideoTrack
+                trackRef={{ participant: localParticipant, source: Track.Source.Camera }}
+                className="absolute inset-0 w-full h-full object-cover pointer-events-none"
+              />
+            ) : (
+              <div className="absolute inset-0 bg-slate-900 flex flex-col items-center justify-center gap-1.5 pointer-events-none">
+                <div className="w-10 h-10 rounded-full bg-[#7c3aed]/20 border border-[#7c3aed]/40 flex items-center justify-center text-[#8b5cf6] font-bold text-sm">
+                  {(user?.name || user?.full_name || localParticipant?.name || 'You')?.charAt(0).toUpperCase() || 'Y'}
+                </div>
+                <span className="text-[10px] text-gray-400 font-medium">Camera off</span>
+              </div>
+            )}
+
+            {/* Self View Badge */}
+            <div className="absolute top-2 left-2 px-1.5 py-0.5 rounded bg-black/60 border border-white/10 text-[9px] font-semibold text-gray-300 pointer-events-none select-none">
+              Self View
+            </div>
+
+            {/* Name Tag */}
+            <div className="absolute bottom-2 left-2 px-2 py-0.5 rounded-lg bg-black/70 backdrop-blur-sm border border-white/10 text-[10px] font-bold text-white z-10 flex items-center gap-1 pointer-events-none">
+              <span className="truncate max-w-[120px]">
+                {user?.name || user?.full_name || localParticipant?.name || 'You'} (You)
+              </span>
+            </div>
           </div>
         )}
       </div>

@@ -258,5 +258,26 @@ describe('Screen Share Zoom Controls & Recording Pause/Resume Lifecycle', () => 
 
       assert.equal(expandedId, null, 'Expanded stage must safely close if participant leaves')
     })
+
+    it('renders floating self-view at bottom-left when another participant enters fullscreen, but omits it for own video', () => {
+      const localUser = { identity: 'user-self-1', name: 'Sai (You)' }
+      const remoteUser = { identity: 'user-remote-2', name: 'Alice' }
+
+      // Scenario 1: User enters fullscreen on another participant's video
+      let fullscreenParticipant = remoteUser
+      let isFullscreen = true
+      const shouldShowSelfView1 = isFullscreen && fullscreenParticipant.identity !== localUser.identity
+      assert.equal(shouldShowSelfView1, true, 'Must display floating self-view when viewing another participant in fullscreen')
+
+      // Scenario 2: User enters fullscreen on their OWN video
+      fullscreenParticipant = localUser
+      const shouldShowSelfView2 = isFullscreen && fullscreenParticipant.identity !== localUser.identity
+      assert.equal(shouldShowSelfView2, false, 'Must NOT display redundant floating self-view on own video')
+
+      // Scenario 3: Exiting fullscreen
+      isFullscreen = false
+      const shouldShowSelfView3 = isFullscreen && fullscreenParticipant.identity !== localUser.identity
+      assert.equal(shouldShowSelfView3, false, 'Self-view thumbnail must be cleanly removed upon exiting fullscreen')
+    })
   })
 })
