@@ -2,6 +2,7 @@ import express from 'express'
 import {
   startRecordingSession,
   getMultipartUploadPartUrl,
+  uploadPartDirect,
   completeRecordingSession,
   abortRecordingSession,
   getRecordingStatus,
@@ -15,6 +16,7 @@ const router = express.Router({ mergeParams: true })
 
 router.post('/start', startRecordingSession)
 router.post('/part-url', getMultipartUploadPartUrl)
+router.post('/upload-part', express.raw({ type: '*/*', limit: '100mb' }), uploadPartDirect)
 router.post('/complete', completeRecordingSession)
 router.post('/abort', abortRecordingSession)
 router.get('/', getRecordingStatus)

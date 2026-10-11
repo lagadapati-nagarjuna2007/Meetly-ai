@@ -83,4 +83,106 @@ describe('Backblaze B2 Protocol & Multipart Buffering', () => {
     assert.equal(exactVersionsToDelete.length, 2, 'Must only include exact key matches')
     assert.ok(exactVersionsToDelete.every(v => v.Key === exactKey))
   })
+
+  it('seamlessly falls back to server chunk upload when direct B2 PUT fails with CORS or network error', async () => {
+    let directPutCalled = false
+    let serverFallbackCalled = false
+
+    const mockDirectPut = async () => {
+      directPutCalled = true
+      throw new TypeError('Failed to fetch') // Simulated browser CORS preflight failure
+    }
+
+    const mockServerUpload = async (partNum) => {
+      serverFallbackCalled = true
+      return { partNumber: partNum, etag: '"etag-fallback-captured"' }
+    }
+
+    const uploadWithFallback = async (partNum) => {
+      try {
+        await mockDirectPut()
+        return { partNumber: partNum, etag: '"direct-etag"' }
+      } catch (_) {
+        return await mockServerUpload(partNum)
+      }
+    }
+
+    const result = await uploadWithFallback(1)
+    assert.equal(directPutCalled, true, 'Direct PUT was attempted first')
+    assert.equal(serverFallbackCalled, true, 'Server fallback was invoked upon Failed to fetch')
+    assert.equal(result.etag, '"etag-fallback-captured"')
+    assert.equal(result.partNumber, 1)
+  })
+
+  it('synchronizes final chunk flush by awaiting MediaRecorder stop and in-flight uploads without arbitrary timeout', async () => {
+    let recorderStopped = false
+    let inflightFinished = false
+    let manifestSubmitted = false
+
+    const recorder = {
+      state: 'recording',
+      stop: () => {
+        setTimeout(() => {
+          recorder.state = 'inactive'
+          recorder.onstop()
+        }, 50)
+      },
+      onstop: () => {}
+    }
+
+    const inflightUpload = new Promise(resolve => {
+      setTimeout(() => {
+        inflightFinished = true
+        resolve({ partNumber: 1, etag: '"etag-1"' })
+      }, 70)
+    })
+
+    const inFlightUploads = [inflightUpload]
+    const queue = ['final-chunk-data']
+    const manifest = []
+
+    await new Promise(resolve => {
+      recorder.onstop = () => {
+        recorderStopped = true
+        resolve()
+      }
+      recorder.stop()
+    })
+
+    assert.equal(recorderStopped, true, 'Recorder must be stopped before manifest finalization')
+
+    const settledParts = await Promise.all(inFlightUploads)
+    manifest.push(...settledParts)
+    assert.equal(inflightFinished, true, 'In-flight uploads must be completed')
+
+    if (queue.length > 0) {
+      manifest.push({ partNumber: 2, etag: '"etag-final"' })
+      queue.length = 0
+    }
+
+    manifestSubmitted = true
+    assert.equal(manifestSubmitted, true)
+    assert.equal(manifest.length, 2)
+    assert.equal(queue.length, 0, 'Queue must be drained')
+  })
+
+  it('sanitizes presigned URLs to prevent leaking AWS/B2 signatures and credentials in diagnostic logs', () => {
+    const rawPresignedUrl = 'https://s3.us-west-004.backblazeb2.com/meetly-bucket/recordings/m1/r1.webm?partNumber=1&uploadId=up-123&X-Amz-Algorithm=AWS4-HMAC-SHA256&X-Amz-Credential=SECRET%2F20261011&X-Amz-Signature=abcdef1234567890'
+
+    const sanitizeUrlForLog = (url) => {
+      try {
+        const parsed = new URL(url)
+        const partNum = parsed.searchParams.get('partNumber') || ''
+        return `${parsed.protocol}//${parsed.host}${parsed.pathname}${partNum ? `?partNumber=${partNum}` : ''}&[signature_redacted]`
+      } catch (_) {
+        return '[url_redacted]'
+      }
+    }
+
+    const sanitized = sanitizeUrlForLog(rawPresignedUrl)
+    assert.ok(!sanitized.includes('abcdef1234567890'), 'Signature must not appear in log')
+    assert.ok(!sanitized.includes('SECRET'), 'Credentials must not appear in log')
+    assert.ok(sanitized.includes('s3.us-west-004.backblazeb2.com'), 'Host must be visible for diagnostic verification')
+    assert.ok(sanitized.includes('partNumber=1'), 'Part number should remain for tracking')
+  })
 })

@@ -32,6 +32,19 @@ const getSupportedMimeType = () => {
   return ''
 }
 
+/**
+ * Sanitizes URLs for diagnostic logs to prevent leaking signature or auth parameters.
+ */
+const sanitizeUrlForLog = (url) => {
+  try {
+    const parsed = new URL(url)
+    const partNum = parsed.searchParams.get('partNumber') || ''
+    return `${parsed.protocol}//${parsed.host}${parsed.pathname}${partNum ? `?partNumber=${partNum}` : ''}&[signature_redacted]`
+  } catch (_) {
+    return '[url_redacted]'
+  }
+}
+
 export function useScreenRecorder({
   meetingId,
   room,
@@ -62,7 +75,9 @@ export function useScreenRecorder({
     partNumber: 1,
     manifest: [],
     totalUploadedBytes: 0,
-    isFinalizing: false
+    isFinalizing: false,
+    inFlightUploads: [],
+    uploadErrors: []
   })
 
   // 1. Listen for room recording status broadcast from Socket.IO
@@ -85,12 +100,13 @@ export function useScreenRecorder({
     }
   }, [socket])
 
-  // Helper to upload a single buffered multipart part to Backblaze B2 with automatic retries
+  // Helper to upload a single buffered multipart part to Backblaze B2 with automatic retries and server fallback
   const uploadPartToB2 = async (partBlob, partNum, recId, maxRetries = 2) => {
     let lastErr = null
     for (let attempt = 0; attempt <= maxRetries; attempt++) {
       try {
-        // 1. Request presigned URL from backend
+        // Stage 1: Request presigned URL from backend
+        console.log(`[Screen Recording Upload] Stage: request_part_url | Part #${partNum} | Attempt ${attempt + 1}/${maxRetries + 1}`)
         const res = await fetch(`${API_BASE}/${meetingId}/recording/part-url`, {
           method: 'POST',
           headers: getAuthHeaders(),
@@ -99,34 +115,64 @@ export function useScreenRecorder({
 
         if (!res.ok) {
           const errData = await res.json().catch(() => ({}))
-          throw new Error(errData.message || `Failed to obtain part URL for part ${partNum}`)
+          console.warn(`[Screen Recording Upload] Stage: part_url_failed | Part #${partNum} | HTTP ${res.status}`)
+          throw new Error(errData.message || `Failed to obtain part URL for part ${partNum} (HTTP ${res.status})`)
         }
 
         const { presignedUrl } = await res.json()
+        console.log(`[Screen Recording Upload] Stage: part_url_received | Part #${partNum} | Destination: ${sanitizeUrlForLog(presignedUrl)}`)
 
-        // 2. Direct PUT upload to Backblaze B2
-        const putRes = await fetch(presignedUrl, {
-          method: 'PUT',
-          body: partBlob
-        })
+        // Stage 2: Direct PUT upload to Backblaze B2
+        try {
+          console.log(`[Screen Recording Upload] Stage: direct_b2_put_start | Part #${partNum} (${partBlob.size} bytes)`)
+          const putRes = await fetch(presignedUrl, {
+            method: 'PUT',
+            body: partBlob
+          })
 
-        if (!putRes.ok) {
-          throw new Error(`Direct B2 upload failed with HTTP status ${putRes.status} for part ${partNum}`)
+          if (!putRes.ok) {
+            console.warn(`[Screen Recording Upload] Stage: direct_b2_put_failed | Part #${partNum} | HTTP ${putRes.status}`)
+            throw new Error(`Direct B2 upload returned HTTP ${putRes.status} for part ${partNum}`)
+          }
+
+          const rawEtag = putRes.headers.get('etag') || putRes.headers.get('ETag') || ''
+          const etag = rawEtag.trim()
+          console.log(`[Screen Recording Upload] Stage: direct_b2_put_success | Part #${partNum} | ETag: ${etag ? '[captured]' : '[not_exposed]'}`)
+
+          return { partNumber: partNum, etag }
+        } catch (directPutErr) {
+          // If direct PUT failed (e.g. TypeError: Failed to fetch due to CORS preflight, or network error),
+          // seamlessly fall back to server-side upload route to guarantee recording completes.
+          console.warn(`[Screen Recording Upload] Stage: direct_b2_put_fallback | Part #${partNum} | Direct upload failed (${directPutErr.name}: ${directPutErr.message}). Falling back to backend upload route...`)
+
+          const fallbackRes = await fetch(`${API_BASE}/${meetingId}/recording/upload-part?recordingId=${encodeURIComponent(recId)}&partNumber=${partNum}`, {
+            method: 'POST',
+            headers: {
+              ...getAuthHeaders(),
+              'Content-Type': 'application/octet-stream'
+            },
+            body: partBlob
+          })
+
+          if (!fallbackRes.ok) {
+            const fbErrData = await fallbackRes.json().catch(() => ({}))
+            console.error(`[Screen Recording Upload] Stage: server_fallback_failed | Part #${partNum} | HTTP ${fallbackRes.status}`)
+            throw new Error(fbErrData.message || `Server upload fallback failed with HTTP ${fallbackRes.status} for part ${partNum}`)
+          }
+
+          const fbData = await fallbackRes.json()
+          console.log(`[Screen Recording Upload] Stage: server_fallback_success | Part #${partNum} | ETag: ${fbData.etag ? '[captured]' : '[none]'}`)
+          return { partNumber: partNum, etag: fbData.etag }
         }
-
-        // 3. Extract ETag from response header (preserve exact format as returned by B2)
-        const etag = (putRes.headers.get('etag') || putRes.headers.get('ETag') || '').trim()
-
-        return { partNumber: partNum, etag }
       } catch (err) {
         lastErr = err
-        console.warn(`[Upload Part Retry] Part ${partNum} attempt ${attempt + 1}/${maxRetries + 1} failed: ${err.message}`)
+        console.warn(`[Screen Recording Upload Retry] Stage: attempt_failed | Part #${partNum} | Attempt ${attempt + 1}/${maxRetries + 1}: ${err.message}`)
         if (attempt < maxRetries) {
           await new Promise(r => setTimeout(r, 1000 * (attempt + 1)))
         }
       }
     }
-    console.error(`[Upload Part Error] Part ${partNum} permanently failed after ${maxRetries + 1} attempts:`, lastErr)
+    console.error(`[Screen Recording Upload Error] Stage: part_permanently_failed | Part #${partNum}: ${lastErr?.message}`)
     throw lastErr
   }
 
@@ -147,26 +193,56 @@ export function useScreenRecorder({
 
     const recId = recordingIdRef.current
     const recorder = screenMediaRecorderRef.current
+    let completionDispatched = false
 
     try {
-      // Request final data available
+      // 1. Await MediaRecorder stop event to guarantee final ondataavailable has fired
       if (recorder && recorder.state !== 'inactive') {
-        recorder.stop()
+        console.log('[Screen Recording] Awaiting MediaRecorder stop event for final data chunks...')
+        await new Promise((resolve) => {
+          let timeoutId = null
+          const handleStop = () => {
+            if (timeoutId) clearTimeout(timeoutId)
+            recorder.removeEventListener('stop', handleStop)
+            resolve()
+          }
+          recorder.addEventListener('stop', handleStop)
+          timeoutId = setTimeout(() => {
+            recorder.removeEventListener('stop', handleStop)
+            resolve()
+          }, 5000)
+
+          try {
+            recorder.stop()
+          } catch (stopErr) {
+            console.warn('[Screen Recording] Error stopping recorder:', stopErr.message)
+            handleStop()
+          }
+        })
+        console.log('[Screen Recording] MediaRecorder successfully stopped.')
       }
 
-      // Small pause to allow final ondataavailable to push into queue
-      await new Promise(r => setTimeout(r, 400))
+      // 2. Await all in-flight 5 MiB part uploads to settle
+      if (bufferRef.current.inFlightUploads.length > 0) {
+        console.log(`[Screen Recording] Awaiting ${bufferRef.current.inFlightUploads.length} in-flight part upload(s)...`)
+        await Promise.all(bufferRef.current.inFlightUploads)
+      }
 
-      // Flush final part if data remains in queue
+      if (bufferRef.current.uploadErrors.length > 0) {
+        throw new Error(`Upload failed for buffered parts: ${bufferRef.current.uploadErrors[0].message}`)
+      }
+
+      // 3. Flush the final part if data remains in queue
       if (bufferRef.current.queue.length > 0) {
         const finalBlob = new Blob(bufferRef.current.queue, { type: recorder?.mimeType || 'video/webm' })
         const finalPartNum = bufferRef.current.partNumber
-
-        console.log(`[Screen Recording] Uploading final part #${finalPartNum} (${finalBlob.size} bytes)...`)
-        const finalPart = await uploadPartToB2(finalBlob, finalPartNum, recId)
-        bufferRef.current.manifest.push(finalPart)
+        bufferRef.current.partNumber += 1
         bufferRef.current.queue = []
         bufferRef.current.queuedBytes = 0
+
+        console.log(`[Screen Recording Upload] Stage: final_part | Part #${finalPartNum} (${finalBlob.size} bytes)...`)
+        const finalPart = await uploadPartToB2(finalBlob, finalPartNum, recId)
+        bufferRef.current.manifest.push(finalPart)
       }
 
       const manifest = bufferRef.current.manifest
@@ -174,7 +250,12 @@ export function useScreenRecorder({
         throw new Error('No video chunks were successfully recorded.')
       }
 
-      // Complete multipart upload on backend
+      // Ensure manifest is sorted ascending by partNumber
+      manifest.sort((a, b) => a.partNumber - b.partNumber)
+
+      // 4. Complete multipart upload on backend
+      completionDispatched = true
+      console.log(`[Screen Recording Upload] Stage: complete_request | Submitting manifest with ${manifest.length} part(s)...`)
       const completeRes = await fetch(`${API_BASE}/${meetingId}/recording/complete`, {
         method: 'POST',
         headers: getAuthHeaders(),
@@ -188,20 +269,21 @@ export function useScreenRecorder({
       const completeData = await completeRes.json().catch(() => ({}))
 
       if (!completeRes.ok) {
-        throw new Error(completeData.message || 'Failed to finalize recording on server.')
+        throw new Error(completeData.message || `Server finalization failed with HTTP ${completeRes.status}`)
       }
 
-      console.log('[Screen Recording] Finalized successfully:', completeData)
+      console.log('[Screen Recording Upload] Stage: complete_success | Recording ready:', completeData)
       setRecordingState('ready')
       showToast('Screen recording saved and ready for playback!', 'success')
     } catch (err) {
-      console.error('[Screen Recording Error] Finalization failed:', err)
+      console.error('[Screen Recording Error] Finalization failed:', err.message)
       setRecordingState('failed')
       setErrorMessage(err.message)
       showToast(`Recording failed: ${err.message}`, 'error')
 
-      // Notify backend about abort if possible
-      if (recId) {
+      // Only notify backend about abort if completion was NOT dispatched, to avoid conflicting with active completion
+      if (recId && !completionDispatched) {
+        console.log('[Screen Recording Upload] Stage: abort_request | Notifying server of abort...')
         fetch(`${API_BASE}/${meetingId}/recording/abort`, {
           method: 'POST',
           headers: getAuthHeaders(),
@@ -243,7 +325,9 @@ export function useScreenRecorder({
       partNumber: 1,
       manifest: [],
       totalUploadedBytes: 0,
-      isFinalizing: false
+      isFinalizing: false,
+      inFlightUploads: [],
+      uploadErrors: []
     }
 
     let displayStream = null
@@ -382,7 +466,7 @@ export function useScreenRecorder({
       screenMediaRecorderRef.current = recorder
 
       // Step 7: Handle chunk accumulation and multipart upload threshold (>= 5 MiB)
-      recorder.ondataavailable = async (e) => {
+      recorder.ondataavailable = (e) => {
         if (!e.data || e.data.size === 0) return
 
         bufferRef.current.queue.push(e.data)
@@ -396,20 +480,25 @@ export function useScreenRecorder({
           bufferRef.current.queue = []
           bufferRef.current.queuedBytes = 0
 
-          try {
-            console.log(`[Screen Recording] Uploading part #${currentPartNum} (${partBlob.size} bytes)...`)
-            const partInfo = await uploadPartToB2(partBlob, currentPartNum, recId)
-            bufferRef.current.manifest.push(partInfo)
-            bufferRef.current.totalUploadedBytes += partBlob.size
+          const uploadTask = (async () => {
+            try {
+              console.log(`[Screen Recording Upload] Stage: start_buffered_part | Part #${currentPartNum} (${partBlob.size} bytes)`)
+              const partInfo = await uploadPartToB2(partBlob, currentPartNum, recId)
+              bufferRef.current.manifest.push(partInfo)
+              bufferRef.current.totalUploadedBytes += partBlob.size
 
-            // Soft threshold: Stop recording before reaching 2,000,000,000 bytes
-            if (bufferRef.current.totalUploadedBytes >= 1950000000) {
-              console.warn('[Screen Recording] Approaching 1.95 GB ceiling. Triggering safe stop.')
-              stopRecording('soft_limit_reached')
+              // Soft threshold: Stop recording before reaching 2,000,000,000 bytes
+              if (bufferRef.current.totalUploadedBytes >= 1950000000) {
+                console.warn('[Screen Recording] Approaching 1.95 GB ceiling. Triggering safe stop.')
+                stopRecording('soft_limit_reached')
+              }
+            } catch (upErr) {
+              console.error(`[Screen Recording Error] Part #${currentPartNum} failed:`, upErr.message)
+              bufferRef.current.uploadErrors.push(upErr)
             }
-          } catch (upErr) {
-            console.error(`[Screen Recording Error] Uploading part #${currentPartNum} failed:`, upErr)
-          }
+          })()
+
+          bufferRef.current.inFlightUploads.push(uploadTask)
         }
       }
 

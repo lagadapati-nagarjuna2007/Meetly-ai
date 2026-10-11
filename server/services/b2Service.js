@@ -41,7 +41,7 @@ const getB2Config = () => {
     bucketName,
     endpoint,
     region,
-    forcePathStyle: process.env.B2_FORCE_PATH_STYLE === 'true'
+    forcePathStyle: process.env.B2_FORCE_PATH_STYLE === 'true' || (Boolean(endpoint) && endpoint.includes('.backblazeb2.com') && process.env.B2_FORCE_PATH_STYLE !== 'false')
   }
 }
 
@@ -112,6 +112,28 @@ export const getPresignedPartUrl = async (key, uploadId, partNumber, expiresInSe
     partNumber: Number(partNumber),
     presignedUrl,
     expiresInSeconds
+  }
+}
+
+/**
+ * Uploads a single part directly from the server to Backblaze B2 (CORS-free fallback).
+ */
+export const uploadPart = async (key, uploadId, partNumber, body) => {
+  const client = getS3Client()
+  const bucket = getBucketName()
+
+  const command = new UploadPartCommand({
+    Bucket: bucket,
+    Key: key,
+    UploadId: uploadId,
+    PartNumber: Number(partNumber),
+    Body: body
+  })
+
+  const response = await client.send(command)
+  return {
+    partNumber: Number(partNumber),
+    etag: response.ETag
   }
 }
 

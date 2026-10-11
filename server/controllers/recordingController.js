@@ -206,6 +206,79 @@ export const getMultipartUploadPartUrl = async (req, res) => {
 }
 
 /**
+ * 2b. POST /api/meetings/:meetingId/recording/upload-part
+ * Server-side multipart chunk upload (CORS-free fallback).
+ */
+export const uploadPartDirect = async (req, res) => {
+  try {
+    const { meetingId } = req.params
+    const recordingId = req.query.recordingId || req.headers['x-recording-id']
+    const partNum = Number(req.query.partNumber || req.headers['x-part-number'])
+
+    const auth = await authorizeRecordingHost(meetingId, req.user?.id)
+    if (!auth.passed) {
+      return res.status(auth.status).json({ message: auth.message })
+    }
+
+    if (!recordingId) {
+      return res.status(400).json({ message: 'Missing recordingId parameter.' })
+    }
+
+    if (!partNum || partNum < 1 || partNum > 10000) {
+      return res.status(400).json({ message: 'Part number must be an integer between 1 and 10000.' })
+    }
+
+    const chunkBuffer = req.body
+    if (!chunkBuffer || !Buffer.isBuffer(chunkBuffer) || chunkBuffer.length === 0) {
+      return res.status(400).json({ message: 'Upload chunk body is missing or empty.' })
+    }
+
+    // Fetch recording session
+    const { data: recording, error: recErr } = await supabase
+      .from('recordings')
+      .select('recording_id, b2_key, b2_upload_id, status, recorded_by')
+      .eq('recording_id', recordingId)
+      .eq('meeting_id', auth.meeting.meeting_id)
+      .maybeSingle()
+
+    if (recErr || !recording) {
+      return res.status(404).json({ message: 'Recording session not found.' })
+    }
+
+    if (!['starting', 'recording'].includes(recording.status)) {
+      return res.status(409).json({ message: `Cannot upload parts for recording in '${recording.status}' state.` })
+    }
+
+    if (!recording.b2_upload_id) {
+      return res.status(500).json({ message: 'Storage upload ID missing for this session.' })
+    }
+
+    if (recording.status === 'starting') {
+      await supabase
+        .from('recordings')
+        .update({ status: 'recording' })
+        .eq('recording_id', recordingId)
+    }
+
+    console.log(`[Recording Upload-Part Fallback] Uploading part ${partNum} (${chunkBuffer.length} bytes) for recording ${recordingId} via server...`)
+    const result = await b2Service.uploadPart(
+      recording.b2_key,
+      recording.b2_upload_id,
+      partNum,
+      chunkBuffer
+    )
+
+    return res.status(200).json({
+      partNumber: partNum,
+      etag: result.etag
+    })
+  } catch (err) {
+    console.error('[Recording Upload-Part Error] Server part upload failed:', err.message)
+    return res.status(500).json({ message: `Failed to upload part chunk: ${err.message}` })
+  }
+}
+
+/**
  * 3. POST /api/meetings/:meetingId/recording/complete
  * Validates uploaded parts against B2, completes multipart upload, and verifies actual size.
  */
