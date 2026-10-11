@@ -36,6 +36,9 @@ import {
   toggleMuteAll
 } from '../controllers/securityController.js'
 import { authenticateToken } from '../middleware/auth.js'
+import recordingRoutes from './recording.js'
+import { getAttendedMeetingsWithRecordings } from '../controllers/recordingController.js'
+import { runRecordingRetentionCycle } from '../services/recordingRetention.js'
 
 const upload = multer({ storage: multer.memoryStorage() })
 
@@ -76,11 +79,25 @@ router.get('/participants/:meetingId', getMeetingParticipants)
 // Parameter-based endpoints (backward compatibility and dashboard controls)
 router.get('/', getRecentMeetings)
 router.get('/history', getMeetingHistory)
+router.get('/attended', getAttendedMeetingsWithRecordings)
+
+// Internal maintenance trigger for retention cleanup
+router.post('/internal/recording-cleanup', async (req, res) => {
+  try {
+    const result = await runRecordingRetentionCycle()
+    return res.status(200).json({ success: true, ...result })
+  } catch (err) {
+    return res.status(500).json({ success: false, error: err.message })
+  }
+})
 
 // Host Management routes — must be before /:id catch-all
 router.get('/:meetingId/host-status', getHostStatus)
 router.post('/:meetingId/assign-host', assignHost)
 router.delete('/:meetingId/assigned-host', removeAssignedHost)
+
+// Recording sub-routes (canonical path: /api/meetings/:meetingId/recording/...)
+router.use('/:meetingId/recording', recordingRoutes)
 
 router.get('/:id', getMeetingDetails)
 router.put('/:id', renameMeeting)

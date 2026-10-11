@@ -6,6 +6,7 @@ import { clearMeetingCounters } from '../services/aiChat.service.js'
 import { scheduleCleanup, cancelCleanup } from '../services/meetingCleanup.js'
 import { authorizeHost } from '../utils/authHelper.js'
 import { isMuteAllEnabled } from './securityController.js'
+import * as b2Service from '../services/b2Service.js'
 
 // UUID validation helper
 const isUuid = (val) => {
@@ -956,7 +957,7 @@ export const renameMeeting = async (req, res) => {
   }
 }
 
-// 10. DELETE MEETING (Hard Delete - Original Host only)
+// 10. DELETE MEETING (Coordinated Deletion - Original Host only)
 export const deleteMeeting = async (req, res) => {
   try {
     const { id } = req.params
@@ -966,6 +967,61 @@ export const deleteMeeting = async (req, res) => {
       return res.status(auth.status).json({ message: auth.message })
     }
     const meeting = auth.meeting
+
+    // Check if unpurged recordings exist for this meeting
+    const { data: recs } = await supabase
+      .from('recordings')
+      .select('recording_id, b2_key, b2_upload_id, status')
+      .eq('meeting_id', meeting.meeting_id)
+
+    if (recs && recs.length > 0) {
+      const activeOrReady = recs.filter(r => r.status !== 'purged')
+      if (activeOrReady.length > 0) {
+        console.log(`[Delete Meeting] Meeting ${meeting.meeting_id} has ${activeOrReady.length} unpurged recording(s). Transitioning to pending_deletion.`)
+
+        // Mark meeting as deleted to hide from user UI
+        await supabase
+          .from('meetings')
+          .update({ is_deleted: true, deletion_requested_at: new Date().toISOString() })
+          .eq('meeting_id', meeting.meeting_id)
+
+        // Queue all active recordings for permanent storage cleanup
+        for (const r of activeOrReady) {
+          await supabase
+            .from('recordings')
+            .update({
+              status: 'pending_deletion',
+              cleanup_status: 'pending_cleanup',
+              b2_operation_state: 'in_flight',
+              last_b2_operation: 'delete_versions'
+            })
+            .eq('recording_id', r.recording_id)
+
+          // Asynchronously trigger B2 exact-key version purge
+          b2Service.deleteExactKeyVersions(r.b2_key, r.b2_upload_id)
+            .then(async () => {
+              await supabase
+                .from('recordings')
+                .update({ status: 'purged', cleanup_status: 'cleaned', b2_operation_state: 'settled' })
+                .eq('recording_id', r.recording_id)
+              console.log(`[Delete Meeting] Purged B2 recording ${r.recording_id}`)
+            })
+            .catch(async (purgeErr) => {
+              console.error(`[Delete Meeting Error] B2 purge error for ${r.recording_id}:`, purgeErr)
+              await supabase
+                .from('recordings')
+                .update({ cleanup_status: 'unresolved_error', b2_operation_state: 'unresolved' })
+                .eq('recording_id', r.recording_id)
+            })
+        }
+
+        clearMeetingCounters(meeting.meeting_id)
+        return res.status(200).json({
+          message: 'Meeting and associated recordings scheduled for permanent deletion.',
+          status: 'deletion_pending'
+        })
+      }
+    }
 
     // Clean up security records
     if (meeting.meeting_code) {
@@ -981,6 +1037,9 @@ export const deleteMeeting = async (req, res) => {
       .eq('meeting_id', meeting.meeting_id)
 
     if (deletePartsErr) throw deletePartsErr
+
+    // Delete child purged recordings if any
+    await supabase.from('recordings').delete().eq('meeting_id', meeting.meeting_id)
 
     // Delete the meeting from the database
     const { error: deleteMtgErr } = await supabase
@@ -2147,19 +2206,39 @@ export const startRetentionCleanup = () => {
       }
 
       if (expiredMeetings && expiredMeetings.length > 0) {
-        const expiredIds = expiredMeetings.map(m => m.meeting_id)
-        console.log(`[Cleanup Job] Found ${expiredIds.length} expired meeting(s) older than 2 hours. Permanently deleting:`, expiredMeetings.map(m => m.meeting_code))
+        const candidateIds = expiredMeetings.map(m => m.meeting_id)
 
-        const { error: deleteErr } = await supabase
-          .from('meetings')
-          .delete()
-          .in('meeting_id', expiredIds)
+        // Exclude meetings that have an active, ready, or pending-cleanup recording
+        const { data: recCheck } = await supabase
+          .from('recordings')
+          .select('meeting_id')
+          .in('meeting_id', candidateIds)
+          .neq('status', 'purged')
 
-        if (deleteErr) {
-          console.error('[Cleanup Job Error] Failed to hard delete expired meetings:', deleteErr)
+        const protectedIds = new Set((recCheck || []).map(r => r.meeting_id))
+        const expiredIds = candidateIds.filter(id => !protectedIds.has(id))
+
+        if (expiredIds.length > 0) {
+          console.log(`[Cleanup Job] Found ${expiredIds.length} expired meeting(s) older than 2 hours without retained recordings. Permanently deleting:`, expiredIds)
+
+          // Delete any purged recording rows and child records first to satisfy FK constraints
+          await supabase.from('recordings').delete().in('meeting_id', expiredIds)
+          await supabase.from('participants').delete().in('meeting_id', expiredIds)
+          await supabase.from('meeting_attendance').delete().in('meeting_id', expiredIds)
+
+          const { error: deleteErr } = await supabase
+            .from('meetings')
+            .delete()
+            .in('meeting_id', expiredIds)
+
+          if (deleteErr) {
+            console.error('[Cleanup Job Error] Failed to hard delete expired meetings:', deleteErr)
+          } else {
+            console.log('[Cleanup Job] Hard deleted expired meetings and their cascading records successfully.')
+            expiredIds.forEach(id => clearMeetingCounters(id))
+          }
         } else {
-          console.log('[Cleanup Job] Hard deleted expired meetings and their cascading records successfully.')
-          expiredIds.forEach(id => clearMeetingCounters(id))
+          console.log('[Cleanup Job] All expired meetings are protected by active or retained recordings.')
         }
       }
     } catch (err) {

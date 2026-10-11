@@ -8,8 +8,10 @@ import { Server } from 'socket.io'
 import authRoutes from './routes/auth.js'
 import meetingRoutes from './routes/meetings.js'
 import aiChatRoutes from './routes/aiChat.routes.js'
+import recordingRoutes from './routes/recording.js'
 import { supabase } from './config/supabase.js'
 import { startRetentionCleanup } from './controllers/meetingController.js'
+import { startRecordingRetentionCleanup } from './services/recordingRetention.js'
 import { clearMeetingCounters } from './services/aiChat.service.js'
 import { scheduleCleanup, cancelCleanup } from './services/meetingCleanup.js'
 
@@ -52,6 +54,8 @@ app.use('/api/meeting', meetingRoutes)
 app.use('/api/meetings', meetingRoutes)
 app.use('/api/meetings', aiChatRoutes)
 app.use('/api/meeting', aiChatRoutes)
+app.use('/api/recordings/:meetingId', recordingRoutes)
+app.use('/api/recordings', recordingRoutes)
 
 // Server Health Check endpoint
 app.get('/health', (req, res) => {
@@ -65,6 +69,7 @@ app.get('/health', (req, res) => {
 const httpServer = app.listen(PORT, () => {
   console.log(`[Meetly AI Backend] server successfully listening on port ${PORT}`)
   startRetentionCleanup()
+  startRecordingRetentionCleanup()
 })
 
 // Configure Socket.IO server

@@ -1037,6 +1037,16 @@ export default function MeetingCard({ meeting, index = 0, onDeleted }) {
                   onClick={() => setDropdownOpen(false)}
                 />
                 <div className="absolute right-0 mt-1 w-40 rounded-xl bg-slate-900 border border-white/10 shadow-lg py-1 z-40 text-left">
+                  <button
+                    onClick={() => {
+                      setDropdownOpen(false)
+                      navigate(`/report/${meeting.id}?tab=recording`)
+                    }}
+                    className="w-full text-left px-4 py-2.5 text-xs font-semibold text-blue-400 hover:text-blue-300 hover:bg-white/5 flex items-center gap-2 cursor-pointer transition-all duration-200 border-b border-white/5"
+                  >
+                    <Video size={13} className="opacity-80" />
+                    <span>View Recording</span>
+                  </button>
                   {meeting.enableAiAnalyzer && (
                     <button
                       onClick={handleGenerateSummary}

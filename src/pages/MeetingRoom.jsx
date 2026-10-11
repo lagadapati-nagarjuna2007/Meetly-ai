@@ -43,6 +43,7 @@ import {
 } from 'lucide-react'
 
 import AIChatPanel from '../components/AIChatPanel'
+import { useScreenRecorder } from '../hooks/useScreenRecorder'
 
 const EMOJI_CATEGORIES = [
   { id: 'all', label: 'All', icon: '⭐', emojis: [] },
@@ -1059,6 +1060,25 @@ function MeetingRoomContent({
   // and returns one of: ConnectionState.Connected | Reconnecting | Disconnected | Connecting
   const connectionState = useConnectionState()
   const [isReconnecting, setIsReconnecting] = useState(false)
+
+  // ── Screen Recording Engine (Independent from AI Analyzer) ─────────────────
+  const {
+    recordingState,
+    isRecording,
+    recordingDuration,
+    isRoomRecording,
+    includeTabAudio,
+    setIncludeTabAudio,
+    startRecording,
+    stopRecording
+  } = useScreenRecorder({
+    meetingId: meetingData?.meeting_id,
+    room,
+    localParticipant,
+    participants,
+    socket,
+    showToast
+  })
 
   // ── Host Management UI state ─────────────────────────────────────────────────
   const [showHostPicker, setShowHostPicker] = useState(false)
@@ -3085,6 +3105,17 @@ function MeetingRoomContent({
 
         {/* Live Status Indicators */}
         <div className="flex items-center gap-4 text-xs font-bold">
+          {(isRecording || isRoomRecording) && (
+            <div className="flex items-center gap-1.5 px-2.5 py-0.5 rounded-full bg-red-500/15 border border-red-500/30 text-red-400 text-xs font-semibold animate-pulse shadow-sm shadow-red-500/20">
+              <span className="w-2 h-2 rounded-full bg-red-500" />
+              <span>REC</span>
+              {isRecording && (
+                <span className="text-gray-300 font-mono text-[11px] ml-1">
+                  {Math.floor(recordingDuration / 60)}:{(recordingDuration % 60).toString().padStart(2, '0')}
+                </span>
+              )}
+            </div>
+          )}
           <span className="flex items-center gap-1.5 text-emerald-400">
             <Radio size={14} className="animate-pulse" />
             <span>LIVE</span>
@@ -4067,6 +4098,32 @@ function MeetingRoomContent({
           >
             <Monitor size={18} />
           </button>
+
+          {/* Screen Recording (Host / Active Host only) */}
+          {canManageMeeting && (
+            <button
+              onClick={isRecording ? () => stopRecording('user_stop') : startRecording}
+              disabled={recordingState === 'starting' || recordingState === 'finalizing'}
+              title={
+                isRecording
+                  ? 'Stop Screen Recording'
+                  : recordingState === 'starting'
+                  ? 'Starting recording...'
+                  : recordingState === 'finalizing'
+                  ? 'Finalizing recording...'
+                  : 'Start Screen Recording (Meeting Audio Included)'
+              }
+              className={`w-11 h-11 rounded-xl flex items-center justify-center border transition-all duration-200 cursor-pointer ${
+                isRecording
+                  ? 'bg-red-500/20 border-red-500/40 text-red-400 shadow-lg shadow-red-500/20 animate-pulse'
+                  : recordingState === 'starting' || recordingState === 'finalizing'
+                  ? 'bg-[#0f1122]/60 border-yellow-500/30 text-yellow-400 opacity-70 animate-pulse'
+                  : 'bg-[#0f1122]/60 hover:bg-[#141629] border-white/10 text-white hover:text-red-400'
+              }`}
+            >
+              <Radio size={18} className={isRecording ? 'text-red-400' : ''} />
+            </button>
+          )}
         </div>
 
         {/* End / Leave Meeting Button (Opens Confirmation Modal) */}

@@ -14,7 +14,8 @@ import {
   CheckCircle,
   Clock,
   AlertTriangle,
-  PlayCircle
+  PlayCircle,
+  Download
 } from 'lucide-react'
 
 export default function Report() {
@@ -41,6 +42,14 @@ export default function Report() {
   const [isLoadingSummary, setIsLoadingSummary] = useState(false)
   const [summaryError, setSummaryError] = useState(null)
 
+  // Screen Recording State
+  const [recordingInfo, setRecordingInfo] = useState(null)
+  const [isLoadingRecording, setIsLoadingRecording] = useState(false)
+  const [recordingStreamUrl, setRecordingStreamUrl] = useState(null)
+  const [isPlayingRecording, setIsPlayingRecording] = useState(false)
+  const [isDownloadingRecording, setIsDownloadingRecording] = useState(false)
+  const [recordingError, setRecordingError] = useState(null)
+
   useEffect(() => {
     if (activeTab === 'summary' && meeting?.dbId && !summaryData && !isLoadingSummary) {
       setIsLoadingSummary(true)
@@ -62,6 +71,82 @@ export default function Report() {
         })
     }
   }, [activeTab, meeting?.dbId, fetchMeetingSummary])
+
+  // Fetch real recording metadata when recording tab is active
+  useEffect(() => {
+    const targetMeetingId = meeting?.dbId || id
+    if (activeTab === 'recording' && targetMeetingId && !recordingInfo && !isLoadingRecording) {
+      setIsLoadingRecording(true)
+      const token = sessionStorage.getItem('meetly_auth_token')
+      fetch(`${import.meta.env.VITE_API_URL || 'http://localhost:5000'}/api/meetings/${targetMeetingId}/recording`, {
+        headers: token ? { Authorization: `Bearer ${token}` } : {}
+      })
+        .then(async res => {
+          if (!res.ok) {
+            if (res.status === 404) return null
+            throw new Error('Recording not found or unavailable.')
+          }
+          return res.json()
+        })
+        .then(data => {
+          setRecordingInfo(data)
+          setRecordingError(null)
+        })
+        .catch(err => {
+          setRecordingError(err.message)
+        })
+        .finally(() => {
+          setIsLoadingRecording(false)
+        })
+    }
+  }, [activeTab, meeting?.dbId, id, recordingInfo, isLoadingRecording])
+
+  const handlePlayRecording = async () => {
+    const targetMeetingId = meeting?.dbId || id
+    const token = sessionStorage.getItem('meetly_auth_token')
+    try {
+      showToast('Loading secure playback stream...', 'info')
+      const res = await fetch(`${import.meta.env.VITE_API_URL || 'http://localhost:5000'}/api/meetings/${targetMeetingId}/recording/stream`, {
+        headers: token ? { Authorization: `Bearer ${token}` } : {}
+      })
+      if (!res.ok) {
+        throw new Error('Could not load recording stream.')
+      }
+      const data = await res.json()
+      setRecordingStreamUrl(data.streamUrl)
+      setIsPlayingRecording(true)
+      showToast('Playback stream ready.', 'success')
+    } catch (e) {
+      showToast(e.message || 'Failed to start playback.', 'error')
+    }
+  }
+
+  const handleDownloadRecording = async () => {
+    const targetMeetingId = meeting?.dbId || id
+    const token = sessionStorage.getItem('meetly_auth_token')
+    try {
+      setIsDownloadingRecording(true)
+      showToast('Generating secure download URL...', 'info')
+      const res = await fetch(`${import.meta.env.VITE_API_URL || 'http://localhost:5000'}/api/meetings/${targetMeetingId}/recording/download`, {
+        headers: token ? { Authorization: `Bearer ${token}` } : {}
+      })
+      if (!res.ok) {
+        throw new Error('Could not generate download URL.')
+      }
+      const data = await res.json()
+      const a = document.createElement('a')
+      a.href = data.downloadUrl
+      a.download = data.filename || 'recording.webm'
+      document.body.appendChild(a)
+      a.click()
+      document.body.removeChild(a)
+      showToast('Download started.', 'success')
+    } catch (e) {
+      showToast(e.message || 'Download failed.', 'error')
+    } finally {
+      setIsDownloadingRecording(false)
+    }
+  }
 
   const handleGenerateSummaryInReport = async () => {
     if (!meeting?.dbId) return
@@ -623,42 +708,78 @@ export default function Report() {
           </div>
         )}
 
-        {/* PANEL: RECORDING */}
+        {/* PANEL: REAL RECORDING */}
         {activeTab === 'recording' && (
           <div className="flex flex-col gap-4 max-w-3xl">
-            <div className="aspect-video bg-slate-950 border border-white/5 rounded-2xl relative overflow-hidden flex flex-col items-center justify-center shadow-2xl group">
-              {/* Fake Video stream preview */}
-              <div className="absolute inset-0 bg-[#090b14]/50 backdrop-blur-xs flex flex-col items-center justify-center gap-3 select-none">
-                <button
-                  onClick={() => showToast('Playback starting... (Mock Stream)', 'success')}
-                  className="w-16 h-16 rounded-full bg-brand-purple hover:bg-brand-purple-hover text-white flex items-center justify-center transition-all duration-200 shadow-xl shadow-brand-purple/20 cursor-pointer transform hover:scale-105"
-                >
-                  <Play size={24} className="fill-white ml-1" />
-                </button>
-                <span className="text-xs font-bold text-gray-300">Play Meeting Stream</span>
+            {isLoadingRecording ? (
+              <div className="aspect-video bg-slate-950 border border-white/5 rounded-2xl flex flex-col items-center justify-center gap-3">
+                <div className="w-8 h-8 rounded-full border-2 border-brand-purple border-t-transparent animate-spin" />
+                <span className="text-xs text-gray-400 font-medium">Checking recording status...</span>
               </div>
-            </div>
+            ) : recordingInfo && recordingInfo.status === 'ready' ? (
+              <>
+                <div className="aspect-video bg-black border border-white/5 rounded-2xl relative overflow-hidden flex flex-col items-center justify-center shadow-2xl group">
+                  {isPlayingRecording && recordingStreamUrl ? (
+                    <video
+                      src={recordingStreamUrl}
+                      controls
+                      autoPlay
+                      className="w-full h-full object-contain"
+                    />
+                  ) : (
+                    <div className="absolute inset-0 bg-[#090b14]/70 backdrop-blur-xs flex flex-col items-center justify-center gap-3 select-none">
+                      <button
+                        onClick={handlePlayRecording}
+                        className="w-16 h-16 rounded-full bg-brand-purple hover:bg-brand-purple-hover text-white flex items-center justify-center transition-all duration-200 shadow-xl shadow-brand-purple/20 cursor-pointer transform hover:scale-105"
+                      >
+                        <Play size={24} className="fill-white ml-1" />
+                      </button>
+                      <span className="text-xs font-bold text-gray-200">Play Meeting Recording</span>
+                      <span className="text-[11px] text-gray-400">
+                        {Math.floor(recordingInfo.durationSeconds / 60)} min {recordingInfo.durationSeconds % 60} sec • {(recordingInfo.fileSizeBytes / (1024 * 1024)).toFixed(1)} MB
+                      </span>
+                    </div>
+                  )}
+                </div>
 
-            {/* Video player controls dashboard */}
-            <div className="flex items-center justify-between p-3.5 bg-white/2 border border-white/3 rounded-xl text-xs font-semibold">
-              <div className="flex items-center gap-3 text-gray-400">
-                <PlayCircle size={18} className="text-brand-purple" />
-                <span>Recording-05-24-2024.mp4</span>
-              </div>
+                {/* Video metadata and download controls */}
+                <div className="flex items-center justify-between p-3.5 bg-white/2 border border-white/5 rounded-xl text-xs font-semibold">
+                  <div className="flex items-center gap-3 text-gray-400">
+                    <PlayCircle size={18} className="text-brand-purple" />
+                    <span>Meetly-{recordingInfo.meetingCode}-Recording.{recordingInfo.mimeType?.includes('mp4') ? 'mp4' : 'webm'}</span>
+                  </div>
 
-              {/* Speed selector */}
-              <div className="flex items-center gap-1">
-                {['1.0x', '1.5x', '2.0x'].map((spd) => (
-                  <button
-                    key={spd}
-                    onClick={() => showToast(`Speed set to ${spd}`, 'info')}
-                    className="px-2.5 py-1 bg-white/3 hover:bg-white/5 hover:text-white rounded text-[10px] text-gray-400 transition-colors cursor-pointer"
-                  >
-                    {spd}
-                  </button>
-                ))}
+                  <div className="flex items-center gap-2">
+                    {recordingInfo.canDownload && (
+                      <button
+                        onClick={handleDownloadRecording}
+                        disabled={isDownloadingRecording}
+                        className="px-3.5 py-1.5 bg-brand-purple/20 hover:bg-brand-purple/30 text-[#c084fc] hover:text-[#d8b4fe] border border-brand-purple/30 rounded-lg text-xs font-semibold flex items-center gap-1.5 transition-colors cursor-pointer disabled:opacity-50"
+                      >
+                        <Download size={13} />
+                        <span>{isDownloadingRecording ? 'Downloading...' : 'Download'}</span>
+                      </button>
+                    )}
+                  </div>
+                </div>
+              </>
+            ) : recordingInfo && ['starting', 'recording', 'finalizing'].includes(recordingInfo.status) ? (
+              <div className="aspect-video bg-slate-950 border border-white/5 rounded-2xl flex flex-col items-center justify-center gap-3 p-6 text-center">
+                <Clock size={28} className="text-yellow-400 animate-pulse" />
+                <span className="text-xs font-bold text-gray-200">Recording In Progress or Finalizing</span>
+                <p className="text-xs text-gray-400 max-w-sm">
+                  This recording session is currently being processed and assembled on secure storage. Please check back in a few moments.
+                </p>
               </div>
-            </div>
+            ) : (
+              <div className="aspect-video bg-slate-950 border border-white/5 rounded-2xl flex flex-col items-center justify-center gap-3 p-6 text-center">
+                <AlertTriangle size={28} className="text-gray-500" />
+                <span className="text-xs font-bold text-gray-300">No Recording Available</span>
+                <p className="text-xs text-gray-500 max-w-sm">
+                  {recordingError || 'A screen recording was not captured for this meeting or has passed the 30-day retention window.'}
+                </p>
+              </div>
+            )}
           </div>
         )}
       </div>
