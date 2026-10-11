@@ -45,6 +45,8 @@ import {
 import AIChatPanel from '../components/AIChatPanel'
 import ScreenShareView from '../components/ScreenShareView'
 import RecordingControlPopover from '../components/RecordingControlPopover'
+import ParticipantVideoTile from '../components/ParticipantVideoTile'
+import ExpandedParticipantStage from '../components/ExpandedParticipantStage'
 import { useScreenRecorder } from '../hooks/useScreenRecorder'
 
 const EMOJI_CATEGORIES = [
@@ -1348,19 +1350,21 @@ function MeetingRoomContent({
 
   const [activePopup, setActivePopup] = useState(null) // 'react' | 'more' | null
   const [showEndConfirmModal, setShowEndConfirmModal] = useState(false)
+  const [expandedParticipantId, setExpandedParticipantId] = useState(null)
 
   const [emojiSearchQuery, setEmojiSearchQuery] = useState('')
   const [emojiCategory, setEmojiCategory] = useState('all')
 
   const reactionCooldownRef = useRef(0)
 
-  // Keyboard shortcut listener (Escape closes popups & modals)
+  // Keyboard shortcut listener (Escape closes popups, modals & expanded view)
   useEffect(() => {
     const handleKeyDown = (e) => {
       if (e.key === 'Escape') {
         setActivePopup(null)
         setRecordingPopoverAnchor(null)
         setShowEndConfirmModal(false)
+        setExpandedParticipantId(null)
       }
     }
     window.addEventListener('keydown', handleKeyDown)
@@ -3017,6 +3021,21 @@ function MeetingRoomContent({
   })
   const allParticipants = Array.from(participantMap.values())
 
+  // Auto-close expanded view if that participant disconnects
+  useEffect(() => {
+    if (expandedParticipantId) {
+      const exists = allParticipants.some((p) => (p.identity || p.sid) === expandedParticipantId)
+      if (!exists) {
+        setExpandedParticipantId(null)
+      }
+    }
+  }, [allParticipants, expandedParticipantId])
+
+  const expandedParticipant = useMemo(() => {
+    if (!expandedParticipantId) return null
+    return allParticipants.find((p) => (p.identity || p.sid) === expandedParticipantId) || null
+  }, [allParticipants, expandedParticipantId])
+
   // Participant search state & instant local filtering
   const [participantSearchQuery, setParticipantSearchQuery] = useState('')
 
@@ -3181,112 +3200,58 @@ function MeetingRoomContent({
       {/* Main Grid + Drawer Area */}
       <div className="flex-1 flex overflow-hidden">
         {/* Video Grid Section */}
-        <div className="flex-1 p-6 overflow-y-auto flex items-center justify-center bg-[#05060b]">
-          <div className="grid grid-cols-1 md:grid-cols-2 gap-4 w-full max-w-5xl h-full max-h-[560px]">
-            {/* Screen share presentations first */}
-            {(tracks || []).map((t) => (
-              <div
-                key={t.publication?.trackSid || t.sid || Math.random()}
-                className="bg-slate-900/60 rounded-2xl border border-white/5 relative overflow-hidden flex flex-col justify-end items-center group shadow-xl col-span-2 min-h-[260px] md:min-h-[360px]"
-              >
-                <ScreenShareView
-                  trackRef={t}
-                  participant={t.participant}
-                  className="absolute inset-0 w-full h-full"
-                />
-              </div>
-            ))}
-
-            {/* Video feeds for all participants */}
-            {allParticipants.map((p) => {
-              let role = 'participant'
-              try {
-                const meta = JSON.parse(p?.metadata || '{}')
-                role = meta.role || 'participant'
-              } catch (e) {}
-
-              const isCurrentUser = p?.identity === localParticipant?.identity
-              const displayName = isCurrentUser ? (user?.name || user?.full_name || p.name) : p.name
-
-              return (
+        <div className="flex-1 p-4 md:p-6 overflow-hidden flex items-center justify-center bg-[#05060b]">
+          {expandedParticipant ? (
+            <div className="w-full h-full max-w-6xl max-h-[640px] flex items-center justify-center">
+              <ExpandedParticipantStage
+                participant={expandedParticipant}
+                allParticipants={allParticipants}
+                localParticipant={localParticipant}
+                user={user}
+                onClose={() => setExpandedParticipantId(null)}
+                onSelectParticipant={(id) => setExpandedParticipantId(id)}
+                camInitializing={camInitializing}
+                camError={camError}
+                onRetryCam={handleToggleCam}
+                raisedHandsMap={raisedHandsMap}
+                participantStatusMap={participantStatusMap}
+                activeReactionsMap={activeReactionsMap}
+              />
+            </div>
+          ) : (
+            <div className="grid grid-cols-1 md:grid-cols-2 gap-4 w-full max-w-5xl h-full max-h-[560px] overflow-y-auto">
+              {/* Screen share presentations first */}
+              {(tracks || []).map((t) => (
                 <div
-                  key={p.sid || p.identity || Math.random()}
-                  className="bg-slate-900/60 rounded-2xl border border-white/5 relative overflow-hidden flex flex-col justify-end items-center group shadow-xl min-h-[220px]"
+                  key={t.publication?.trackSid || t.sid || Math.random()}
+                  className="bg-slate-900/60 rounded-2xl border border-white/5 relative overflow-hidden flex flex-col justify-end items-center group shadow-xl col-span-2 min-h-[260px] md:min-h-[360px]"
                 >
-                  {p.isCameraEnabled ? (
-                    <VideoTrack trackRef={{ participant: p, source: Track.Source.Camera }} className="absolute inset-0 w-full h-full object-cover" />
-                  ) : isCurrentUser && camInitializing ? (
-                    <div className="absolute inset-0 bg-slate-950 flex flex-col items-center justify-center gap-3">
-                      <div className="w-8 h-8 rounded-full border-2 border-white/10 border-t-purple-500 animate-spin" />
-                      <span className="text-[10px] font-semibold text-gray-400 uppercase tracking-widest">Starting camera...</span>
-                    </div>
-                  ) : isCurrentUser && camError ? (
-                    <div className="absolute inset-0 bg-slate-950 flex flex-col items-center justify-center gap-3 px-4">
-                      <VideoOff size={28} className="text-red-400/60" />
-                      <span className="text-[10px] font-semibold text-red-400/80 text-center max-w-[200px]">{camError}</span>
-                      <button
-                        onClick={handleToggleCam}
-                        className="mt-1 px-3 py-1 rounded-lg bg-purple-600/20 border border-purple-500/30 text-[10px] font-bold text-purple-300 hover:bg-purple-600/30 transition-colors cursor-pointer"
-                      >
-                        Retry Camera
-                      </button>
-                    </div>
-                  ) : (
-                    <div className="absolute inset-0 bg-slate-950 flex flex-col items-center justify-center">
-                      <div className="w-16 h-16 rounded-full bg-[#7c3aed]/10 border border-[#7c3aed]/20 flex items-center justify-center text-[#8b5cf6] font-bold text-lg">
-                        {displayName?.charAt(0).toUpperCase() || 'P'}
-                      </div>
-                    </div>
-                  )}
-
-                  {/* Raised Hand Top-Right Badge */}
-                  {raisedHandsMap[p.identity] && (
-                    <div className="absolute top-3 right-3 z-20 px-2.5 py-1 rounded-full bg-amber-500/90 border border-amber-300 text-slate-950 font-extrabold text-[11px] shadow-lg animate-bounce flex items-center gap-1">
-                      <span>✋</span>
-                      <span>Hand Raised</span>
-                    </div>
-                  )}
-
-                  {/* Be Right Back Full Tile Overlay */}
-                  {participantStatusMap[p.identity] === 'be_right_back' && (
-                    <div className="absolute inset-0 z-15 bg-black/85 backdrop-blur-sm flex flex-col items-center justify-center gap-2 p-4 text-center select-none">
-                      <span className="text-3xl animate-pulse">⌛</span>
-                      <span className="text-xs font-bold text-amber-300 tracking-wider uppercase">Be Right Back</span>
-                      <span className="text-[10px] text-gray-400 font-medium">{displayName} is temporarily away</span>
-                    </div>
-                  )}
-
-                  {/* Floating Reaction Animation Overlay */}
-                  {activeReactionsMap[p.identity] && (
-                    <div className="absolute bottom-12 left-1/2 -translate-x-1/2 z-20 px-3.5 py-1.5 rounded-2xl bg-black/80 border border-purple-500/50 text-white font-bold text-3xl shadow-2xl animate-bounce">
-                      {activeReactionsMap[p.identity]}
-                    </div>
-                  )}
-
-                  {/* Signal quality status */}
-                  <div className="absolute top-3 left-3 flex flex-col gap-1 z-10 text-[9px] font-bold uppercase tracking-wider">
-                    <span className="px-2 py-1 rounded bg-black/70 border border-white/10 flex items-center gap-1.5 text-gray-300">
-                      <span
-                        className={`w-1.5 h-1.5 rounded-full ${
-                          p.connectionQuality === 'excellent' ? 'bg-emerald-500' :
-                          p.connectionQuality === 'good' ? 'bg-yellow-500' :
-                          p.connectionQuality === 'poor' ? 'bg-red-500' : 'bg-gray-500'
-                        }`}
-                      />
-                      <span>Signal: {p.connectionQuality}</span>
-                    </span>
-                  </div>
-
-                  {/* Name Tag (Bottom bar) */}
-                  <div className="absolute bottom-3 left-3 px-3 py-1.5 rounded-xl bg-black/60 border border-white/5 text-[10px] font-bold text-white z-10 flex items-center gap-1.5">
-                    <span>{displayName} {isCurrentUser && ' (You)'} {role === 'host' && ' (Host)'}</span>
-                    {raisedHandsMap[p.identity] && <span className="text-amber-400">✋</span>}
-                    {participantStatusMap[p.identity] === 'be_right_back' && <span className="text-amber-400">⌛</span>}
-                  </div>
+                  <ScreenShareView
+                    trackRef={t}
+                    participant={t.participant}
+                    className="absolute inset-0 w-full h-full"
+                  />
                 </div>
-              )
-            })}
-          </div>
+              ))}
+
+              {/* Video feeds for all participants */}
+              {allParticipants.map((p) => (
+                <ParticipantVideoTile
+                  key={p.sid || p.identity || Math.random()}
+                  participant={p}
+                  localParticipant={localParticipant}
+                  user={user}
+                  camInitializing={camInitializing}
+                  camError={camError}
+                  onRetryCam={handleToggleCam}
+                  raisedHand={Boolean(raisedHandsMap[p.identity])}
+                  status={participantStatusMap[p.identity]}
+                  activeReaction={activeReactionsMap[p.identity]}
+                  onExpand={(identity) => setExpandedParticipantId(identity)}
+                />
+              ))}
+            </div>
+          )}
         </div>
 
         {/* Right Side Drawer Panel */}

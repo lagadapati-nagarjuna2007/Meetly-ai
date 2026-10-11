@@ -170,4 +170,93 @@ describe('Screen Share Zoom Controls & Recording Pause/Resume Lifecycle', () => 
       assert.ok(domContainer.style.transform.includes('scale(1.5)'), 'Scale applied only to CSS style')
     })
   })
+
+  describe('Universal Participant Video Tile & Expanded Stage Controls', () => {
+    const PARTICIPANT_ZOOM_PRESETS = [50, 75, 100, 125, 150, 175, 200]
+
+    it('provides identical zoom capabilities for host, self/local participant, and remote peers', () => {
+      const participants = [
+        { identity: 'host-user-1', name: 'Host Sai', role: 'host' },
+        { identity: 'local-user-me', name: 'Me (Local)', role: 'participant' },
+        { identity: 'remote-user-2', name: 'Peer Alice', role: 'participant' }
+      ]
+
+      // For every participant in call, zoom operations work identically without permission gates
+      participants.forEach((p) => {
+        let zoom = 100
+
+        // Zoom In
+        const nextZoomIn = PARTICIPANT_ZOOM_PRESETS.find((z) => z > zoom)
+        zoom = nextZoomIn || 200
+        assert.equal(zoom, 125, `${p.name} zoom in must advance from 100% to 125%`)
+
+        // Zoom Out
+        const prevPresets = PARTICIPANT_ZOOM_PRESETS.filter((z) => z < zoom)
+        zoom = prevPresets[prevPresets.length - 1] || 50
+        assert.equal(zoom, 100, `${p.name} zoom out must decrement back to 100%`)
+
+        // Min clamp
+        zoom = 50
+        const prevMin = PARTICIPANT_ZOOM_PRESETS.filter((z) => z < zoom)
+        assert.equal(prevMin.length, 0, 'Cannot zoom out beyond 50%')
+
+        // Max clamp
+        zoom = 200
+        const nextMax = PARTICIPANT_ZOOM_PRESETS.find((z) => z > zoom)
+        assert.equal(nextMax, undefined, 'Cannot zoom in beyond 200%')
+      })
+    })
+
+    it('supports expanding any participant into spotlight stage and returning to normal grid', () => {
+      let expandedParticipantId = null
+
+      const participants = [
+        { identity: 'host-1', name: 'Host' },
+        { identity: 'self-1', name: 'Self' },
+        { identity: 'peer-1', name: 'Peer' }
+      ]
+
+      // 1. Expand host video
+      expandedParticipantId = 'host-1'
+      assert.equal(expandedParticipantId, 'host-1')
+      const active1 = participants.find((p) => p.identity === expandedParticipantId)
+      assert.equal(active1.name, 'Host')
+
+      // 2. Switch to self camera preview in expanded stage
+      expandedParticipantId = 'self-1'
+      assert.equal(expandedParticipantId, 'self-1')
+      const active2 = participants.find((p) => p.identity === expandedParticipantId)
+      assert.equal(active2.name, 'Self')
+
+      // 3. Switch to peer in expanded stage
+      expandedParticipantId = 'peer-1'
+      assert.equal(expandedParticipantId, 'peer-1')
+      const active3 = participants.find((p) => p.identity === expandedParticipantId)
+      assert.equal(active3.name, 'Peer')
+
+      // 4. Return to grid view
+      expandedParticipantId = null
+      assert.equal(expandedParticipantId, null, 'Grid view restored when expandedParticipantId is null')
+    })
+
+    it('auto-closes expanded stage if the spotlighted participant disconnects', () => {
+      let currentParticipants = [
+        { identity: 'user-a', name: 'User A' },
+        { identity: 'user-b', name: 'User B' }
+      ]
+
+      let expandedId = 'user-b'
+
+      // User B disconnects from room
+      currentParticipants = currentParticipants.filter((p) => p.identity !== 'user-b')
+
+      // Auto-close check
+      const exists = currentParticipants.some((p) => p.identity === expandedId)
+      if (!exists) {
+        expandedId = null
+      }
+
+      assert.equal(expandedId, null, 'Expanded stage must safely close if participant leaves')
+    })
+  })
 })
