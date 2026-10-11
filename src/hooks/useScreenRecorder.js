@@ -310,6 +310,70 @@ export function useScreenRecorder({
     }
   }, [meetingId, recordingDuration, showToast])
 
+  // Pause active recording safely without disrupting session or chunks
+  const pauseRecording = useCallback(() => {
+    const recorder = screenMediaRecorderRef.current
+    if (!recorder) {
+      console.warn('[Screen Recording] Cannot pause: recorder instance not found.')
+      return
+    }
+
+    if (recorder.state !== 'recording') {
+      console.warn('[Screen Recording] Cannot pause: recorder state is not "recording" (current state:', recorder.state, ')')
+      return
+    }
+
+    try {
+      recorder.pause()
+      if (recordingTimerRef.current) {
+        clearInterval(recordingTimerRef.current)
+        recordingTimerRef.current = null
+      }
+      setRecordingState('paused')
+      showToast('Screen recording paused.', 'info')
+      console.log('[Screen Recording] Recording paused successfully.')
+    } catch (err) {
+      console.error('[Screen Recording Error] Failed to pause recorder:', err)
+      showToast(`Could not pause recording: ${err.message}`, 'error')
+    }
+  }, [showToast])
+
+  // Resume paused recording
+  const resumeRecording = useCallback(() => {
+    const recorder = screenMediaRecorderRef.current
+    if (!recorder) {
+      console.warn('[Screen Recording] Cannot resume: recorder instance not found.')
+      return
+    }
+
+    if (recorder.state !== 'paused') {
+      console.warn('[Screen Recording] Cannot resume: recorder state is not "paused" (current state:', recorder.state, ')')
+      return
+    }
+
+    try {
+      recorder.resume()
+      if (!recordingTimerRef.current) {
+        recordingTimerRef.current = setInterval(() => {
+          setRecordingDuration(prev => {
+            const nextSec = prev + 1
+            if (nextSec >= 7200) {
+              console.warn('[Screen Recording] Reached maximum duration limit of 120 minutes.')
+              stopRecording('max_duration_reached')
+            }
+            return nextSec
+          })
+        }, 1000)
+      }
+      setRecordingState('recording')
+      showToast('Screen recording resumed.', 'info')
+      console.log('[Screen Recording] Recording resumed successfully.')
+    } catch (err) {
+      console.error('[Screen Recording Error] Failed to resume recorder:', err)
+      showToast(`Could not resume recording: ${err.message}`, 'error')
+    }
+  }, [showToast, stopRecording])
+
   // 3. Start screen recording
   const startRecording = useCallback(async () => {
     if (recordingState === 'recording' || recordingState === 'starting') return
@@ -534,11 +598,15 @@ export function useScreenRecorder({
   return {
     recordingState,
     isRecording: recordingState === 'recording',
+    isPaused: recordingState === 'paused',
+    isRecordingOrPaused: recordingState === 'recording' || recordingState === 'paused',
     recordingDuration,
     isRoomRecording,
     includeTabAudio,
     setIncludeTabAudio,
     startRecording,
+    pauseRecording,
+    resumeRecording,
     stopRecording,
     errorMessage
   }

@@ -43,6 +43,8 @@ import {
 } from 'lucide-react'
 
 import AIChatPanel from '../components/AIChatPanel'
+import ScreenShareView from '../components/ScreenShareView'
+import RecordingControlPopover from '../components/RecordingControlPopover'
 import { useScreenRecorder } from '../hooks/useScreenRecorder'
 
 const EMOJI_CATEGORIES = [
@@ -1065,11 +1067,15 @@ function MeetingRoomContent({
   const {
     recordingState,
     isRecording,
+    isPaused,
+    isRecordingOrPaused,
     recordingDuration,
     isRoomRecording,
     includeTabAudio,
     setIncludeTabAudio,
     startRecording,
+    pauseRecording,
+    resumeRecording,
     stopRecording
   } = useScreenRecorder({
     meetingId: meetingData?.meeting_id,
@@ -1079,6 +1085,9 @@ function MeetingRoomContent({
     socket,
     showToast
   })
+
+  // Popover state for Zoom-style recording popover: 'header' | 'bottom' | null
+  const [recordingPopoverAnchor, setRecordingPopoverAnchor] = useState(null)
 
   // ── Host Management UI state ─────────────────────────────────────────────────
   const [showHostPicker, setShowHostPicker] = useState(false)
@@ -1350,6 +1359,7 @@ function MeetingRoomContent({
     const handleKeyDown = (e) => {
       if (e.key === 'Escape') {
         setActivePopup(null)
+        setRecordingPopoverAnchor(null)
         setShowEndConfirmModal(false)
       }
     }
@@ -3105,14 +3115,55 @@ function MeetingRoomContent({
 
         {/* Live Status Indicators */}
         <div className="flex items-center gap-4 text-xs font-bold">
-          {(isRecording || isRoomRecording) && (
-            <div className="flex items-center gap-1.5 px-2.5 py-0.5 rounded-full bg-red-500/15 border border-red-500/30 text-red-400 text-xs font-semibold animate-pulse shadow-sm shadow-red-500/20">
-              <span className="w-2 h-2 rounded-full bg-red-500" />
-              <span>REC</span>
-              {isRecording && (
-                <span className="text-gray-300 font-mono text-[11px] ml-1">
-                  {Math.floor(recordingDuration / 60)}:{(recordingDuration % 60).toString().padStart(2, '0')}
-                </span>
+          {(isRecordingOrPaused || isRoomRecording) && (
+            <div className="relative">
+              <button
+                type="button"
+                onClick={() => {
+                  if (canManageMeeting) {
+                    setRecordingPopoverAnchor((prev) => (prev === 'header' ? null : 'header'))
+                  }
+                }}
+                disabled={!canManageMeeting}
+                title={
+                  canManageMeeting
+                    ? 'Recording controls (Pause, Resume, Stop)'
+                    : 'Screen recording in progress'
+                }
+                className={`flex items-center gap-1.5 px-2.5 py-0.5 rounded-full border text-xs font-semibold shadow-sm transition-all ${
+                  canManageMeeting ? 'cursor-pointer hover:brightness-125' : 'cursor-default'
+                } ${
+                  isPaused
+                    ? 'bg-amber-500/15 border-amber-500/30 text-amber-400 shadow-amber-500/20'
+                    : 'bg-red-500/15 border-red-500/30 text-red-400 animate-pulse shadow-red-500/20'
+                }`}
+              >
+                <span
+                  className={`w-2 h-2 rounded-full ${
+                    isPaused ? 'bg-amber-400' : 'bg-red-500'
+                  }`}
+                />
+                <span>{isPaused ? 'PAUSED' : 'REC'}</span>
+                {isRecordingOrPaused && (
+                  <span className="text-gray-300 font-mono text-[11px] ml-1">
+                    {Math.floor(recordingDuration / 60)}:{(recordingDuration % 60).toString().padStart(2, '0')}
+                  </span>
+                )}
+              </button>
+
+              {/* Header recording popover */}
+              {canManageMeeting && (
+                <RecordingControlPopover
+                  isOpen={recordingPopoverAnchor === 'header'}
+                  onClose={() => setRecordingPopoverAnchor(null)}
+                  isPaused={isPaused}
+                  isRecording={isRecording}
+                  recordingDuration={recordingDuration}
+                  onPause={pauseRecording}
+                  onResume={resumeRecording}
+                  onStop={() => stopRecording('user_stop')}
+                  position="top"
+                />
               )}
             </div>
           )}
@@ -3136,12 +3187,13 @@ function MeetingRoomContent({
             {(tracks || []).map((t) => (
               <div
                 key={t.publication?.trackSid || t.sid || Math.random()}
-                className="bg-slate-900/60 rounded-2xl border border-white/5 relative overflow-hidden flex flex-col justify-end items-center group shadow-xl col-span-2 min-h-[220px]"
+                className="bg-slate-900/60 rounded-2xl border border-white/5 relative overflow-hidden flex flex-col justify-end items-center group shadow-xl col-span-2 min-h-[260px] md:min-h-[360px]"
               >
-                <VideoTrack trackRef={t} className="absolute inset-0 w-full h-full object-contain bg-black" />
-                <div className="absolute bottom-3 left-3 px-3 py-1.5 rounded-xl bg-black/60 border border-white/5 text-[10px] font-bold text-white z-10">
-                  {t.participant?.name || 'User'}'s Presentation
-                </div>
+                <ScreenShareView
+                  trackRef={t}
+                  participant={t.participant}
+                  className="absolute inset-0 w-full h-full"
+                />
               </div>
             ))}
 
@@ -4101,28 +4153,54 @@ function MeetingRoomContent({
 
           {/* Screen Recording (Host / Active Host only) */}
           {canManageMeeting && (
-            <button
-              onClick={isRecording ? () => stopRecording('user_stop') : startRecording}
-              disabled={recordingState === 'starting' || recordingState === 'finalizing'}
-              title={
-                isRecording
-                  ? 'Stop Screen Recording'
-                  : recordingState === 'starting'
-                  ? 'Starting recording...'
-                  : recordingState === 'finalizing'
-                  ? 'Finalizing recording...'
-                  : 'Start Screen Recording (Meeting Audio Included)'
-              }
-              className={`w-11 h-11 rounded-xl flex items-center justify-center border transition-all duration-200 cursor-pointer ${
-                isRecording
-                  ? 'bg-red-500/20 border-red-500/40 text-red-400 shadow-lg shadow-red-500/20 animate-pulse'
-                  : recordingState === 'starting' || recordingState === 'finalizing'
-                  ? 'bg-[#0f1122]/60 border-yellow-500/30 text-yellow-400 opacity-70 animate-pulse'
-                  : 'bg-[#0f1122]/60 hover:bg-[#141629] border-white/10 text-white hover:text-red-400'
-              }`}
-            >
-              <Radio size={18} className={isRecording ? 'text-red-400' : ''} />
-            </button>
+            <div className="relative">
+              <button
+                onClick={
+                  isRecordingOrPaused
+                    ? () => setRecordingPopoverAnchor((prev) => (prev === 'bottom' ? null : 'bottom'))
+                    : startRecording
+                }
+                disabled={recordingState === 'starting' || recordingState === 'finalizing'}
+                title={
+                  isRecordingOrPaused
+                    ? 'Recording controls (Pause, Resume, Stop)'
+                    : recordingState === 'starting'
+                    ? 'Starting recording...'
+                    : recordingState === 'finalizing'
+                    ? 'Finalizing recording...'
+                    : 'Start Screen Recording (Meeting Audio Included)'
+                }
+                className={`w-11 h-11 rounded-xl flex items-center justify-center border transition-all duration-200 cursor-pointer ${
+                  isPaused
+                    ? 'bg-amber-500/20 border-amber-500/40 text-amber-400 shadow-lg shadow-amber-500/20'
+                    : isRecording
+                    ? 'bg-red-500/20 border-red-500/40 text-red-400 shadow-lg shadow-red-500/20 animate-pulse'
+                    : recordingState === 'starting' || recordingState === 'finalizing'
+                    ? 'bg-[#0f1122]/60 border-yellow-500/30 text-yellow-400 opacity-70 animate-pulse'
+                    : 'bg-[#0f1122]/60 hover:bg-[#141629] border-white/10 text-white hover:text-red-400'
+                }`}
+              >
+                <Radio
+                  size={18}
+                  className={
+                    isPaused ? 'text-amber-400' : isRecording ? 'text-red-400' : ''
+                  }
+                />
+              </button>
+
+              {/* Bottom bar recording popover */}
+              <RecordingControlPopover
+                isOpen={recordingPopoverAnchor === 'bottom'}
+                onClose={() => setRecordingPopoverAnchor(null)}
+                isPaused={isPaused}
+                isRecording={isRecording}
+                recordingDuration={recordingDuration}
+                onPause={pauseRecording}
+                onResume={resumeRecording}
+                onStop={() => stopRecording('user_stop')}
+                position="bottom"
+              />
+            </div>
           )}
         </div>
 
