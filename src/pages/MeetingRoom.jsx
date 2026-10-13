@@ -47,7 +47,7 @@ import ScreenShareView from '../components/ScreenShareView'
 import RecordingControlPopover from '../components/RecordingControlPopover'
 import ParticipantVideoTile from '../components/ParticipantVideoTile'
 import ExpandedParticipantStage from '../components/ExpandedParticipantStage'
-import MeetingChat from '../components/MeetingChat'
+import MeetingChat, { mergeAndSortMessages } from '../components/MeetingChat'
 import { useScreenRecorder } from '../hooks/useScreenRecorder'
 
 const EMOJI_CATEGORIES = [
@@ -246,6 +246,13 @@ function MeetingRoomInner() {
   const [chatMessages, setChatMessages] = useState([
     { name: 'System', text: 'Welcome to the meeting room. Chat messages and AI queries are enabled.' }
   ])
+  const [ephemeralChatMessages, setEphemeralChatMessages] = useState([])
+  const [ephemeralChatPolicy, setEphemeralChatPolicy] = useState('everyone_and_direct')
+  const [activeChatConvTab, setActiveChatConvTab] = useState('everyone')
+  const [selectedChatRecipient, setSelectedChatRecipient] = useState(null)
+  const [socketReady, setSocketReady] = useState(0)
+  const userIdRef = useRef(user?.id)
+  userIdRef.current = user?.id
   const [typingUsers, setTypingUsers] = useState({})
   const socket = useRef(null)
   const handleLeaveWithAttendanceRef = useRef(null)
@@ -509,15 +516,87 @@ function MeetingRoomInner() {
     if (!meetingData?.room_name) return
     console.log('[MeetingRoomInner useEffect socket] Initializing Socket.IO for room:', meetingData.room_name)
     const socketUrl = import.meta.env.VITE_API_URL || 'http://localhost:5000'
+    const authToken = typeof window !== 'undefined' ? sessionStorage.getItem('meetly_auth_token') : null
 
     try {
       socket.current = io(socketUrl, {
-        withCredentials: true
+        withCredentials: true,
+        auth: authToken ? { token: authToken } : undefined
+      })
+      setSocketReady((v) => v + 1)
+
+      // 1. Register ephemeral chat listeners BEFORE emitting join_room or chat:sync
+      socket.current.on('chat:init', (data) => {
+        if (data?.policy) setEphemeralChatPolicy(data.policy)
+        const incoming = [
+          ...(Array.isArray(data?.messages) ? data.messages : []),
+          ...(Array.isArray(data?.groupMessages) ? data.groupMessages : []),
+          ...(Array.isArray(data?.directMessages) ? data.directMessages : []),
+          ...(Array.isArray(data?.selectedDirectMessages) ? data.selectedDirectMessages : [])
+        ]
+        if (incoming.length > 0) {
+          setEphemeralChatMessages((prev) => mergeAndSortMessages(prev, incoming))
+        }
       })
 
-      // Register room
-      // Pass userId so server can track per-user socket presence (multi-tab aware)
-      socket.current.emit('join_room', { roomName: meetingData.room_name, userId: user?.id })
+      socket.current.on('chat:message', (msg) => {
+        if (!msg?.id) return
+        setEphemeralChatMessages((prev) => mergeAndSortMessages(prev, [msg]))
+      })
+
+      socket.current.on('chat:policy_updated', (data) => {
+        if (data?.policy) {
+          setEphemeralChatPolicy(data.policy)
+        }
+      })
+
+      socket.current.on('chat:cleared', () => {
+        setEphemeralChatMessages([])
+        setSelectedChatRecipient(null)
+        setActiveChatConvTab('everyone')
+      })
+
+      const syncRoomAndChat = () => {
+        if (!socket.current) return
+        setSocketReady((v) => v + 1)
+        const currentToken = typeof window !== 'undefined' ? sessionStorage.getItem('meetly_auth_token') : null
+        const latestUserId = userIdRef.current
+        socket.current.emit('join_room', {
+          roomName: meetingData.room_name,
+          userId: latestUserId,
+          token: currentToken
+        })
+        if (latestUserId) {
+          socket.current.emit(
+            'chat:sync',
+            { roomName: meetingData.room_name, userId: latestUserId, token: currentToken },
+            (res) => {
+              if (res?.ended) {
+                setEphemeralChatMessages([])
+                setSelectedChatRecipient(null)
+                setActiveChatConvTab('everyone')
+                return
+              }
+              if (res?.success) {
+                if (res.policy) setEphemeralChatPolicy(res.policy)
+                const incoming = [
+                  ...(Array.isArray(res.messages) ? res.messages : []),
+                  ...(Array.isArray(res.groupMessages) ? res.groupMessages : []),
+                  ...(Array.isArray(res.directMessages) ? res.directMessages : []),
+                  ...(Array.isArray(res.selectedDirectMessages) ? res.selectedDirectMessages : [])
+                ]
+                setEphemeralChatMessages((prev) => mergeAndSortMessages(prev, incoming))
+              } else if (res?.error) {
+                console.warn('[MeetingRoomInner] Chat sync warning:', res.error)
+              }
+            }
+          )
+        }
+      }
+
+      // 2. Register room immediately and on every socket reconnect
+      syncRoomAndChat()
+      socket.current.on('connect', syncRoomAndChat)
 
       // WebSocket listeners
       socket.current.on('receive_message', (msg) => {
@@ -588,6 +667,9 @@ function MeetingRoomInner() {
       })
 
       socket.current.on('meeting_ended', async () => {
+        setEphemeralChatMessages([])
+        setSelectedChatRecipient(null)
+        setActiveChatConvTab('everyone')
         showToast('The host has ended this meeting.', 'info')
         console.log('[Frontend] Meeting ended. Redirecting user to dashboard.')
         if (enableAiAttendanceRef.current && !isHostRef.current) {
@@ -707,6 +789,39 @@ function MeetingRoomInner() {
       }
     }
   }, [meetingData?.room_name])
+
+  // Re-sync room presence and chat history once user.id, socketReady, or livekitToken is ready
+  useEffect(() => {
+    if (!socket.current || !meetingData?.room_name || !user?.id) return
+    const currentToken = typeof window !== 'undefined' ? sessionStorage.getItem('meetly_auth_token') : null
+    socket.current.emit('join_room', {
+      roomName: meetingData.room_name,
+      userId: user.id,
+      token: currentToken
+    })
+    socket.current.emit(
+      'chat:sync',
+      { roomName: meetingData.room_name, userId: user.id, token: currentToken },
+      (res) => {
+        if (res?.ended) {
+          setEphemeralChatMessages([])
+          setSelectedChatRecipient(null)
+          setActiveChatConvTab('everyone')
+          return
+        }
+        if (res?.success) {
+          if (res.policy) setEphemeralChatPolicy(res.policy)
+          const incoming = [
+            ...(Array.isArray(res.messages) ? res.messages : []),
+            ...(Array.isArray(res.groupMessages) ? res.groupMessages : []),
+            ...(Array.isArray(res.directMessages) ? res.directMessages : []),
+            ...(Array.isArray(res.selectedDirectMessages) ? res.selectedDirectMessages : [])
+          ]
+          setEphemeralChatMessages((prev) => mergeAndSortMessages(prev, incoming))
+        }
+      }
+    )
+  }, [meetingData?.room_name, user?.id, livekitToken, socketReady])
 
   // Error UI — differentiate "meeting ended" from other errors
   if (roomError) {
@@ -925,8 +1040,17 @@ function MeetingRoomInner() {
         attendanceConsent={attendanceConsent}
         endMeeting={endMeeting}
         socket={socket}
+        socketReady={socketReady}
         chatMessages={chatMessages}
         setChatMessages={setChatMessages}
+        ephemeralChatMessages={ephemeralChatMessages}
+        setEphemeralChatMessages={setEphemeralChatMessages}
+        ephemeralChatPolicy={ephemeralChatPolicy}
+        setEphemeralChatPolicy={setEphemeralChatPolicy}
+        activeChatConvTab={activeChatConvTab}
+        setActiveChatConvTab={setActiveChatConvTab}
+        selectedChatRecipient={selectedChatRecipient}
+        setSelectedChatRecipient={setSelectedChatRecipient}
         typingUsers={typingUsers}
         setTypingUsers={setTypingUsers}
         handleLeaveWithAttendanceRef={handleLeaveWithAttendanceRef}
@@ -983,8 +1107,17 @@ function MeetingRoomContent({
   attendanceConsent,
   endMeeting,
   socket,
+  socketReady,
   chatMessages,
   setChatMessages,
+  ephemeralChatMessages,
+  setEphemeralChatMessages,
+  ephemeralChatPolicy,
+  setEphemeralChatPolicy,
+  activeChatConvTab,
+  setActiveChatConvTab,
+  selectedChatRecipient,
+  setSelectedChatRecipient,
   typingUsers,
   setTypingUsers,
   handleLeaveWithAttendanceRef,
@@ -3316,8 +3449,17 @@ function MeetingRoomContent({
                     participants={participants}
                     dbParticipants={dbParticipants}
                     socket={socket}
+                    socketReady={socketReady}
                     isHost={isHost}
                     showToast={showToast}
+                    messages={ephemeralChatMessages}
+                    setMessages={setEphemeralChatMessages}
+                    policy={ephemeralChatPolicy}
+                    setPolicy={setEphemeralChatPolicy}
+                    activeChatTab={activeChatConvTab}
+                    setActiveChatTab={setActiveChatConvTab}
+                    selectedRecipient={selectedChatRecipient}
+                    setSelectedRecipient={setSelectedChatRecipient}
                   />
                 </div>
               )}

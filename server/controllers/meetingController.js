@@ -25,7 +25,7 @@ const cleanupStaleMeetings = async (userId, isCreateIntent = false, targetMeetin
     // 1. Expire 'Waiting' meetings created > 3 minutes ago
     const { data: expiredWaiting } = await supabase
       .from('meetings')
-      .select('meeting_id')
+      .select('meeting_id, room_name')
       .eq('host_id', userId)
       .eq('meeting_status', 'Waiting')
       .eq('is_deleted', false)
@@ -58,6 +58,10 @@ Stack/Caller: cleanupStaleMeetings Part 1
           .update({ participant_status: 'left', left_at: now.toISOString() })
           .eq('meeting_id', m.meeting_id)
           .in('participant_status', ['joined', 'active', 'disconnected'])
+
+        if (m.room_name) {
+          clearMeetingChat(m.room_name)
+        }
       }
     }
 
@@ -86,7 +90,7 @@ Stack/Caller: cleanupStaleMeetings Part 1
     if (isCreateIntent || targetMeetingId) {
       const { data: activeJoined } = await supabase
         .from('participants')
-        .select('participant_id, meeting_id, meetings(meeting_id, host_id, meeting_status, meeting_code)')
+        .select('participant_id, meeting_id, meetings(meeting_id, host_id, meeting_status, meeting_code, room_name)')
         .eq('user_id', userId)
         .in('participant_status', ['joined', 'disconnected'])
 
@@ -131,6 +135,10 @@ Stack/Caller: cleanupStaleMeetings Part 3 (release seat)
                 .from('meetings')
                 .update({ meeting_status: 'Ended', ended_at: now.toISOString(), updated_at: now.toISOString() })
                 .eq('meeting_id', p.meeting_id)
+
+              if (p.meetings?.room_name) {
+                clearMeetingChat(p.meetings.room_name)
+              }
             }
           }
         }
@@ -683,8 +691,8 @@ export const leaveMeeting = async (req, res) => {
     }
 
     const query = isUuid(meetingId)
-      ? supabase.from('meetings').select('meeting_id').eq('meeting_id', meetingId)
-      : supabase.from('meetings').select('meeting_id').eq('meeting_code', meetingId.trim().toUpperCase())
+      ? supabase.from('meetings').select('meeting_id, meeting_code, room_name').eq('meeting_id', meetingId)
+      : supabase.from('meetings').select('meeting_id, meeting_code, room_name').eq('meeting_code', meetingId.trim().toUpperCase())
 
     const { data: meeting, error: fetchErr } = await query.maybeSingle()
 
@@ -1021,6 +1029,14 @@ export const deleteMeeting = async (req, res) => {
         }
 
         clearMeetingCounters(meeting.meeting_id)
+        if (meeting.room_name) {
+          clearMeetingChat(meeting.room_name)
+          const io = req.app.get('io')
+          if (io) {
+            io.to(meeting.room_name).emit('chat:cleared')
+            io.to(meeting.room_name).emit('meeting_ended')
+          }
+        }
         return res.status(200).json({
           message: 'Meeting and associated recordings scheduled for permanent deletion.',
           status: 'deletion_pending'
@@ -1055,6 +1071,14 @@ export const deleteMeeting = async (req, res) => {
     if (deleteMtgErr) throw deleteMtgErr
 
     clearMeetingCounters(meeting.meeting_id)
+    if (meeting.room_name) {
+      clearMeetingChat(meeting.room_name)
+      const io = req.app.get('io')
+      if (io) {
+        io.to(meeting.room_name).emit('chat:cleared')
+        io.to(meeting.room_name).emit('meeting_ended')
+      }
+    }
 
     console.log(`[Cleanup] Meeting ${meeting.meeting_id} deleted successfully.`)
 

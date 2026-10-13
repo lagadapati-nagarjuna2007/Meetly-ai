@@ -85,8 +85,9 @@ Stack/Caller: setTimeout inside meetingCleanup.js
         clearMeetingCounters(meetingId)
 
         // 4. Purge in-memory meeting chat state
-        if (roomName) {
-          clearMeetingChat(roomName)
+        const targetRoomName = roomName || mtgData?.room_name
+        if (targetRoomName) {
+          clearMeetingChat(targetRoomName)
         }
       } else {
         console.log(`[Cleanup] Grace period expired for meeting ${meetingId}, but active participants exist (count: ${activeCount}). Skipping cleanup.`)

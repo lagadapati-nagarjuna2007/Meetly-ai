@@ -3,12 +3,17 @@ import assert from 'node:assert/strict'
 import {
   CHAT_POLICIES,
   getOrCreateRoomChat,
+  isRoomChatEnded,
   getChatPolicy,
   setChatPolicy,
   isUserHostOrCoHost,
   canUserSendMessage,
   addRoomMessage,
+  getGroupMessages,
+  getDirectConversationMessages,
+  getUserDirectMessages,
   getUserVisibleMessages,
+  restoreParticipantChatSession,
   clearMeetingChat,
   resetAllMeetingChats,
   getMeetingChatStats
@@ -379,4 +384,253 @@ describe('Zoom-Style Ephemeral Meeting Chat System', () => {
       assert.equal(getMeetingChatStats(ROOM_2).messageCount, 1)
     })
   })
+
+  describe('6. Browser Refresh & Reconnect History Restoration vs Meeting-End Wipe', () => {
+    it('stores group messages and 1:1 direct conversations in separate structures and restores only authorized threads on refresh', () => {
+      const m1 = addRoomMessage(ROOM, {
+        senderId: HOST_ID,
+        senderName: 'Host',
+        text: 'Welcome everyone!',
+        isDirect: false
+      })
+      const m2 = addRoomMessage(ROOM, {
+        senderId: USER_A,
+        senderName: 'Alice',
+        recipientId: USER_B,
+        recipientName: 'Bob',
+        text: 'Private Alice -> Bob',
+        isDirect: true
+      })
+      const m3 = addRoomMessage(ROOM, {
+        senderId: USER_B,
+        senderName: 'Bob',
+        recipientId: USER_A,
+        recipientName: 'Alice',
+        text: 'Private Bob -> Alice',
+        isDirect: true
+      })
+      const m4 = addRoomMessage(ROOM, {
+        senderId: USER_A,
+        senderName: 'Alice',
+        recipientId: USER_C,
+        recipientName: 'Charlie',
+        text: 'Private Alice -> Charlie',
+        isDirect: true
+      })
+      const m5 = addRoomMessage(ROOM, {
+        senderId: USER_C,
+        senderName: 'Charlie',
+        text: 'Everyone update from Charlie',
+        isDirect: false
+      })
+
+      // Verify monotonic sequence numbers
+      assert.ok(m1.seq < m2.seq && m2.seq < m3.seq && m3.seq < m4.seq && m4.seq < m5.seq)
+
+      // Verify separate group and direct stores
+      const groupOnly = getGroupMessages(ROOM)
+      assert.equal(groupOnly.length, 2)
+      assert.equal(groupOnly.every((m) => !m.isDirect), true)
+
+      const aliceBobThread = getDirectConversationMessages(ROOM, USER_A, USER_B)
+      assert.equal(aliceBobThread.length, 2)
+      assert.equal(aliceBobThread[0].text, 'Private Alice -> Bob')
+      assert.equal(aliceBobThread[1].text, 'Private Bob -> Alice')
+
+      const bobDirectAll = getUserDirectMessages(ROOM, USER_B)
+      assert.equal(bobDirectAll.length, 2)
+
+      // Simulate Bob refreshing the browser and reconnecting
+      const bobRestored = restoreParticipantChatSession({
+        roomName: ROOM,
+        userId: USER_B,
+        meeting: { ...mockMeeting, meeting_status: 'Active' },
+        isParticipantAuthorized: true
+      })
+      assert.equal(bobRestored.allowed, true)
+      // Bob gets the 2 Everyone messages + 2 Alice<->Bob DMs, NEVER Alice->Charlie DM
+      assert.equal(bobRestored.messages.length, 4)
+      assert.deepEqual(
+        bobRestored.messages.map((m) => m.text),
+        [
+          'Welcome everyone!',
+          'Private Alice -> Bob',
+          'Private Bob -> Alice',
+          'Everyone update from Charlie'
+        ]
+      )
+
+      // Simulate Charlie refreshing the browser and reconnecting
+      const charlieRestored = restoreParticipantChatSession({
+        roomName: ROOM,
+        userId: USER_C,
+        meeting: { ...mockMeeting, meeting_status: 'Active' },
+        isParticipantAuthorized: true
+      })
+      assert.equal(charlieRestored.allowed, true)
+      // Charlie gets the 2 Everyone messages + 1 Alice->Charlie DM, NEVER Alice<->Bob DMs
+      assert.equal(charlieRestored.messages.length, 3)
+      assert.deepEqual(
+        charlieRestored.messages.map((m) => m.text),
+        [
+          'Welcome everyone!',
+          'Private Alice -> Charlie',
+          'Everyone update from Charlie'
+        ]
+      )
+    })
+
+    it('rejects history restoration for unauthorized users or ended meetings and prevents resurrection after clearMeetingChat', () => {
+      addRoomMessage(ROOM, {
+        senderId: USER_A,
+        senderName: 'Alice',
+        text: 'Active meeting message',
+        isDirect: false
+      })
+
+      // Unauthorized user cannot restore history
+      const unauthorizedRestore = restoreParticipantChatSession({
+        roomName: ROOM,
+        userId: 'stranger-uuid',
+        meeting: { ...mockMeeting, meeting_status: 'Active' },
+        isParticipantAuthorized: false
+      })
+      assert.equal(unauthorizedRestore.allowed, false)
+      assert.equal(unauthorizedRestore.messages.length, 0)
+
+      // Authoritative meeting end wipes everything
+      assert.equal(isRoomChatEnded(ROOM), false)
+      clearMeetingChat(ROOM)
+      assert.equal(isRoomChatEnded(ROOM), true)
+
+      // Attempting to restore after meeting ends is rejected
+      const endedRestore = restoreParticipantChatSession({
+        roomName: ROOM,
+        userId: USER_A,
+        meeting: { ...mockMeeting, meeting_status: 'Ended' },
+        isParticipantAuthorized: true
+      })
+      assert.equal(endedRestore.allowed, false)
+      assert.equal(endedRestore.ended, true)
+      assert.equal(endedRestore.messages.length, 0)
+
+      // Attempting to send a message or recreate room chat after meeting ended is rejected
+      assert.equal(getOrCreateRoomChat(ROOM), null)
+      assert.throws(() => {
+        addRoomMessage(ROOM, {
+          senderId: USER_A,
+          senderName: 'Alice',
+          text: 'Should fail after meeting end'
+        })
+      }, /has.*ended/i)
+    })
+
+    it('handles late user.id resolution safely without losing or corrupting in-memory history', () => {
+      addRoomMessage(ROOM, {
+        senderId: HOST_ID,
+        senderName: 'Host',
+        text: 'Early group message before user.id resolved',
+        isDirect: false
+      })
+      addRoomMessage(ROOM, {
+        senderId: HOST_ID,
+        senderName: 'Host',
+        recipientId: USER_A,
+        recipientName: 'Alice',
+        text: 'Early DM to Alice before user.id resolved',
+        isDirect: true
+      })
+
+      // 1. Initial call when user.id is still undefined/null on page refresh
+      const earlyAttempt = restoreParticipantChatSession({
+        roomName: ROOM,
+        userId: null,
+        meeting: { ...mockMeeting, meeting_status: 'Active' },
+        isParticipantAuthorized: true
+      })
+      assert.equal(earlyAttempt.authorized, false)
+      assert.equal(earlyAttempt.messages.length, 0)
+
+      // 2. Subsequent retry once user.id resolves
+      const retryAfterIdentityResolved = restoreParticipantChatSession({
+        roomName: ROOM,
+        userId: USER_A,
+         recipientId: HOST_ID,
+        meeting: { ...mockMeeting, meeting_status: 'Active' },
+        isParticipantAuthorized: true
+      })
+      assert.equal(retryAfterIdentityResolved.authorized, true)
+      assert.equal(retryAfterIdentityResolved.groupMessages.length, 1)
+      assert.equal(retryAfterIdentityResolved.directMessages.length, 1)
+      assert.equal(retryAfterIdentityResolved.selectedDirectMessages.length, 1)
+      assert.equal(retryAfterIdentityResolved.messages.length, 2)
+      assert.equal(retryAfterIdentityResolved.selectedDirectMessages[0].text, 'Early DM to Alice before user.id resolved')
+    })
+
+    it('prevents duplicate messages across repeated chat:init, chat:sync, sidebar switches, and reconnects while preserving seq order', () => {
+      const msg1 = addRoomMessage(ROOM, {
+        senderId: USER_A,
+        senderName: 'Alice',
+        text: 'First group message',
+        isDirect: false
+      })
+      const msg2 = addRoomMessage(ROOM, {
+        senderId: USER_B,
+        senderName: 'Bob',
+        recipientId: USER_A,
+        recipientName: 'Alice',
+        text: 'Second message (DM)',
+        isDirect: true
+      })
+      const msg3 = addRoomMessage(ROOM, {
+        senderId: HOST_ID,
+        senderName: 'Host',
+        text: 'Third group message',
+        isDirect: false
+      })
+
+      // Simulate repeated syncs (e.g., initial join_room chat:init + late MeetingChat mount chat:sync + sidebar tab switch + socket reconnect)
+      const sync1 = restoreParticipantChatSession({
+        roomName: ROOM,
+        userId: USER_A,
+        recipientId: USER_B,
+        meeting: { ...mockMeeting, meeting_status: 'Active' },
+        isParticipantAuthorized: true
+      })
+      const sync2 = restoreParticipantChatSession({
+        roomName: ROOM,
+        userId: USER_A,
+        recipientId: USER_B,
+        meeting: { ...mockMeeting, meeting_status: 'Active' },
+        isParticipantAuthorized: true
+      })
+
+      // Combine overlapping batches from chat:init, chat:sync, and live chat:message
+      const combinedBatches = [
+        ...sync1.messages,
+        ...sync1.groupMessages,
+        ...sync1.directMessages,
+        ...sync1.selectedDirectMessages,
+        ...sync2.messages,
+        msg3,
+        msg1,
+        msg2
+      ]
+
+      const byId = new Map()
+      for (const m of combinedBatches) {
+        if (m && m.id) byId.set(m.id, m)
+      }
+      const deduplicated = Array.from(byId.values()).sort((a, b) => (a.seq || 0) - (b.seq || 0))
+
+      assert.equal(deduplicated.length, 3, 'Must never duplicate messages across repeated syncs or reconnects')
+      assert.deepEqual(
+        deduplicated.map((m) => m.id),
+        [msg1.id, msg2.id, msg3.id],
+        'Must preserve exact monotonic sequence order'
+      )
+    })
+  })
 })
+
+

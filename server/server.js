@@ -4,6 +4,7 @@ import dotenv from 'dotenv'
 import express from 'express'
 import cors from 'cors'
 import cookieParser from 'cookie-parser'
+import jwt from 'jsonwebtoken'
 import { Server } from 'socket.io'
 import authRoutes from './routes/auth.js'
 import meetingRoutes from './routes/meetings.js'
@@ -21,7 +22,11 @@ import {
   isUserHostOrCoHost,
   canUserSendMessage,
   addRoomMessage,
+  getGroupMessages,
+  getUserDirectMessages,
   getUserVisibleMessages,
+  restoreParticipantChatSession,
+  isRoomChatEnded,
   clearMeetingChat
 } from './services/meetingChatService.js'
 
@@ -290,17 +295,163 @@ const performHostTransfer = async (roomName, originalHostId, disconnectedActiveH
   }
 }
 
+/**
+ * Extracts and verifies a participant's JWT from Socket.IO handshake or event payload.
+ */
+const extractSocketAuthUser = (socket, explicitToken = null) => {
+  let token = explicitToken || socket?.handshake?.auth?.token || null
+
+  if (!token && socket?.handshake?.headers?.authorization) {
+    const authHeader = socket.handshake.headers.authorization
+    if (authHeader.startsWith('Bearer ')) {
+      token = authHeader.slice(7).trim()
+    }
+  }
+
+  if (!token && socket?.handshake?.headers?.cookie) {
+    const cookies = socket.handshake.headers.cookie.split(';')
+    for (const c of cookies) {
+      const [rawKey, ...rawVal] = c.trim().split('=')
+      if (rawKey === 'meetly_token' && rawVal.length > 0) {
+        token = decodeURIComponent(rawVal.join('='))
+        break
+      }
+    }
+  }
+
+  if (!token || !process.env.JWT_SECRET) {
+    return { userId: null, authenticated: false }
+  }
+
+  try {
+    const decoded = jwt.verify(token, process.env.JWT_SECRET)
+    return {
+      userId: decoded?.id || null,
+      email: decoded?.email || null,
+      authenticated: Boolean(decoded?.id)
+    }
+  } catch {
+    return { userId: null, authenticated: false, invalidToken: true }
+  }
+}
+
+/**
+ * Reauthenticates a socket participant, checks meeting active state and membership,
+ * and restores their authorized in-memory chat history.
+ */
+const verifySocketMeetingParticipant = async (
+  socket,
+  roomName,
+  claimedUserId = null,
+  explicitToken = null,
+  recipientId = null
+) => {
+  const authResult = extractSocketAuthUser(socket, explicitToken)
+  const effectiveUserId = authResult.userId || claimedUserId || null
+
+  if (!roomName) {
+    return {
+      authorized: false,
+      ended: false,
+      userId: effectiveUserId,
+      reason: 'Room name is required.'
+    }
+  }
+
+  if (isRoomChatEnded(roomName)) {
+    return {
+      authorized: false,
+      ended: true,
+      userId: effectiveUserId,
+      reason: 'This meeting has ended.'
+    }
+  }
+
+  const { data: meeting, error: mtgErr } = await supabase
+    .from('meetings')
+    .select('meeting_id, meeting_code, host_id, assigned_host_id, active_host_id, meeting_status, is_deleted, room_name')
+    .eq('room_name', roomName)
+    .maybeSingle()
+
+  if (mtgErr || !meeting) {
+    return {
+      authorized: false,
+      ended: false,
+      userId: effectiveUserId,
+      meeting: null,
+      reason: 'Unable to verify active meeting.'
+    }
+  }
+
+  if (meeting.is_deleted || meeting.meeting_status === 'Ended') {
+    clearMeetingChat(roomName)
+    return {
+      authorized: false,
+      ended: true,
+      userId: effectiveUserId,
+      meeting,
+      reason: 'This meeting has ended.'
+    }
+  }
+
+  if (!effectiveUserId) {
+    return {
+      authorized: false,
+      ended: false,
+      userId: null,
+      meeting,
+      reason: 'Authentication required to access meeting chat.'
+    }
+  }
+
+  const isHost = isUserHostOrCoHost(meeting, effectiveUserId)
+  let isMember = isHost
+
+  if (!isMember) {
+    const { data: partRow } = await supabase
+      .from('participants')
+      .select('participant_id, participant_status')
+      .eq('meeting_id', meeting.meeting_id)
+      .eq('user_id', effectiveUserId)
+      .maybeSingle()
+
+    if (partRow && ['joined', 'active', 'disconnected'].includes(partRow.participant_status)) {
+      isMember = true
+    }
+  }
+
+  const session = restoreParticipantChatSession({
+    roomName,
+    userId: effectiveUserId,
+    recipientId,
+    meeting,
+    isParticipantAuthorized: isMember
+  })
+
+  return {
+    ...session,
+    userId: effectiveUserId,
+    meeting
+  }
+}
+
 io.on('connection', (socket) => {
   let currentRoom = null
   let currentUserId = null
 
   // Join Room — handles both new joins and reconnects
-  socket.on('join_room', (data) => {
-    // Support both legacy string and new object payload { roomName, userId }
+  socket.on('join_room', (data, callback) => {
+    // Support both legacy string and new object payload { roomName, userId, token }
     const roomName = typeof data === 'string' ? data : data?.roomName
-    const joinedUserId = typeof data === 'object' ? data?.userId : null
+    const claimedUserId = typeof data === 'object' ? data?.userId : null
+    const explicitToken = typeof data === 'object' ? data?.token : null
+    const authUser = extractSocketAuthUser(socket, explicitToken)
+    const joinedUserId = authUser.userId || claimedUserId || null
 
-    if (!roomName) return
+    if (!roomName) {
+      if (typeof callback === 'function') callback({ success: false, error: 'Room name is required.' })
+      return
+    }
 
     currentRoom = roomName
     currentUserId = joinedUserId || null
@@ -317,23 +468,69 @@ io.on('connection', (socket) => {
       console.log(`[Socket Connected] Socket ${socket.id} (no userId) joined room ${roomName}.`)
     }
 
-    // Ephemeral Chat: Sync in-memory chat state and policy for joined user
-    const initialMessages = getUserVisibleMessages(roomName, joinedUserId)
-    const initialPolicy = getChatPolicy(roomName)
-    socket.emit('chat:init', {
-      policy: initialPolicy,
-      messages: initialMessages
-    })
-
-    // Cancel pending cleanup for this room if any participant joins
+    // Cancel pending cleanup for this room and verify chat restoration
     supabase
       .from('meetings')
-      .select('meeting_id, host_id, assigned_host_id, active_host_id')
+      .select('meeting_id, host_id, assigned_host_id, active_host_id, meeting_status, is_deleted, room_name')
       .eq('room_name', roomName)
       .maybeSingle()
-      .then(async ({ data: meeting }) => {
-        if (!meeting) return
+      .then(async ({ data: meeting, error: mtgErr }) => {
+        if (isRoomChatEnded(roomName) || (meeting && (meeting.is_deleted || meeting.meeting_status === 'Ended'))) {
+          clearMeetingChat(roomName)
+          socket.emit('chat:cleared')
+          if (typeof callback === 'function') callback({ success: false, ended: true })
+          return
+        }
+
+        if (mtgErr || !meeting) {
+          if (typeof callback === 'function') callback({ success: false, error: 'Unable to verify active meeting.' })
+          return
+        }
+
         cancelCleanup(meeting.meeting_id)
+
+        // Verify participant membership and restore authorized in-memory chat history
+        if (joinedUserId) {
+          const isHost = isUserHostOrCoHost(meeting, joinedUserId)
+          let isMember = isHost
+          if (!isMember) {
+            const { data: partRow } = await supabase
+              .from('participants')
+              .select('participant_id, participant_status')
+              .eq('meeting_id', meeting.meeting_id)
+              .eq('user_id', joinedUserId)
+              .maybeSingle()
+            if (partRow && ['joined', 'active', 'disconnected'].includes(partRow.participant_status)) {
+              isMember = true
+            }
+          }
+
+          const restored = restoreParticipantChatSession({
+            roomName,
+            userId: joinedUserId,
+            meeting,
+            isParticipantAuthorized: isMember
+          })
+
+          if (restored.authorized) {
+            const initPayload = {
+              policy: restored.policy,
+              isHost: restored.isHost,
+              groupMessages: restored.groupMessages,
+              directMessages: restored.directMessages,
+              selectedDirectMessages: restored.selectedDirectMessages,
+              messages: restored.messages
+            }
+            socket.emit('chat:init', initPayload)
+            if (typeof callback === 'function') {
+              callback({ success: true, ...initPayload })
+            }
+          } else if (typeof callback === 'function') {
+            callback({ success: false, error: restored.reason })
+          }
+        } else if (typeof callback === 'function') {
+          callback({ success: true, messages: [] })
+        }
 
         // --- Reconnect detection: Original Host ---
         if (joinedUserId && String(joinedUserId).toLowerCase() === String(meeting.host_id || '').toLowerCase()) {
@@ -345,16 +542,8 @@ io.on('connection', (socket) => {
             console.log(`[HostTransfer] Grace period CANCELLED — Original Host ${joinedUserId} reconnected to room ${roomName}.`)
           }
 
-          // Only restore active_host_id when the Original Host actually disconnected and is now reconnecting.
-          // Do NOT restore if the Original Host is continuously present (e.g., socket re-join after page refresh)
-          // and intentionally assigned B as the Active Host — gracePending being set is the indicator
-          // that A was truly absent. Without it, A was present the whole time and B's assignment stands.
           const currentActiveHost = String(meeting.active_host_id || '').toLowerCase()
           const origHostLower = String(meeting.host_id || '').toLowerCase()
-
-          // needsRestore is true ONLY when there was a real disconnection (gracePending timer existed).
-          // If gracePending is false but active_host_id !== host_id, the Original Host intentionally
-          // delegated Active Host to someone else — do NOT override that.
           const needsRestore = Boolean(gracePending)
 
           if (needsRestore) {
@@ -381,12 +570,8 @@ io.on('connection', (socket) => {
               console.log(`[HostTransfer] Original Host ${joinedUserId} reconnected — active_host_id restored. Emitted active_host_changed + original_host_reconnected.`)
             }
           } else if (currentActiveHost === origHostLower) {
-            // Original Host was already the active host and no grace period was pending — normal join/refresh, nothing to do.
             console.log(`[HostTransfer] Original Host ${joinedUserId} joined room ${roomName} — already active host, no restore needed.`)
           } else {
-            // Original Host joined but active_host_id points to someone else (e.g., B after intentional assignment).
-            // No grace period was active, so this is a normal join while B is intentionally the Active Host.
-            // Emit original_host_reconnected so clients know A is back, but keep active_host_id as B.
             const { data: hostUser } = await supabase
               .from('users')
               .select('full_name')
@@ -396,38 +581,146 @@ io.on('connection', (socket) => {
             const payload = {
               originalHostId: meeting.host_id,
               assignedHostId: meeting.assigned_host_id || null,
-              activeHostId: meeting.active_host_id,  // B remains active
+              activeHostId: meeting.active_host_id,
               activeHostName: hostUser?.full_name || meeting.host_id
             }
             io.to(roomName).emit('original_host_reconnected', payload)
             console.log(`[HostTransfer] Original Host ${joinedUserId} joined room ${roomName} while ${meeting.active_host_id} is Active Host — no restore. B continues.`)
           }
         }
-        // Assigned Host reconnect is silent — they simply become eligible for future transfers again
       })
       .catch((err) => {
         console.error('[Socket Join Error]:', err)
+        if (typeof callback === 'function') callback({ success: false, error: 'Failed to join socket room.' })
       })
   })
+
+  // Zoom-style Ephemeral Chat: Explicit History & Permission Sync on Refresh / Reconnect / Tab Mount
+  const handleChatSync = async (data, callback) => {
+    try {
+      const roomName = data?.roomName || currentRoom
+      const claimedUserId = data?.userId || currentUserId
+      const explicitToken = data?.token || null
+      const recipientId = data?.recipientId || null
+
+      const verified = await verifySocketMeetingParticipant(
+        socket,
+        roomName,
+        claimedUserId,
+        explicitToken,
+        recipientId
+      )
+
+      if (verified.ended) {
+        socket.emit('chat:cleared')
+        if (typeof callback === 'function') {
+          callback({
+            success: false,
+            ended: true,
+            error: verified.reason || 'This meeting has ended.',
+            policy: CHAT_POLICIES.NO_ONE,
+            groupMessages: [],
+            directMessages: [],
+            selectedDirectMessages: [],
+            messages: []
+          })
+        }
+        return
+      }
+
+      if (!verified.authorized) {
+        if (typeof callback === 'function') {
+          callback({
+            success: false,
+            ended: false,
+            error: verified.reason || 'Not authorized to restore meeting chat.',
+            policy: verified.policy || CHAT_POLICIES.EVERYONE_AND_DIRECT,
+            groupMessages: [],
+            directMessages: [],
+            selectedDirectMessages: [],
+            messages: []
+          })
+        }
+        return
+      }
+
+      // Ensure socket presence and room membership are registered after refresh/reconnect
+      currentRoom = roomName
+      currentUserId = verified.userId
+      socket.join(roomName)
+      addSocketPresence(roomName, verified.userId, socket.id)
+
+      const payload = {
+        policy: verified.policy,
+        isHost: verified.isHost,
+        groupMessages: verified.groupMessages,
+        directMessages: verified.directMessages,
+        selectedDirectMessages: verified.selectedDirectMessages,
+        messages: verified.messages
+      }
+
+      socket.emit('chat:init', payload)
+
+      if (typeof callback === 'function') {
+        callback({
+          success: true,
+          ...payload
+        })
+      }
+    } catch (err) {
+      console.error('[Chat Sync Error]:', err)
+      if (typeof callback === 'function') {
+        callback({
+          success: false,
+          error: 'Failed to synchronize meeting chat history.',
+          groupMessages: [],
+          directMessages: [],
+          selectedDirectMessages: [],
+          messages: []
+        })
+      }
+    }
+  }
+
+  socket.on('chat:sync', handleChatSync)
+  socket.on('chat:get_history', handleChatSync)
 
   // Zoom-style Ephemeral Chat: Send message (Everyone or Direct 1:1)
   socket.on('chat:send_message', async (data, callback) => {
     try {
-      const { roomName, text, formatted, attachment, recipientId, recipientName, isDirect } = data || {}
+      const { roomName, text, formatted, attachment, recipientId, recipientName, isDirect, token } = data || {}
       if (!roomName) {
         if (typeof callback === 'function') callback({ success: false, error: 'roomName is required' })
         return
       }
 
-      const senderId = currentUserId || data.senderId
-      const senderName = data.senderName || 'Anonymous'
+      const claimedSenderId = currentUserId || data.senderId
+      const verified = await verifySocketMeetingParticipant(socket, roomName, claimedSenderId, token)
 
-      // Check host authorization from meeting record
-      const { data: meeting } = await supabase
-        .from('meetings')
-        .select('host_id, assigned_host_id, active_host_id')
-        .eq('room_name', roomName)
-        .maybeSingle()
+      if (verified.ended) {
+        socket.emit('chat:cleared')
+        const endError = 'This meeting has ended.'
+        if (typeof callback === 'function') callback({ success: false, ended: true, error: endError })
+        socket.emit('chat:error', { error: endError })
+        return
+      }
+
+      if (!verified.authorized) {
+        const authError = verified.reason || 'You are not authorized to send messages in this meeting.'
+        if (typeof callback === 'function') callback({ success: false, error: authError })
+        socket.emit('chat:error', { error: authError })
+        return
+      }
+
+      const senderId = verified.userId
+      const senderName = data.senderName || 'Anonymous'
+      const meeting = verified.meeting
+
+      // Ensure socket presence is registered so sender also receives direct messages across tabs
+      currentRoom = roomName
+      currentUserId = senderId
+      socket.join(roomName)
+      addSocketPresence(roomName, senderId, socket.id)
 
       const isSenderHost = isUserHostOrCoHost(meeting, senderId)
       const isRecipientHost = recipientId ? isUserHostOrCoHost(meeting, recipientId) : false
@@ -462,12 +755,14 @@ io.on('connection', (socket) => {
 
       if (createdMessage.isDirect && createdMessage.recipientId) {
         // Direct message: deliver ONLY to recipient socket(s) and sender socket(s)
+        const deliveredSockets = new Set()
         const userMap = roomUserSockets.get(roomName)
         if (userMap) {
           const recKey = String(createdMessage.recipientId).trim().toLowerCase()
           const recSockets = userMap.get(recKey)
           if (recSockets) {
             recSockets.forEach((sId) => {
+              deliveredSockets.add(sId)
               io.to(sId).emit('chat:message', createdMessage)
             })
           }
@@ -476,9 +771,13 @@ io.on('connection', (socket) => {
           const sendSockets = userMap.get(sendKey)
           if (sendSockets) {
             sendSockets.forEach((sId) => {
+              deliveredSockets.add(sId)
               io.to(sId).emit('chat:message', createdMessage)
             })
           }
+        }
+        if (!deliveredSockets.has(socket.id)) {
+          socket.emit('chat:message', createdMessage)
         }
       } else {
         // Everyone group chat: broadcast to all room participants
@@ -509,20 +808,24 @@ io.on('connection', (socket) => {
   // Zoom-style Ephemeral Chat: Set host permission policy
   socket.on('chat:set_policy', async (data, callback) => {
     try {
-      const { roomName, policy } = data || {}
+      const { roomName, policy, token } = data || {}
       if (!roomName || !policy) {
         if (typeof callback === 'function') callback({ success: false, error: 'roomName and policy are required' })
         return
       }
 
-      const requesterId = currentUserId || data.userId
-      const { data: meeting } = await supabase
-        .from('meetings')
-        .select('host_id, assigned_host_id, active_host_id')
-        .eq('room_name', roomName)
-        .maybeSingle()
+      const claimedUserId = currentUserId || data.userId
+      const verified = await verifySocketMeetingParticipant(socket, roomName, claimedUserId, token)
 
-      const isHost = isUserHostOrCoHost(meeting, requesterId)
+      if (verified.ended) {
+        socket.emit('chat:cleared')
+        const endMsg = 'This meeting has ended.'
+        if (typeof callback === 'function') callback({ success: false, ended: true, error: endMsg })
+        return
+      }
+
+      const requesterId = verified.userId
+      const isHost = isUserHostOrCoHost(verified.meeting, requesterId)
       if (!isHost) {
         const errorMsg = 'Only the host or co-host can change chat permissions.'
         if (typeof callback === 'function') callback({ success: false, error: errorMsg })

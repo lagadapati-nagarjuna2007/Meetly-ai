@@ -183,6 +183,25 @@ const renderFormattedText = (text) => {
   return elements
 }
 
+export const mergeAndSortMessages = (existing = [], incoming = []) => {
+  const byId = new Map()
+  for (const m of existing) {
+    if (m && m.id) byId.set(m.id, m)
+  }
+  for (const m of incoming) {
+    if (m && m.id) byId.set(m.id, m)
+  }
+  return Array.from(byId.values()).sort((a, b) => {
+    const seqA = Number(a.seq || 0)
+    const seqB = Number(b.seq || 0)
+    if (seqA && seqB && seqA !== seqB) return seqA - seqB
+    const timeA = a.timestamp ? new Date(a.timestamp).getTime() : 0
+    const timeB = b.timestamp ? new Date(b.timestamp).getTime() : 0
+    if (timeA !== timeB) return timeA - timeB
+    return String(a.id).localeCompare(String(b.id))
+  })
+}
+
 export default function MeetingChat({
   meetingData,
   user,
@@ -190,14 +209,33 @@ export default function MeetingChat({
   participants = [],
   dbParticipants = [],
   socket,
+  socketReady = 0,
   isHost,
-  showToast
+  showToast,
+  messages: controlledMessages,
+  setMessages: setControlledMessages,
+  policy: controlledPolicy,
+  setPolicy: setControlledPolicy,
+  activeChatTab: controlledActiveTab,
+  setActiveChatTab: setControlledActiveTab,
+  selectedRecipient: controlledSelectedRecipient,
+  setSelectedRecipient: setControlledSelectedRecipient
 }) {
-  // In-memory chat messages strictly in React state (Zero persistent storage)
-  const [messages, setMessages] = useState([])
-  const [activeTab, setActiveTab] = useState('everyone') // 'everyone' | 'direct' | 'picker'
-  const [selectedRecipient, setSelectedRecipient] = useState(null) // { userId, name, role }
-  const [policy, setPolicy] = useState(CHAT_POLICIES.EVERYONE_AND_DIRECT)
+  // In-memory chat messages strictly in React state + temporary server memory (Zero persistent storage)
+  const [internalMessages, setInternalMessages] = useState([])
+  const [internalActiveTab, setInternalActiveTab] = useState('everyone') // 'everyone' | 'direct' | 'picker'
+  const [internalSelectedRecipient, setInternalSelectedRecipient] = useState(null) // { userId, name, role }
+  const [internalPolicy, setInternalPolicy] = useState(CHAT_POLICIES.EVERYONE_AND_DIRECT)
+
+  const messages = controlledMessages !== undefined ? controlledMessages : internalMessages
+  const setMessages = setControlledMessages || setInternalMessages
+  const activeTab = controlledActiveTab !== undefined ? controlledActiveTab : internalActiveTab
+  const setActiveTab = setControlledActiveTab || setInternalActiveTab
+  const selectedRecipient = controlledSelectedRecipient !== undefined ? controlledSelectedRecipient : internalSelectedRecipient
+  const setSelectedRecipient = setControlledSelectedRecipient || setInternalSelectedRecipient
+  const policy = controlledPolicy !== undefined ? controlledPolicy : internalPolicy
+  const setPolicy = setControlledPolicy || setInternalPolicy
+
   const [inputText, setInputText] = useState('')
   const [pendingAttachment, setPendingAttachment] = useState(null) // { name, size, type, dataUrl }
 
@@ -213,7 +251,20 @@ export default function MeetingChat({
   const settingsMenuRef = useRef(null)
   const emojiPickerRef = useRef(null)
 
-  const currentUserId = user?.id || localParticipant?.identity
+  // Resolve authenticated user ID (do not fall back to email identity)
+  const currentUserId = useMemo(() => {
+    if (user?.id) return user.id
+    if (localParticipant?.metadata) {
+      try {
+        const meta = typeof localParticipant.metadata === 'string'
+          ? JSON.parse(localParticipant.metadata)
+          : localParticipant.metadata
+        if (meta?.userId) return meta.userId
+      } catch {}
+    }
+    return null
+  }, [user?.id, localParticipant?.metadata])
+
   const currentUserName = user?.full_name || user?.name || localParticipant?.name || 'You'
 
   // Host IDs from meeting record
@@ -253,36 +304,57 @@ export default function MeetingChat({
     return null
   }, [dbParticipants])
 
-  // List of other participants available for 1:1 chat
+  // List of other participants available for 1:1 chat (LiveKit + admitted DB participants + restored DM peers)
   const eligibleRecipients = useMemo(() => {
     const list = []
     const seen = new Set()
+    const myIdLower = String(currentUserId || '').trim().toLowerCase()
 
-    for (const p of participants || []) {
-      const pUserId = getParticipantUserId(p)
-      if (!pUserId) continue
-
-      const isMe = String(pUserId).toLowerCase() === String(currentUserId || '').toLowerCase()
-      if (isMe) continue
-
-      const key = String(pUserId).toLowerCase()
-      if (seen.has(key)) continue
+    const addCandidate = (uid, name, identity) => {
+      if (!uid) return
+      const key = String(uid).trim().toLowerCase()
+      if (!key || key === myIdLower || seen.has(key)) return
       seen.add(key)
 
-      const pName = p.name || p.identity || 'Participant'
-      const isTargetHost = isUserHostOrCoHost(pUserId)
-
+      const isTargetHost = isUserHostOrCoHost(uid)
       list.push({
-        userId: pUserId,
-        name: pName,
-        identity: p.identity,
+        userId: uid,
+        name: name || identity || 'Participant',
+        identity: identity || uid,
         isHost: isTargetHost,
         role: isTargetHost ? 'Host' : 'Participant'
       })
     }
 
+    // 1. LiveKit participants currently in room
+    for (const p of participants || []) {
+      const pUserId = getParticipantUserId(p)
+      if (!pUserId) continue
+      addCandidate(pUserId, p.name || p.identity, p.identity)
+    }
+
+    // 2. Admitted database participants (ensures peers are immediately available right after page refresh)
+    for (const dbP of dbParticipants || []) {
+      if (dbP.status && !['joined', 'active', 'disconnected'].includes(dbP.status)) continue
+      const pUserId = dbP.user_id
+      const pName = dbP.user?.full_name || dbP.user?.name || dbP.user?.email || 'Participant'
+      addCandidate(pUserId, pName, dbP.user?.email || pUserId)
+    }
+
+    // 3. Peers from restored in-memory direct conversations
+    for (const m of messages || []) {
+      if (!m?.isDirect) continue
+      const senderLower = String(m.senderId || '').trim().toLowerCase()
+      const recipientLower = String(m.recipientId || '').trim().toLowerCase()
+      if (senderLower === myIdLower && m.recipientId) {
+        addCandidate(m.recipientId, m.recipientName || 'Participant', m.recipientId)
+      } else if (recipientLower === myIdLower && m.senderId) {
+        addCandidate(m.senderId, m.senderName || 'Participant', m.senderId)
+      }
+    }
+
     return list
-  }, [participants, currentUserId, getParticipantUserId, isUserHostOrCoHost])
+  }, [participants, dbParticipants, messages, currentUserId, getParticipantUserId, isUserHostOrCoHost])
 
   const filteredRecipients = useMemo(() => {
     const query = participantSearch.trim().toLowerCase()
@@ -335,24 +407,71 @@ export default function MeetingChat({
     }
   }
 
-  // Socket listener setup for chat messages and policy changes
+  // Request authoritative in-memory chat history from server only once roomName AND currentUserId are ready
+  const syncChatHistory = React.useCallback(() => {
+    const s = socket?.current
+    const roomName = meetingData?.room_name
+    if (!s || !roomName || !currentUserId) return
+
+    const token = typeof window !== 'undefined' ? sessionStorage.getItem('meetly_auth_token') : null
+    const recipientId = selectedRecipient?.userId || null
+
+    s.emit(
+      'chat:sync',
+      { roomName, userId: currentUserId, recipientId, token },
+      (res) => {
+        if (res?.ended) {
+          setMessages([])
+          setSelectedRecipient(null)
+          setActiveTab('everyone')
+          return
+        }
+        if (res?.success) {
+          if (res.policy) setPolicy(res.policy)
+          const incoming = [
+            ...(Array.isArray(res.messages) ? res.messages : []),
+            ...(Array.isArray(res.groupMessages) ? res.groupMessages : []),
+            ...(Array.isArray(res.directMessages) ? res.directMessages : []),
+            ...(Array.isArray(res.selectedDirectMessages) ? res.selectedDirectMessages : [])
+          ]
+          setMessages((prev) => mergeAndSortMessages(prev, incoming))
+        } else if (res?.error) {
+          console.warn('[MeetingChat] History sync warning:', res.error)
+        }
+      }
+    )
+  }, [
+    socket,
+    meetingData?.room_name,
+    currentUserId,
+    selectedRecipient?.userId,
+    setMessages,
+    setPolicy,
+    setSelectedRecipient,
+    setActiveTab
+  ])
+
+  // Socket listener setup for chat messages, reconnect sync, and policy changes
   useEffect(() => {
     const s = socket?.current
     if (!s) return
 
     const handleInit = (data) => {
       if (data?.policy) setPolicy(data.policy)
-      if (Array.isArray(data?.messages)) {
-        setMessages(data.messages)
+      const incoming = [
+        ...(Array.isArray(data?.messages) ? data.messages : []),
+        ...(Array.isArray(data?.groupMessages) ? data.groupMessages : []),
+        ...(Array.isArray(data?.directMessages) ? data.directMessages : []),
+        ...(Array.isArray(data?.selectedDirectMessages) ? data.selectedDirectMessages : [])
+      ]
+      if (incoming.length > 0) {
+        setMessages((prev) => mergeAndSortMessages(prev, incoming))
       }
     }
 
     const handleMessage = (msg) => {
-      setMessages((prev) => {
-        // Prevent duplicates
-        if (prev.some((m) => m.id === msg.id)) return prev
-        return [...prev, msg]
-      })
+      if (!msg?.id) return
+      setMessages((prev) => mergeAndSortMessages(prev, [msg]))
     }
 
     const handlePolicyUpdated = (data) => {
@@ -366,8 +485,12 @@ export default function MeetingChat({
     }
 
     const handleCleared = () => {
-      // Ephemeral wipe
+      // Authoritative meeting-end ephemeral wipe
       setMessages([])
+      setSelectedRecipient(null)
+      setActiveTab('everyone')
+      setInputText('')
+      setPendingAttachment(null)
     }
 
     const handleError = (data) => {
@@ -376,11 +499,19 @@ export default function MeetingChat({
       }
     }
 
+    const handleReconnect = () => {
+      syncChatHistory()
+    }
+
     s.on('chat:init', handleInit)
     s.on('chat:message', handleMessage)
     s.on('chat:policy_updated', handlePolicyUpdated)
     s.on('chat:cleared', handleCleared)
     s.on('chat:error', handleError)
+    s.on('connect', handleReconnect)
+
+    // Perform handshake after listener registration once roomName and currentUserId are available
+    syncChatHistory()
 
     return () => {
       s.off('chat:init', handleInit)
@@ -388,8 +519,9 @@ export default function MeetingChat({
       s.off('chat:policy_updated', handlePolicyUpdated)
       s.off('chat:cleared', handleCleared)
       s.off('chat:error', handleError)
+      s.off('connect', handleReconnect)
     }
-  }, [socket, showToast])
+  }, [socket, socketReady, showToast, syncChatHistory, setMessages, setPolicy, setSelectedRecipient, setActiveTab])
 
   // Scroll to bottom on new message
   useEffect(() => {
@@ -448,10 +580,12 @@ export default function MeetingChat({
     setShowSettingsMenu(false)
     const s = socket?.current
     if (s && meetingData?.room_name) {
+      const token = typeof window !== 'undefined' ? sessionStorage.getItem('meetly_auth_token') : null
       s.emit('chat:set_policy', {
         roomName: meetingData.room_name,
         policy: newPolicy,
-        userId: currentUserId
+        userId: currentUserId,
+        token
       }, (res) => {
         if (!res?.success && showToast) {
           showToast(res?.error || 'Failed to update chat policy.', 'error')
@@ -568,6 +702,7 @@ export default function MeetingChat({
     const recipientId = isDirect ? selectedRecipient.userId : null
     const recipientName = isDirect ? selectedRecipient.name : null
 
+    const token = typeof window !== 'undefined' ? sessionStorage.getItem('meetly_auth_token') : null
     const payload = {
       roomName: meetingData?.room_name,
       text: trimmed,
@@ -577,7 +712,8 @@ export default function MeetingChat({
       recipientName,
       isDirect,
       senderId: currentUserId,
-      senderName: currentUserName
+      senderName: currentUserName,
+      token
     }
 
     const s = socket?.current
@@ -585,6 +721,10 @@ export default function MeetingChat({
       s.emit('chat:send_message', payload, (res) => {
         if (!res?.success && showToast) {
           showToast(res?.error || 'Failed to send message.', 'error')
+          return
+        }
+        if (res?.message?.id) {
+          setMessages((prev) => mergeAndSortMessages(prev, [res.message]))
         }
       })
     }
