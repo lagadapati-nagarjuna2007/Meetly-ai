@@ -1,5 +1,6 @@
 import { supabase } from '../config/supabase.js'
 import { clearMeetingCounters } from './aiChat.service.js'
+import { clearMeetingChat } from './meetingChatService.js'
 
 // In-memory map of active cleanup timeouts keyed by meeting_id
 const activeCleanupTimers = new Map()
@@ -82,6 +83,11 @@ Stack/Caller: setTimeout inside meetingCleanup.js
 
         // 3. Clear meeting counters
         clearMeetingCounters(meetingId)
+
+        // 4. Purge in-memory meeting chat state
+        if (roomName) {
+          clearMeetingChat(roomName)
+        }
       } else {
         console.log(`[Cleanup] Grace period expired for meeting ${meetingId}, but active participants exist (count: ${activeCount}). Skipping cleanup.`)
       }

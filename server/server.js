@@ -12,8 +12,18 @@ import recordingRoutes from './routes/recording.js'
 import { supabase } from './config/supabase.js'
 import { startRetentionCleanup } from './controllers/meetingController.js'
 import { startRecordingRetentionCleanup } from './services/recordingRetention.js'
-import { clearMeetingCounters } from './services/aiChat.service.js'
 import { scheduleCleanup, cancelCleanup } from './services/meetingCleanup.js'
+import {
+  CHAT_POLICIES,
+  getOrCreateRoomChat,
+  getChatPolicy,
+  setChatPolicy,
+  isUserHostOrCoHost,
+  canUserSendMessage,
+  addRoomMessage,
+  getUserVisibleMessages,
+  clearMeetingChat
+} from './services/meetingChatService.js'
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url))
 dotenv.config({ path: path.resolve(__dirname, '../.env') })
@@ -307,6 +317,14 @@ io.on('connection', (socket) => {
       console.log(`[Socket Connected] Socket ${socket.id} (no userId) joined room ${roomName}.`)
     }
 
+    // Ephemeral Chat: Sync in-memory chat state and policy for joined user
+    const initialMessages = getUserVisibleMessages(roomName, joinedUserId)
+    const initialPolicy = getChatPolicy(roomName)
+    socket.emit('chat:init', {
+      policy: initialPolicy,
+      messages: initialMessages
+    })
+
     // Cancel pending cleanup for this room if any participant joins
     supabase
       .from('meetings')
@@ -392,7 +410,147 @@ io.on('connection', (socket) => {
       })
   })
 
-  // Chat message broadcasting
+  // Zoom-style Ephemeral Chat: Send message (Everyone or Direct 1:1)
+  socket.on('chat:send_message', async (data, callback) => {
+    try {
+      const { roomName, text, formatted, attachment, recipientId, recipientName, isDirect } = data || {}
+      if (!roomName) {
+        if (typeof callback === 'function') callback({ success: false, error: 'roomName is required' })
+        return
+      }
+
+      const senderId = currentUserId || data.senderId
+      const senderName = data.senderName || 'Anonymous'
+
+      // Check host authorization from meeting record
+      const { data: meeting } = await supabase
+        .from('meetings')
+        .select('host_id, assigned_host_id, active_host_id')
+        .eq('room_name', roomName)
+        .maybeSingle()
+
+      const isSenderHost = isUserHostOrCoHost(meeting, senderId)
+      const isRecipientHost = recipientId ? isUserHostOrCoHost(meeting, recipientId) : false
+
+      const check = canUserSendMessage({
+        roomName,
+        senderId,
+        isSenderHost,
+        isDirect: Boolean(isDirect || recipientId),
+        recipientId,
+        isRecipientHost
+      })
+
+      if (!check.allowed) {
+        if (typeof callback === 'function') callback({ success: false, error: check.reason })
+        socket.emit('chat:error', { error: check.reason })
+        return
+      }
+
+      const senderRole = isSenderHost ? 'host' : 'participant'
+      const createdMessage = addRoomMessage(roomName, {
+        senderId,
+        senderName,
+        senderRole,
+        recipientId,
+        recipientName,
+        isDirect: Boolean(isDirect || recipientId),
+        text,
+        formatted,
+        attachment
+      })
+
+      if (createdMessage.isDirect && createdMessage.recipientId) {
+        // Direct message: deliver ONLY to recipient socket(s) and sender socket(s)
+        const userMap = roomUserSockets.get(roomName)
+        if (userMap) {
+          const recKey = String(createdMessage.recipientId).trim().toLowerCase()
+          const recSockets = userMap.get(recKey)
+          if (recSockets) {
+            recSockets.forEach((sId) => {
+              io.to(sId).emit('chat:message', createdMessage)
+            })
+          }
+
+          const sendKey = String(createdMessage.senderId).trim().toLowerCase()
+          const sendSockets = userMap.get(sendKey)
+          if (sendSockets) {
+            sendSockets.forEach((sId) => {
+              io.to(sId).emit('chat:message', createdMessage)
+            })
+          }
+        }
+      } else {
+        // Everyone group chat: broadcast to all room participants
+        io.to(roomName).emit('chat:message', createdMessage)
+      }
+
+      // Legacy broadcast compatibility for any legacy listeners
+      if (!createdMessage.isDirect) {
+        const timestamp = new Date().toLocaleTimeString('en-US', { hour: '2-digit', minute: '2-digit' })
+        io.to(roomName).emit('receive_message', {
+          name: createdMessage.senderName,
+          text: createdMessage.text,
+          timestamp
+        })
+      }
+
+      if (typeof callback === 'function') {
+        callback({ success: true, message: createdMessage })
+      }
+    } catch (err) {
+      console.error('[Chat Send Error]:', err)
+      if (typeof callback === 'function') {
+        callback({ success: false, error: err.message || 'Failed to send message' })
+      }
+    }
+  })
+
+  // Zoom-style Ephemeral Chat: Set host permission policy
+  socket.on('chat:set_policy', async (data, callback) => {
+    try {
+      const { roomName, policy } = data || {}
+      if (!roomName || !policy) {
+        if (typeof callback === 'function') callback({ success: false, error: 'roomName and policy are required' })
+        return
+      }
+
+      const requesterId = currentUserId || data.userId
+      const { data: meeting } = await supabase
+        .from('meetings')
+        .select('host_id, assigned_host_id, active_host_id')
+        .eq('room_name', roomName)
+        .maybeSingle()
+
+      const isHost = isUserHostOrCoHost(meeting, requesterId)
+      if (!isHost) {
+        const errorMsg = 'Only the host or co-host can change chat permissions.'
+        if (typeof callback === 'function') callback({ success: false, error: errorMsg })
+        socket.emit('chat:error', { error: errorMsg })
+        return
+      }
+
+      setChatPolicy(roomName, policy)
+      console.log(`[MeetingChat] Chat policy in room ${roomName} updated to: ${policy} by host ${requesterId}`)
+
+      io.to(roomName).emit('chat:policy_updated', {
+        roomName,
+        policy,
+        updatedBy: requesterId
+      })
+
+      if (typeof callback === 'function') {
+        callback({ success: true, policy })
+      }
+    } catch (err) {
+      console.error('[Chat Set Policy Error]:', err)
+      if (typeof callback === 'function') {
+        callback({ success: false, error: err.message || 'Failed to update policy' })
+      }
+    }
+  })
+
+  // Legacy chat message broadcasting
   socket.on('send_message', (data) => {
     const timestamp = new Date().toLocaleTimeString('en-US', { hour: '2-digit', minute: '2-digit' })
     io.to(data.roomName).emit('receive_message', {
@@ -457,7 +615,11 @@ io.on('connection', (socket) => {
 
   // Host ended room trigger
   socket.on('end_meeting', (roomName) => {
-    io.to(roomName).emit('meeting_ended')
+    if (roomName) {
+      clearMeetingChat(roomName)
+      io.to(roomName).emit('chat:cleared')
+      io.to(roomName).emit('meeting_ended')
+    }
   })
 
   // Socket Disconnect — multi-socket-aware with grace period + race-safe host transfer

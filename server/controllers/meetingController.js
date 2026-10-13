@@ -3,6 +3,7 @@ import bcrypt from 'bcrypt'
 import { AccessToken } from 'livekit-server-sdk'
 import { supabase } from '../config/supabase.js'
 import { clearMeetingCounters } from '../services/aiChat.service.js'
+import { clearMeetingChat } from '../services/meetingChatService.js'
 import { scheduleCleanup, cancelCleanup } from '../services/meetingCleanup.js'
 import { authorizeHost } from '../utils/authHelper.js'
 import { isMuteAllEnabled } from './securityController.js'
@@ -787,14 +788,18 @@ Stack/Caller: endMeeting inside meetingController.js
     }
 
     clearMeetingCounters(meeting.meeting_id)
+    if (meeting.room_name) {
+      clearMeetingChat(meeting.room_name)
+    }
 
     // BUG 2 FIX: Emit meeting_ended to ALL connected participants via Socket.IO.
     // This must happen server-side so participants are notified even before
     // the host's browser socket disconnects on navigation.
     const io = req.app.get('io')
     if (io && meeting.room_name) {
+      io.to(meeting.room_name).emit('chat:cleared')
       io.to(meeting.room_name).emit('meeting_ended')
-      console.log(`[End] Emitted 'meeting_ended' to Socket.IO room: ${meeting.room_name}`)
+      console.log(`[End] Emitted 'chat:cleared' and 'meeting_ended' to Socket.IO room: ${meeting.room_name}`)
     } else {
       console.warn(`[End] io or room_name not available, participants may not receive meeting_ended event.`)
     }
