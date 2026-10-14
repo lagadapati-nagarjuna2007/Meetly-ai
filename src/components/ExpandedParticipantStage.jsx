@@ -19,6 +19,7 @@ export default function ExpandedParticipantStage({
   allParticipants = [],
   localParticipant,
   user,
+  localCamActive,
   onClose,
   onSelectParticipant,
   camInitializing = false,
@@ -219,7 +220,12 @@ export default function ExpandedParticipantStage({
     ? (user?.name || user?.full_name || participant?.name || 'You')
     : (participant?.name || 'Participant')
 
-  const isCameraEnabled = Boolean(participant?.isCameraEnabled)
+  const isLocalCameraEnabled = typeof localCamActive === 'boolean'
+    ? Boolean(localCamActive && localParticipant?.isCameraEnabled)
+    : Boolean(localParticipant?.isCameraEnabled)
+  const isCameraEnabled = isCurrentUser
+    ? isLocalCameraEnabled
+    : Boolean(participant?.isCameraEnabled)
   const isHandRaised = Boolean(raisedHandsMap[participant?.identity])
   const isAway = participantStatusMap[participant?.identity] === 'be_right_back'
   const activeReaction = activeReactionsMap[participant?.identity]
@@ -441,7 +447,7 @@ export default function ExpandedParticipantStage({
               isThumbDragging ? 'cursor-grabbing shadow-purple-500/30' : 'cursor-grab'
             }`}
           >
-            {localParticipant.isCameraEnabled ? (
+            {isLocalCameraEnabled ? (
               <VideoTrack
                 trackRef={{ participant: localParticipant, source: Track.Source.Camera }}
                 className="absolute inset-0 w-full h-full object-cover pointer-events-none"
@@ -479,6 +485,7 @@ export default function ExpandedParticipantStage({
         {allParticipants.map((p) => {
           const isSelected = p.identity === participant?.identity
           const isCurrent = p.identity === localParticipant?.identity
+          const pCamEnabled = isCurrent ? isLocalCameraEnabled : Boolean(p.isCameraEnabled)
           const pName = isCurrent
             ? (user?.name || user?.full_name || p.name || 'You')
             : (p.name || 'Participant')
@@ -505,10 +512,10 @@ export default function ExpandedParticipantStage({
                 <span className="text-[9px] text-gray-400 flex items-center gap-1">
                   <span
                     className={`w-1.5 h-1.5 rounded-full ${
-                      p.isCameraEnabled ? 'bg-emerald-400' : 'bg-gray-500'
+                      pCamEnabled ? 'bg-emerald-400' : 'bg-gray-500'
                     }`}
                   />
-                  {p.isCameraEnabled ? 'Cam On' : 'Cam Off'}
+                  {pCamEnabled ? 'Cam On' : 'Cam Off'}
                   {raisedHandsMap[p.identity] && <span>✋</span>}
                 </span>
               </div>

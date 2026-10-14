@@ -49,6 +49,15 @@ import ParticipantVideoTile from '../components/ParticipantVideoTile'
 import ExpandedParticipantStage from '../components/ExpandedParticipantStage'
 import MeetingChat, { mergeAndSortMessages } from '../components/MeetingChat'
 import { useScreenRecorder } from '../hooks/useScreenRecorder'
+import {
+  resolveMediaUserId,
+  resolveInitialMediaState,
+  applyInitialMediaState,
+  toggleMicrophoneState,
+  toggleCameraState,
+  syncAndEnforceMediaState
+} from '../utils/mediaPreferences'
+import { mergeIntervals } from '../utils/durationHelper'
 
 const EMOJI_CATEGORIES = [
   { id: 'all', label: 'All', icon: '⭐', emojis: [] },
@@ -1132,10 +1141,27 @@ function MeetingRoomContent({
   const participants = useParticipants()
   const tracks = useTracks([Track.Source.ScreenShare])
   const mediaInitRef = useRef(false)
+  const mediaInitDoneRef = useRef(false)
+  const micActionInFlightRef = useRef(false)
+  const camActionInFlightRef = useRef(false)
   const activatedRef = useRef(false)
 
-  const [micActive, setMicActive] = useState(false)
-  const [camActive, setCamActive] = useState(false)
+  const [micActive, setMicActive] = useState(() => {
+    const resolved = resolveInitialMediaState({
+      userId: user?.id,
+      isHost: isHostProp,
+      muteAllEnabled: Boolean(meetingData?.mute_all_enabled)
+    })
+    return resolved.shouldEnableMic
+  })
+  const [camActive, setCamActive] = useState(() => {
+    const resolved = resolveInitialMediaState({
+      userId: user?.id,
+      isHost: isHostProp,
+      muteAllEnabled: Boolean(meetingData?.mute_all_enabled)
+    })
+    return resolved.shouldEnableCam
+  })
   const [sharingActive, setSharingActive] = useState(false)
   const [camError, setCamError] = useState(null)
   const [camInitializing, setCamInitializing] = useState(false)
@@ -1187,6 +1213,23 @@ function MeetingRoomContent({
 
   // Legacy alias — all existing isHost references remain valid
   const isHost = canManageMeeting
+
+  const effectiveMediaUserId = useMemo(
+    () => resolveMediaUserId(user, localParticipant, resolveParticipantUserId, dbParticipants),
+    [user, localParticipant, dbParticipants]
+  )
+
+  // Keep initial UI button states aligned with saved preferences before LiveKit media initializes
+  useEffect(() => {
+    if (mediaInitRef.current) return
+    const resolved = resolveInitialMediaState({
+      userId: effectiveMediaUserId,
+      isHost,
+      muteAllEnabled: Boolean(meetingData?.mute_all_enabled)
+    })
+    setMicActive(resolved.shouldEnableMic)
+    setCamActive(resolved.shouldEnableCam)
+  }, [effectiveMediaUserId, isHost, meetingData?.mute_all_enabled])
 
   console.log(`[HOST UI STATE]\ncurrentUserId: ${currentUserId}\nhost_id: ${originalHostId}\nassigned_host_id: ${assignedHostId}\nactive_host_id: ${activeHostId}\nisOriginalHost: ${isOriginalHost}\nisAssignedHost: ${isAssignedHost}\nisActiveHost: ${isActiveHost}\ncanManageMeeting: ${canManageMeeting}\ncanManageHostAssignment: ${canManageHostAssignment}`)
 
@@ -1396,20 +1439,27 @@ function MeetingRoomContent({
   /**
    * Compute total face-presence seconds from closed intervals + current open interval.
    * This is the SINGLE SOURCE OF TRUTH for presence duration.
+   * Merges overlapping intervals to prevent double-counting.
    */
   const getFacePresenceSeconds = useCallback(() => {
-    const closedSeconds = attendanceIntervalsRef.current.reduce((sum, iv) => sum + iv.seconds, 0)
-    let openSeconds = 0
+    const intervals = [...attendanceIntervalsRef.current]
     const state = attendanceStateRef.current
     if ((state === 'PRESENT' || state === 'GRACE') && currentIntervalStartRef.current) {
-      openSeconds = Math.max(0, Math.floor((Date.now() - currentIntervalStartRef.current) / 1000))
+      const now = Date.now()
+      intervals.push({
+        start: currentIntervalStartRef.current,
+        end: now,
+        seconds: Math.max(0, Math.floor((now - currentIntervalStartRef.current) / 1000))
+      })
     }
-    return closedSeconds + openSeconds
+    const merged = mergeIntervals(intervals)
+    return merged.reduce((sum, iv) => sum + iv.seconds, 0)
   }, [])
 
   /**
    * Close any open interval and set state to PAUSED.
    * Must be called before every attendance upload.
+   * Merges intervals to ensure reliable accumulation without overlapping spans.
    */
   const finalizeAttendanceState = useCallback((reason = 'leave') => {
     const now = Date.now()
@@ -1427,7 +1477,8 @@ function MeetingRoomContent({
     }
     attendanceStateRef.current = 'PAUSED'
     graceStartTimeRef.current = null
-    // Sync the display counter with timestamp-based truth
+    // Merge any overlapping intervals and sync the display counter
+    attendanceIntervalsRef.current = mergeIntervals(attendanceIntervalsRef.current)
     presenceSeconds.current = attendanceIntervalsRef.current.reduce((sum, iv) => sum + iv.seconds, 0)
     console.log(`[AI Attendance] Finalized (${reason}) | total face-presence: ${presenceSeconds.current}s | intervals: ${attendanceIntervalsRef.current.length}`)
   }, [])
@@ -1708,20 +1759,69 @@ function MeetingRoomContent({
 
   useEffect(() => {
     if (!room) return
-    room.on(RoomEvent.TrackMuted, forceTrackUpdate)
-    room.on(RoomEvent.TrackUnmuted, forceTrackUpdate)
+
+    const syncLocalTracks = async (enforceOff = false) => {
+      forceTrackUpdate()
+      if (!localParticipant || !mediaInitDoneRef.current) return
+      if (!enforceOff && (micActionInFlightRef.current || camActionInFlightRef.current)) return
+      await syncAndEnforceMediaState({
+        localParticipant,
+        userId: effectiveMediaUserId,
+        isHost,
+        muteAllEnabled: Boolean(meetingData?.mute_all_enabled),
+        enforceSavedOffState: enforceOff,
+        releasePhysicalCameraIfUnneeded,
+        setMeetingCamActive: (val) => {
+          meetingCamActiveRef.current = Boolean(val)
+        },
+        setMicActive: (val) => {
+          if (!micActionInFlightRef.current) setMicActive(val)
+        },
+        setCamActive: (val) => {
+          if (!camActionInFlightRef.current) setCamActive(val)
+        },
+        cameraSource: Track.Source.Camera,
+        micSource: Track.Source.Microphone
+      })
+      forceTrackUpdate()
+    }
+
+    const handleTrackChange = () => {
+      syncLocalTracks(false)
+    }
+
+    const handleReconnectedSync = () => {
+      syncLocalTracks(true)
+    }
+
+    room.on(RoomEvent.TrackMuted, handleTrackChange)
+    room.on(RoomEvent.TrackUnmuted, handleTrackChange)
     room.on(RoomEvent.TrackPublished, forceTrackUpdate)
     room.on(RoomEvent.TrackUnpublished, forceTrackUpdate)
+    room.on(RoomEvent.LocalTrackPublished, handleTrackChange)
+    room.on(RoomEvent.LocalTrackUnpublished, handleTrackChange)
     room.on(RoomEvent.ParticipantAttributesChanged, forceTrackUpdate)
+    room.on(RoomEvent.Reconnected, handleReconnectedSync)
 
     return () => {
-      room.off(RoomEvent.TrackMuted, forceTrackUpdate)
-      room.off(RoomEvent.TrackUnmuted, forceTrackUpdate)
+      room.off(RoomEvent.TrackMuted, handleTrackChange)
+      room.off(RoomEvent.TrackUnmuted, handleTrackChange)
       room.off(RoomEvent.TrackPublished, forceTrackUpdate)
       room.off(RoomEvent.TrackUnpublished, forceTrackUpdate)
+      room.off(RoomEvent.LocalTrackPublished, handleTrackChange)
+      room.off(RoomEvent.LocalTrackUnpublished, handleTrackChange)
       room.off(RoomEvent.ParticipantAttributesChanged, forceTrackUpdate)
+      room.off(RoomEvent.Reconnected, handleReconnectedSync)
     }
-  }, [room, forceTrackUpdate])
+  }, [
+    room,
+    localParticipant,
+    effectiveMediaUserId,
+    isHost,
+    meetingData?.mute_all_enabled,
+    releasePhysicalCameraIfUnneeded,
+    forceTrackUpdate
+  ])
 
   // Socket.IO listener for host_mute_toggle to synchronize local LiveKit microphone state
   useEffect(() => {
@@ -2868,64 +2968,63 @@ function MeetingRoomContent({
           activateMeeting(meetingData.meeting_id)
         }
 
-        if (!localParticipant || mediaInitRef.current) return
+        if (!localParticipant || !effectiveMediaUserId || mediaInitRef.current) return
         mediaInitRef.current = true
+        micActionInFlightRef.current = true
+        camActionInFlightRef.current = true
 
-        console.log('[Media Init] Room connected! Initializing camera and microphone...')
+        console.log('[Media Init] Room connected! Restoring saved camera and microphone preferences for user:', effectiveMediaUserId)
 
-        // Initialize camera via shared physical camera architecture
-        setCamInitializing(true)
-        setCamError(null)
         try {
-          console.log('[Camera Init] Requesting camera access via shared camera architecture...')
-          meetingCamActiveRef.current = true
-          const physicalTrack = await getOrCreatePhysicalTrack()
-          const livekitTrack = physicalTrack.clone()
-          await localParticipant.publishTrack(livekitTrack, {
-            source: Track.Source.Camera,
-            simulcast: true
+          await applyInitialMediaState({
+            localParticipant,
+            userId: effectiveMediaUserId,
+            isHost,
+            muteAllEnabled: Boolean(meetingData?.mute_all_enabled),
+            getOrCreatePhysicalTrack,
+            releasePhysicalCameraIfUnneeded,
+            setMeetingCamActive: (val) => {
+              meetingCamActiveRef.current = Boolean(val)
+            },
+            setCamInitializing,
+            setCamActive,
+            setMicActive,
+            setCamError,
+            getCameraErrorMessage,
+            showToast,
+            wasMutedByHostRef,
+            cameraSource: Track.Source.Camera,
+            micSource: Track.Source.Microphone
           })
-          setCamActive(true)
-          setCamInitializing(false)
-          console.log('[Camera Init] Camera enabled and published successfully!')
-        } catch (err) {
-          meetingCamActiveRef.current = false
-          releasePhysicalCameraIfUnneeded()
-          setCamInitializing(false)
-          console.error('[Camera Init] Failed to enable camera:', err)
-          const errorMsg = getCameraErrorMessage(err)
-          setCamError(errorMsg)
-          showToast(errorMsg, 'error')
-        }
-
-        // Initialize microphone
-        if (meetingData?.mute_all_enabled && !isHost) {
-          console.log('[Microphone Init] Meeting has Mute All ON. Keeping microphone muted for participant...')
-          wasMutedByHostRef.current = true
-          try {
-            await localParticipant.setMicrophoneEnabled(false)
-            setMicActive(false)
-          } catch (err) {
-            console.error('[Microphone Init] Error keeping microphone muted:', err)
-          }
-        } else {
-          try {
-            console.log('[Microphone Init] Requesting microphone access via setMicrophoneEnabled(true)...')
-            await localParticipant.setMicrophoneEnabled(true)
-            setMicActive(true)
-            console.log('[Microphone Init] Microphone enabled successfully!')
-          } catch (err) {
-            console.error('[Microphone Init] Failed to enable microphone:', err)
-            showToast('Microphone permission denied or unavailable.', 'error')
-          }
+        } finally {
+          mediaInitDoneRef.current = true
+          micActionInFlightRef.current = false
+          camActionInFlightRef.current = false
+          forceTrackUpdate()
         }
       } catch (globalErr) {
+        mediaInitDoneRef.current = true
+        micActionInFlightRef.current = false
+        camActionInFlightRef.current = false
         console.error('[Media Init] Unhandled error during media initialization:', globalErr)
       }
     }
 
     initRoomSession()
-  }, [room, roomState, localParticipant, meetingData?.meeting_id, activateMeeting, showToast, getOrCreatePhysicalTrack, releasePhysicalCameraIfUnneeded])
+  }, [
+    room,
+    roomState,
+    localParticipant,
+    effectiveMediaUserId,
+    isHost,
+    meetingData?.meeting_id,
+    meetingData?.mute_all_enabled,
+    activateMeeting,
+    showToast,
+    getOrCreatePhysicalTrack,
+    releasePhysicalCameraIfUnneeded,
+    forceTrackUpdate
+  ])
 
 
 
@@ -2970,67 +3069,52 @@ function MeetingRoomContent({
 
   // Handle control actions
   const handleToggleMic = async () => {
-    if (!localParticipant) return
-    if (!isHost && meetingData?.mute_all_enabled) {
-      showToast('Microphones are currently locked by the host.', 'warning')
-      return
-    }
+    if (!localParticipant || micActionInFlightRef.current) return
+    micActionInFlightRef.current = true
     try {
-      const nextState = !micActive
-      console.log(`[Microphone Toggle] Setting microphone to ${nextState ? 'ON' : 'OFF'}...`)
-      wasMutedByHostRef.current = false
-      await localParticipant.setMicrophoneEnabled(nextState)
-      setMicActive(nextState)
-      showToast(nextState ? 'Microphone unmuted' : 'Microphone muted', 'info')
+      await toggleMicrophoneState({
+        localParticipant,
+        userId: effectiveMediaUserId,
+        isHost,
+        muteAllEnabled: Boolean(meetingData?.mute_all_enabled),
+        currentMicActive: micActive,
+        setMicActive,
+        showToast,
+        wasMutedByHostRef
+      })
     } catch (err) {
       console.error('[Microphone Toggle] Failed:', err)
-      showToast('Failed to toggle microphone.', 'error')
+    } finally {
+      micActionInFlightRef.current = false
+      forceTrackUpdate()
     }
   }
 
   const handleToggleCam = async () => {
-    if (!localParticipant) return
-    setCamError(null)
-    setCamInitializing(true)
+    if (!localParticipant || camActionInFlightRef.current) return
+    camActionInFlightRef.current = true
     try {
-      const nextState = !camActive
-      console.log(`[Camera Toggle] Setting camera to ${nextState ? 'ON' : 'OFF'}...`)
-      if (nextState) {
-        meetingCamActiveRef.current = true
-        const physicalTrack = await getOrCreatePhysicalTrack()
-        const livekitTrack = physicalTrack.clone()
-        await localParticipant.publishTrack(livekitTrack, {
-          source: Track.Source.Camera,
-          simulcast: true
-        })
-        setCamActive(true)
-        setCamInitializing(false)
-        showToast('Camera enabled', 'info')
-      } else {
-        meetingCamActiveRef.current = false
-        const pub = localParticipant.getTrackPublication(Track.Source.Camera)
-        if (pub && pub.track) {
-          const trackToUnpublish = pub.track
-          await localParticipant.unpublishTrack(trackToUnpublish, false)
-          try {
-            trackToUnpublish.stop()
-          } catch (_) {}
-        }
-        releasePhysicalCameraIfUnneeded()
-        setCamActive(false)
-        setCamInitializing(false)
-        showToast('Camera disabled', 'info')
-      }
+      await toggleCameraState({
+        localParticipant,
+        userId: effectiveMediaUserId,
+        currentCamActive: camActive,
+        getOrCreatePhysicalTrack,
+        releasePhysicalCameraIfUnneeded,
+        setMeetingCamActive: (val) => {
+          meetingCamActiveRef.current = Boolean(val)
+        },
+        setCamInitializing,
+        setCamActive,
+        setCamError,
+        getCameraErrorMessage,
+        showToast,
+        cameraSource: Track.Source.Camera
+      })
     } catch (err) {
-      if (!camActive) {
-        meetingCamActiveRef.current = false
-        releasePhysicalCameraIfUnneeded()
-      }
-      setCamInitializing(false)
       console.error('[Camera Toggle] Failed:', err)
-      const errorMsg = getCameraErrorMessage(err)
-      setCamError(errorMsg)
-      showToast(errorMsg, 'error')
+    } finally {
+      camActionInFlightRef.current = false
+      forceTrackUpdate()
     }
   }
 
@@ -3342,6 +3426,7 @@ function MeetingRoomContent({
                 allParticipants={allParticipants}
                 localParticipant={localParticipant}
                 user={user}
+                localCamActive={camActive}
                 onClose={() => setExpandedParticipantId(null)}
                 onSelectParticipant={(id) => setExpandedParticipantId(id)}
                 camInitializing={camInitializing}
@@ -3375,6 +3460,7 @@ function MeetingRoomContent({
                   participant={p}
                   localParticipant={localParticipant}
                   user={user}
+                  localCamActive={camActive}
                   camInitializing={camInitializing}
                   camError={camError}
                   onRetryCam={handleToggleCam}

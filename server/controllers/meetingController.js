@@ -8,6 +8,7 @@ import { scheduleCleanup, cancelCleanup } from '../services/meetingCleanup.js'
 import { authorizeHost } from '../utils/authHelper.js'
 import { isMuteAllEnabled } from './securityController.js'
 import * as b2Service from '../services/b2Service.js'
+import { formatDuration, calculateAttendancePercentage } from '../utils/durationHelper.js'
 
 // UUID validation helper
 const isUuid = (val) => {
@@ -1812,9 +1813,30 @@ When the speaker explicitly introduces multiple items under a topic (using phras
 - characteristics: Bullet list of properties mentioned. Empty array if none.
 - example: A specific example the speaker gave. Quote or paraphrase from transcript.
 - analogy: Any comparison or analogy the speaker used. Empty string if none.
-- codeExample: Verbatim code/pseudocode if the speaker wrote or said it. Empty string if none.
+- codeExample: Verbatim short code/pseudocode if the speaker wrote or said it inline for a concept. Empty string if none.
 - importantPoints: Bullet list of notable facts or warnings mentioned. Empty array if none.
 - children: Array of child nodes for any sub-items, sub-types, sub-stages, sub-categories, sub-methods, etc.
+
+=== COMPLETE SOURCE CODE & CODE EXPLANATION (CRITICAL FOR LECTURES WITH CODE) ===
+When the lecture contains or explains programming code:
+1. Generate all the lecture notes, concepts, and hierarchy first. Do not remove or truncate lecture content.
+2. At the end, populate the "programs" array.
+   Each item in "programs" must contain:
+   - "title": Clear title for the program (e.g. "Binary Search Tree Implementation in Python").
+   - "language": Programming language (e.g. "python", "javascript", "cpp", "c", "java", etc.).
+   - "sourceCode": The full, complete, runnable program with proper indentation, line breaks, imports/headers, functions, and main execution entry point as demonstrated or explained in the lecture.
+     - If code was demonstrated in multiple fragments during the lecture, reconstruct them into the complete program only when supported by the transcript.
+     - If the lecture contains multiple independent programs, create a separate entry in the "programs" array for each independent program.
+     - Do NOT invent or fabricate missing code. If parts were omitted in the lecture, state what was omitted inside comments rather than hallucinating fake code.
+   - "explanation": Comprehensive step-by-step student-friendly code explanation immediately matching that program:
+     - Header files, imports, and libraries.
+     - Variables, constants, and data types.
+     - Functions, classes, and their purposes.
+     - Conditions, loops, and control flow.
+     - Step-by-step execution logic and data flow.
+     - Expected inputs, outputs, and sample execution.
+3. If the lecture contains NO programming code or software implementation:
+   Set "programs": []. NEVER create empty or dummy code blocks for non-programming lectures.
 
 === OUTPUT FORMAT ===
 
@@ -1830,7 +1852,7 @@ When the speaker explicitly introduces multiple items under a topic (using phras
       "characteristics": ["characteristic 1", "characteristic 2"],
       "example": "Example from transcript. If none: 'No specific example was provided in the meeting.'",
       "analogy": "Any analogy used. Empty string if none.",
-      "codeExample": "Code or pseudocode if mentioned verbatim. Empty string if none.",
+      "codeExample": "Short snippet if mentioned verbatim. Empty string if none.",
       "importantPoints": ["important point 1"],
       "children": [
         {
@@ -1849,6 +1871,14 @@ When the speaker explicitly introduces multiple items under a topic (using phras
     }
   ],
   "keyPoints": ["Overall key takeaway 1", "Key takeaway 2"],
+  "programs": [
+    {
+      "title": "Title of Program",
+      "language": "python",
+      "sourceCode": "# Complete, runnable, indented source code",
+      "explanation": "Step-by-step explanation covering imports, functions, execution flow, inputs/outputs, and expected output."
+    }
+  ],
   "decisionsMade": [],
   "actionItems": []
 }`
@@ -2035,6 +2065,27 @@ REQUIRED JSON SCHEMA:
         description: n.definition?.slice(0, 150) || n.explanation?.slice(0, 150) || ''
       }))
 
+      // Sanitize programs array (Complete Source Code at end)
+      const rawPrograms = Array.isArray(parsedSummary.programs)
+        ? parsedSummary.programs
+        : (parsedSummary.completeSourceCode && typeof parsedSummary.completeSourceCode === 'string')
+          ? [{
+              title: parsedSummary.programTitle || 'Complete Program',
+              language: parsedSummary.programLanguage || '',
+              sourceCode: parsedSummary.completeSourceCode,
+              explanation: parsedSummary.codeExplanation || ''
+            }]
+          : []
+
+      const sanitizedPrograms = rawPrograms
+        .filter(p => p && typeof p === 'object' && p.sourceCode && String(p.sourceCode).trim().length > 0)
+        .map(p => ({
+          title: String(p.title || 'Complete Source Code').trim(),
+          language: String(p.language || '').trim(),
+          sourceCode: String(p.sourceCode || '').trim(),
+          explanation: String(p.explanation || '').trim()
+        }))
+
       finalSummary = {
         meetingType: 'Educational / Lecture',
         overview: typeof parsedSummary.overview === 'string' ? parsedSummary.overview.trim() : '',
@@ -2044,6 +2095,7 @@ REQUIRED JSON SCHEMA:
         keyPoints: Array.isArray(parsedSummary.keyPoints)
           ? parsedSummary.keyPoints.map(k => String(k).trim()).filter(Boolean)
           : [],
+        programs: sanitizedPrograms,
         decisionsMade: [],
         actionItems: []
       }
@@ -2366,42 +2418,30 @@ export const submitAttendance = async (req, res) => {
     finalPresence = Math.max(0, finalPresence)
     finalDuration = Math.max(0, finalDuration)
 
-    // Denominator for percentage = participant's submitted connection time (meetingDurationSeconds).
-    // This is the time the participant was actually connected to the meeting, submitted by the
-    // frontend from sessionStartTimeRef → Date.now(). It is NOT the full meeting wall-clock time
-    // from DB timestamps, which can be longer if the host started early.
-    //
-    // Example: host starts at T=0, participant joins at T=13s, meeting ends at T=137s.
-    //   DB meeting duration = 137s
-    //   Participant connection time = 124s (submitted by frontend)
-    //   Face presence = 96s
-    //   Correct percentage = 96/124 = 77.42%  ← use finalDuration (124s)
-    //   Wrong percentage  = 96/137 = 70.07%  ← would result from DB timestamps
-    let totalMeetingSec = finalDuration > 0 ? finalDuration : 0
-
-    // Fallback: if frontend sent 0 duration (e.g., sessionStartTimeRef was never set),
-    // use actual meeting wall-clock time from DB timestamps so we don't divide by zero.
-    if (totalMeetingSec <= 0 && meetingCheck) {
+    // Total meeting duration from DB timestamps (started_at to ended_at/now)
+    let totalMeetingSec = 0
+    if (meetingCheck) {
       const start = meetingCheck.started_at || meetingCheck.created_at
       const end = meetingCheck.ended_at || new Date().toISOString()
       if (start) {
         totalMeetingSec = Math.max(1, Math.round((new Date(end) - new Date(start)) / 1000))
       }
     }
-    totalMeetingSec = Math.max(1, totalMeetingSec)
+    // Fallback if meeting timestamps were missing
+    if (totalMeetingSec <= 0) {
+      totalMeetingSec = finalDuration > 0 ? finalDuration : Math.max(1, finalPresence)
+    }
 
-    // Presence can never exceed the participant's connection time
-    finalPresence = Math.min(finalPresence, totalMeetingSec)
-
-    // Attendance percentage: face-presence / participant-connection-time
-    const participantAttendanceSec = finalPresence
-    const rawPercentage = (participantAttendanceSec / totalMeetingSec) * 100
-    const finalPercentage = Math.max(0, Math.min(100, Number(rawPercentage.toFixed(2))))
-    const finalStatus = finalPercentage >= 75 ? 'Present' : 'Absent'
+    // Calculate attendance using official formula: (Participant Duration / Total Meeting Duration) * 100
+    const {
+      participantDurationSeconds,
+      percentage: finalPercentage,
+      status: finalStatus
+    } = calculateAttendancePercentage(finalPresence, totalMeetingSec)
 
     console.log('[Attendance Backend Write]')
-    console.log(`  presence_seconds=${finalPresence}`)
-    console.log(`  meeting_duration_seconds=${finalDuration}`)
+    console.log(`  presence_seconds=${participantDurationSeconds}`)
+    console.log(`  meeting_duration_seconds=${totalMeetingSec}`)
     console.log(`  totalMeetingSec_used_as_denominator=${totalMeetingSec}`)
     console.log(`  attendance_percentage=${finalPercentage.toFixed(2)}`)
     console.log(`  status=${finalStatus}`)
@@ -2507,41 +2547,46 @@ export const getAttendanceReport = async (req, res) => {
     const rowCount = records?.length || 0
     console.log(`[Attendance] Attendance SELECT returned ${rowCount} rows`)
 
-    // Map records — recalculate percentage using the stored participant connection time
-    // (rec.meeting_duration_seconds) as the denominator, NOT the DB wall-clock meeting time.
-    // This must match the logic in submitAttendance exactly.
+    // Map records — calculate percentage using total meeting duration as denominator:
+    // Attendance Percentage = (Participant Attendance Duration / Total Meeting Duration) * 100
     const mapped = (records || []).map((rec) => {
       const pAttendanceSec = Math.max(0, rec.presence_seconds != null ? Number(rec.presence_seconds) : 0)
       const storedDuration = rec.meeting_duration_seconds != null ? Number(rec.meeting_duration_seconds) : 0
 
-      // Denominator priority: participant's connection time → DB meeting wall-clock → 1 (safety)
-      const denominator = storedDuration > 0 ? storedDuration
-                        : totalMtgSec     > 0 ? totalMtgSec
-                        : 1
+      // Denominator: Total Meeting Duration (totalMtgSec) is primary per formula
+      const denominator = totalMtgSec > 0 ? totalMtgSec
+                        : storedDuration > 0 ? storedDuration
+                        : Math.max(1, pAttendanceSec)
 
-      // Presence can never exceed the denominator used
-      const clampedPresence = Math.min(pAttendanceSec, denominator)
-      const calcPercentage = Math.max(0, Math.min(100, Number(((clampedPresence / denominator) * 100).toFixed(2))))
-      const calcStatus = calcPercentage >= 75 ? 'Present' : 'Absent'
+      const {
+        participantDurationSeconds,
+        percentage: calcPercentage,
+        status: calcStatus,
+        participantDurationFormatted,
+        meetingDurationFormatted
+      } = calculateAttendancePercentage(pAttendanceSec, denominator)
 
       console.log('[Attendance Report Calculation]')
       console.log(`  user_id=${rec.user_id}`)
-      console.log(`  presence_seconds=${pAttendanceSec}`)
-      console.log(`  meeting_duration_seconds=${storedDuration}`)
-      console.log(`  totalMtgSec_fallback=${totalMtgSec}`)
-      console.log(`  denominator_used=${denominator}`)
+      console.log(`  participant_duration_seconds=${participantDurationSeconds}`)
+      console.log(`  total_meeting_duration_seconds=${denominator}`)
       console.log(`  calculated_percentage=${calcPercentage}`)
+      console.log(`  calculated_status=${calcStatus}`)
 
       return {
         id: rec.id,
         meeting_id: rec.meeting_id,
         user_id: rec.user_id,
         participant_name: rec.user?.full_name || 'Anonymous User',
-        meeting_duration_seconds: storedDuration,
-        presence_seconds: clampedPresence,
+        total_meeting_duration_seconds: denominator,
+        meeting_duration_seconds: denominator,
+        participant_duration_seconds: participantDurationSeconds,
+        presence_seconds: participantDurationSeconds,
         attendance_percentage: calcPercentage,
         status: calcStatus,
-        camera_permission: rec.camera_permission
+        camera_permission: rec.camera_permission,
+        participant_duration_formatted: participantDurationFormatted,
+        meeting_duration_formatted: meetingDurationFormatted
       }
     })
 

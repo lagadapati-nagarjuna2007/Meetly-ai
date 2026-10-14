@@ -15,15 +15,19 @@ import {
   Clock,
   AlertTriangle,
   PlayCircle,
-  Download
+  Download,
+  Copy,
+  Check
 } from 'lucide-react'
+import { jsPDF } from 'jspdf'
+import { formatDuration } from '../utils/durationHelper'
 
 export default function Report() {
   const { id } = useParams()
   const [searchParams] = useSearchParams()
   const navigate = useNavigate()
   const { user } = useAuth()
-  const { meetings, fetchMeetingSummary, generateMeetingSummary } = useMeetings()
+  const { meetings, fetchMeetingSummary, generateMeetingSummary, getAttendanceReport } = useMeetings()
   const { showToast } = useToast()
 
   // Find meeting report data (do NOT fall back to meetings[0])
@@ -41,6 +45,12 @@ export default function Report() {
   const [summaryData, setSummaryData] = useState(null)
   const [isLoadingSummary, setIsLoadingSummary] = useState(false)
   const [summaryError, setSummaryError] = useState(null)
+  const [copiedProgramIdx, setCopiedProgramIdx] = useState(null)
+
+  // AI Attendance State
+  const [attendanceRecords, setAttendanceRecords] = useState(null)
+  const [isLoadingAttendance, setIsLoadingAttendance] = useState(false)
+  const [attendanceError, setAttendanceError] = useState(null)
 
   // Screen Recording State
   const [recordingInfo, setRecordingInfo] = useState(null)
@@ -49,6 +59,26 @@ export default function Report() {
   const [isPlayingRecording, setIsPlayingRecording] = useState(false)
   const [isDownloadingRecording, setIsDownloadingRecording] = useState(false)
   const [recordingError, setRecordingError] = useState(null)
+
+  // Fetch real attendance records when attendance tab is active
+  useEffect(() => {
+    const targetMeetingId = meeting?.dbId || id
+    if (activeTab === 'attendance' && targetMeetingId && !attendanceRecords && !isLoadingAttendance) {
+      setIsLoadingAttendance(true)
+      getAttendanceReport(targetMeetingId)
+        .then((data) => {
+          setAttendanceRecords(Array.isArray(data) ? data : [])
+          setAttendanceError(null)
+        })
+        .catch((err) => {
+          console.warn('[Report] Failed to fetch attendance report:', err.message)
+          setAttendanceError(err.message || 'No attendance records found.')
+        })
+        .finally(() => {
+          setIsLoadingAttendance(false)
+        })
+    }
+  }, [activeTab, meeting?.dbId, id, attendanceRecords, isLoadingAttendance, getAttendanceReport])
 
   useEffect(() => {
     if (activeTab === 'summary' && meeting?.dbId && !summaryData && !isLoadingSummary) {
@@ -169,6 +199,147 @@ export default function Report() {
     }
   }
 
+  const handleCopyProgram = (code, idx) => {
+    if (!code) return
+    navigator.clipboard.writeText(code)
+    setCopiedProgramIdx(idx)
+    showToast('Source code copied to clipboard!', 'success')
+    setTimeout(() => {
+      setCopiedProgramIdx(null)
+    }, 2500)
+  }
+
+  const handleDownloadAttendancePDF = () => {
+    const records = attendanceRecords || []
+    if (records.length === 0) {
+      showToast('No attendance records available to export.', 'warning')
+      return
+    }
+    const doc = new jsPDF()
+    const pageHeight = doc.internal.pageSize.height
+    const margin = 20
+    const lineSpacing = 7
+    let cursorY = 20
+
+    // Header
+    doc.setFont('helvetica', 'bold')
+    doc.setFontSize(22)
+    doc.setTextColor(124, 58, 237)
+    doc.text('MEETLY AI', margin, cursorY)
+    cursorY += 10
+
+    doc.setFontSize(14)
+    doc.setTextColor(100, 116, 139)
+    doc.text('AI Attendance Report', margin, cursorY)
+    cursorY += 10
+
+    // Divider Line
+    doc.setDrawColor(226, 232, 240)
+    doc.setLineWidth(0.5)
+    doc.line(margin, cursorY, 210 - margin, cursorY)
+    cursorY += 12
+
+    // Metadata Block
+    doc.setFont('helvetica', 'bold')
+    doc.setFontSize(10)
+    doc.setTextColor(71, 85, 105)
+    doc.text('Meeting Name:', margin, cursorY)
+    doc.setFont('helvetica', 'normal')
+    doc.text(meeting.name || 'Untitled Meeting', margin + 35, cursorY)
+    cursorY += 8
+
+    doc.setFont('helvetica', 'bold')
+    doc.text('Meeting Date:', margin, cursorY)
+    doc.setFont('helvetica', 'normal')
+    doc.text(meeting.date || 'N/A', margin + 35, cursorY)
+    cursorY += 8
+
+    doc.setFont('helvetica', 'bold')
+    doc.text('Meeting Duration:', margin, cursorY)
+    doc.setFont('helvetica', 'normal')
+    doc.text(meeting.duration || 'N/A', margin + 35, cursorY)
+    cursorY += 12
+
+    // Divider Line
+    doc.line(margin, cursorY, 210 - margin, cursorY)
+    cursorY += 12
+
+    // Table Header
+    doc.setFont('helvetica', 'bold')
+    doc.setFontSize(10)
+    doc.setTextColor(15, 23, 42)
+    doc.text('Participant Name', margin, cursorY)
+    doc.text('Participant Duration', margin + 65, cursorY)
+    doc.text('Attendance %', margin + 115, cursorY)
+    doc.text('Status', margin + 155, cursorY)
+    cursorY += 6
+
+    doc.setDrawColor(200, 200, 200)
+    doc.line(margin, cursorY, 210 - margin, cursorY)
+    cursorY += 10
+
+    // Table Rows
+    doc.setFont('helvetica', 'normal')
+    records.forEach((rec) => {
+      if (cursorY + lineSpacing > pageHeight - margin - 20) {
+        doc.addPage()
+        cursorY = margin
+        // Repeat header
+        doc.setFont('helvetica', 'bold')
+        doc.text('Participant Name', margin, cursorY)
+        doc.text('Participant Duration', margin + 65, cursorY)
+        doc.text('Attendance %', margin + 115, cursorY)
+        doc.text('Status', margin + 155, cursorY)
+        cursorY += 6
+        doc.line(margin, cursorY, 210 - margin, cursorY)
+        cursorY += 10
+        doc.setFont('helvetica', 'normal')
+      }
+
+      const participantSec = rec.participant_duration_seconds != null
+        ? rec.participant_duration_seconds
+        : (rec.presence_seconds != null ? rec.presence_seconds : 0)
+      const durationFormatted = rec.participant_duration_formatted || formatDuration(participantSec)
+
+      const isPresent = rec.status === 'Present'
+      doc.setTextColor(51, 65, 85)
+      doc.text(rec.participant_name || 'Anonymous', margin, cursorY)
+      doc.text(durationFormatted, margin + 65, cursorY)
+      const formattedPct = typeof rec.attendance_percentage === 'number'
+        ? (rec.attendance_percentage % 1 === 0 ? `${rec.attendance_percentage}%` : `${Number(rec.attendance_percentage).toFixed(2)}%`)
+        : `${rec.attendance_percentage}%`
+      doc.text(formattedPct, margin + 115, cursorY)
+
+      if (isPresent) {
+        doc.setTextColor(16, 185, 129)
+      } else {
+        doc.setTextColor(239, 68, 68)
+      }
+      doc.text(rec.status, margin + 155, cursorY)
+
+      cursorY += 8
+    })
+
+    doc.setTextColor(51, 65, 85)
+    cursorY += 5
+    if (cursorY + 15 > pageHeight - margin) {
+      doc.addPage()
+      cursorY = margin
+    }
+    doc.setDrawColor(226, 232, 240)
+    doc.line(margin, cursorY, 210 - margin, cursorY)
+    cursorY += 10
+
+    doc.setFont('helvetica', 'italic')
+    doc.setFontSize(9)
+    doc.setTextColor(148, 163, 184)
+    doc.text('Generated by Meetly AI', margin, cursorY)
+
+    const safeTitle = (meeting.name || 'attendance').toLowerCase().replace(/[^a-z0-9]+/g, '_')
+    doc.save(`meetly_attendance_${safeTitle}.pdf`)
+    showToast('AI Attendance Report downloaded successfully.', 'success')
+  }
+
   if (!meeting || !isOwner) {
     return (
       <div className="flex flex-col items-center justify-center py-20 text-center gap-3">
@@ -193,6 +364,12 @@ export default function Report() {
     { id: 'transcript', label: 'Transcript', icon: MessageSquare },
     { id: 'recording', label: 'Recording', icon: Play }
   ]
+
+  // Calculated attendance metrics from real attendance records
+  const attendeeCount = attendanceRecords ? attendanceRecords.length : (meeting.participants?.length || 0)
+  const avgAttendanceRatio = attendanceRecords && attendanceRecords.length > 0
+    ? `${(attendanceRecords.reduce((sum, r) => sum + (Number(r.attendance_percentage) || 0), 0) / attendanceRecords.length).toFixed(1)}%`
+    : (meeting.attendance || 'N/A')
 
   return (
     <div className="flex flex-col gap-6 w-full text-left">
@@ -234,6 +411,28 @@ export default function Report() {
         {/* PANEL: ATTENDANCE */}
         {activeTab === 'attendance' && (
           <div className="flex flex-col gap-6">
+            {/* Header & Export Action */}
+            <div className="flex items-center justify-between pb-3 border-b border-white/5">
+              <div className="flex flex-col">
+                <span className="text-sm font-bold text-white tracking-wide flex items-center gap-2">
+                  <Users size={16} className="text-brand-purple" />
+                  AI Attendance Report
+                </span>
+                <span className="text-[11px] text-gray-500">
+                  Individual participant presence verified against total meeting duration.
+                </span>
+              </div>
+              {attendanceRecords && attendanceRecords.length > 0 && (
+                <button
+                  onClick={handleDownloadAttendancePDF}
+                  className="px-3 py-1.5 bg-emerald-500/20 hover:bg-emerald-500/30 text-emerald-400 border border-emerald-500/30 rounded-xl text-xs font-semibold transition-all cursor-pointer flex items-center gap-1.5"
+                >
+                  <Download size={14} />
+                  <span>Download Attendance PDF</span>
+                </button>
+              )}
+            </div>
+
             {/* Stats row */}
             <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
               <div className="bg-white/2 border border-white/3 p-4.5 rounded-xl flex items-center gap-4">
@@ -242,7 +441,7 @@ export default function Report() {
                 </div>
                 <div className="flex flex-col">
                   <span className="text-[10px] font-bold text-gray-500 uppercase tracking-wide">Total Participants</span>
-                  <span className="text-base font-bold text-white">4 Attendees</span>
+                  <span className="text-base font-bold text-white">{attendeeCount} {attendeeCount === 1 ? 'Attendee' : 'Attendees'}</span>
                 </div>
               </div>
 
@@ -252,7 +451,7 @@ export default function Report() {
                 </div>
                 <div className="flex flex-col">
                   <span className="text-[10px] font-bold text-gray-500 uppercase tracking-wide">Attendance Ratio</span>
-                  <span className="text-base font-bold text-white">{meeting.attendance || '90%'}</span>
+                  <span className="text-base font-bold text-white">{avgAttendanceRatio}</span>
                 </div>
               </div>
 
@@ -261,55 +460,62 @@ export default function Report() {
                   <Clock size={18} />
                 </div>
                 <div className="flex flex-col">
-                  <span className="text-[10px] font-bold text-gray-500 uppercase tracking-wide">Average Duration</span>
-                  <span className="text-base font-bold text-white">{meeting.duration}</span>
+                  <span className="text-[10px] font-bold text-gray-500 uppercase tracking-wide">Meeting Duration</span>
+                  <span className="text-base font-bold text-white">{meeting.duration || 'N/A'}</span>
                 </div>
               </div>
             </div>
 
             {/* Attendance Table */}
             <div className="overflow-x-auto w-full">
-              <table className="w-full text-xs text-left border-collapse">
-                <thead>
-                  <tr className="border-b border-white/5 text-gray-500 font-bold uppercase tracking-wider">
-                    <th className="pb-3 pl-2">Attendee</th>
-                    <th className="pb-3">Join Time</th>
-                    <th className="pb-3">Leave Time</th>
-                    <th className="pb-3">Duration</th>
-                    <th className="pb-3 pr-2">Status</th>
-                  </tr>
-                </thead>
-                <tbody className="divide-y divide-white/2">
-                  <tr className="text-gray-300">
-                    <td className="py-3 pl-2 font-semibold text-white">Nagarjuna Sai</td>
-                    <td className="py-3">10:00 AM</td>
-                    <td className="py-3">11:00 AM</td>
-                    <td className="py-3">60 min</td>
-                    <td className="py-3 text-emerald-400 font-semibold">Present</td>
-                  </tr>
-                  <tr className="text-gray-300">
-                    <td className="py-3 pl-2 font-semibold text-white">Dr. Ravi Kumar</td>
-                    <td className="py-3">10:01 AM</td>
-                    <td className="py-3">11:00 AM</td>
-                    <td className="py-3">59 min</td>
-                    <td className="py-3 text-emerald-400 font-semibold">Present</td>
-                  </tr>
-                  <tr className="text-gray-300">
-                    <td className="py-3 pl-2 font-semibold text-white">Prof. Meena</td>
-                    <td className="py-3">10:03 AM</td>
-                    <td className="py-3">10:58 AM</td>
-                    <td className="py-3">55 min</td>
-                    <td className="py-3 text-emerald-400 font-semibold">Present</td>
-                  </tr>
-                  <tr className="text-gray-300">
-                    <td className="py-3 pl-2 font-semibold text-white">Student B</td>
-                    <td className="py-3">10:14 AM</td>
-                    <td className="py-3">11:00 AM</td>
-                    <td className="py-3">46 min</td>
-                    <td className="py-3 text-amber-400 font-semibold">Late</td>
-                  </tr>
-                </tbody>
-              </table>
+              {isLoadingAttendance ? (
+                <div className="flex flex-col items-center justify-center py-12 gap-3 text-gray-400">
+                  <div className="w-8 h-8 rounded-full border-2 border-brand-purple border-t-transparent animate-spin" />
+                  <span className="text-xs font-semibold">Loading attendance logs...</span>
+                </div>
+              ) : attendanceRecords && attendanceRecords.length > 0 ? (
+                <table className="w-full text-xs text-left border-collapse">
+                  <thead>
+                    <tr className="border-b border-white/5 text-gray-500 font-bold uppercase tracking-wider">
+                      <th className="pb-3 pl-2">Participant Name</th>
+                      <th className="pb-3">Participant Duration</th>
+                      <th className="pb-3">Attendance %</th>
+                      <th className="pb-3 pr-2">Status</th>
+                    </tr>
+                  </thead>
+                  <tbody className="divide-y divide-white/2">
+                    {attendanceRecords.map((rec, idx) => {
+                      const participantSec = rec.participant_duration_seconds != null
+                        ? rec.participant_duration_seconds
+                        : (rec.presence_seconds != null ? rec.presence_seconds : 0)
+                      const durFormatted = rec.participant_duration_formatted || formatDuration(participantSec)
+                      const pctFormatted = typeof rec.attendance_percentage === 'number'
+                        ? (rec.attendance_percentage % 1 === 0 ? `${rec.attendance_percentage}%` : `${Number(rec.attendance_percentage).toFixed(2)}%`)
+                        : `${rec.attendance_percentage}%`
+                      const isPresent = rec.status === 'Present'
+
+                      return (
+                        <tr key={rec.id || idx} className="text-gray-300">
+                          <td className="py-3 pl-2 font-semibold text-white">{rec.participant_name || 'Anonymous User'}</td>
+                          <td className="py-3 font-medium text-purple-300">{durFormatted}</td>
+                          <td className="py-3 font-medium text-gray-300">{pctFormatted}</td>
+                          <td className={`py-3 pr-2 font-semibold ${isPresent ? 'text-emerald-400' : 'text-red-400'}`}>
+                            {rec.status}
+                          </td>
+                        </tr>
+                      )
+                    })}
+                  </tbody>
+                </table>
+              ) : (
+                <div className="flex flex-col items-center justify-center py-12 text-center gap-3 border border-dashed border-white/10 rounded-xl p-6 bg-white/2">
+                  <Users size={28} className="text-gray-500" />
+                  <span className="text-xs font-semibold text-gray-300">No attendance logs available</span>
+                  <p className="text-[11px] text-gray-500 max-w-sm">
+                    {attendanceError || 'No participants submitted AI Attendance verification for this meeting.'}
+                  </p>
+                </div>
+              )}
             </div>
           </div>
         )}
@@ -415,6 +621,18 @@ export default function Report() {
                           : Array.isArray(c.subtypes) ? c.subtypes.map(s => ({ ...s, purpose: s.howAchieved || s.purpose || '', children: [] }))
                           : []
                       }))
+                    : []
+
+                // Programs (Complete Source Code & Code Explanation)
+                const programs = Array.isArray(summaryData?.programs)
+                  ? summaryData.programs.filter(p => p && p.sourceCode && String(p.sourceCode).trim().length > 0)
+                  : (summaryData?.completeSourceCode && typeof summaryData.completeSourceCode === 'string' && summaryData.completeSourceCode.trim().length > 0)
+                    ? [{
+                        title: summaryData.programTitle || 'Complete Program',
+                        language: summaryData.programLanguage || '',
+                        sourceCode: summaryData.completeSourceCode,
+                        explanation: summaryData.codeExplanation || ''
+                      }]
                     : []
 
                 // Recursive node renderer for the UI
@@ -597,10 +815,88 @@ export default function Report() {
                       )}
                     </div>
 
+                    {/* Complete Source Code (only when programming code is present) */}
+                    {programs.length > 0 && (
+                      <div className="flex flex-col gap-4 p-4 bg-white/2 border border-white/5 rounded-2xl">
+                        <div className="flex items-center justify-between">
+                          <h3 className="text-xs font-bold uppercase tracking-wider text-brand-purple">
+                            {meetingType === 'Educational / Lecture' ? '5. Complete Source Code' : 'Complete Source Code'}
+                          </h3>
+                          <span className="text-[10px] text-gray-400 font-medium">
+                            {programs.length} {programs.length === 1 ? 'Program' : 'Programs'}
+                          </span>
+                        </div>
+                        <div className="flex flex-col gap-5">
+                          {programs.map((prog, pIdx) => (
+                            <div key={pIdx} className="flex flex-col gap-2 p-3.5 bg-slate-950/80 border border-white/10 rounded-xl">
+                              <div className="flex items-center justify-between pb-2 border-b border-white/5">
+                                <div className="flex items-center gap-2">
+                                  <span className="text-xs font-bold text-white">
+                                    {programs.length > 1 ? `${pIdx + 1}. ` : ''}{prog.title || 'Complete Program'}
+                                  </span>
+                                  {prog.language && (
+                                    <span className="text-[10px] font-semibold px-2 py-0.5 rounded-full bg-blue-900/40 border border-blue-500/30 text-blue-300 uppercase tracking-wider font-mono">
+                                      {prog.language}
+                                    </span>
+                                  )}
+                                </div>
+                                <button
+                                  onClick={() => handleCopyProgram(prog.sourceCode, pIdx)}
+                                  className="px-2.5 py-1 bg-white/5 hover:bg-white/10 border border-white/10 rounded-lg text-[11px] font-semibold text-gray-300 hover:text-white transition-all flex items-center gap-1.5 cursor-pointer"
+                                  title="Copy complete source code"
+                                >
+                                  {copiedProgramIdx === pIdx ? (
+                                    <>
+                                      <Check size={12} className="text-emerald-400" />
+                                      <span className="text-emerald-400">Copied!</span>
+                                    </>
+                                  ) : (
+                                    <>
+                                      <Copy size={12} />
+                                      <span>Copy Code</span>
+                                    </>
+                                  )}
+                                </button>
+                              </div>
+                              <pre className="text-[11px] p-3 overflow-x-auto text-green-300 font-mono leading-relaxed whitespace-pre selection:bg-purple-900/50">
+                                <code>{prog.sourceCode}</code>
+                              </pre>
+                            </div>
+                          ))}
+                        </div>
+                      </div>
+                    )}
+
+                    {/* Code Explanation (immediately follows Complete Source Code) */}
+                    {programs.length > 0 && programs.some(p => p.explanation && p.explanation.trim()) && (
+                      <div className="flex flex-col gap-4 p-4 bg-white/2 border border-white/5 rounded-2xl">
+                        <h3 className="text-xs font-bold uppercase tracking-wider text-brand-purple">
+                          {meetingType === 'Educational / Lecture' ? '6. Code Explanation' : 'Code Explanation'}
+                        </h3>
+                        <div className="flex flex-col gap-4">
+                          {programs.map((prog, pIdx) => {
+                            if (!prog.explanation || !prog.explanation.trim()) return null
+                            return (
+                              <div key={pIdx} className="flex flex-col gap-2 pl-3 border-l-2 border-brand-purple/50">
+                                {programs.length > 1 && (
+                                  <span className="text-xs font-bold text-purple-300">
+                                    Explanation for: {prog.title || `Program ${pIdx + 1}`}
+                                  </span>
+                                )}
+                                <p className="text-gray-200 text-xs leading-relaxed whitespace-pre-line font-medium">
+                                  {prog.explanation}
+                                </p>
+                              </div>
+                            )
+                          })}
+                        </div>
+                      </div>
+                    )}
+
                     {/* Decisions Made */}
                     <div className="flex flex-col gap-3 p-4 bg-white/2 border border-white/5 rounded-2xl">
                       <h3 className="text-xs font-bold uppercase tracking-wider text-brand-purple">
-                        {meetingType === 'Educational / Lecture' ? '5. Decisions Made' : '4. Decisions Made'}
+                        {meetingType === 'Educational / Lecture' ? (programs.length > 0 ? '7. Decisions Made' : '5. Decisions Made') : '4. Decisions Made'}
                       </h3>
                       {decisions.length === 0 ? (
                         <p className="text-gray-400 italic">None identified.</p>
@@ -619,7 +915,7 @@ export default function Report() {
                     {/* Action Items */}
                     <div className="flex flex-col gap-3 p-4 bg-white/2 border border-white/5 rounded-2xl">
                       <h3 className="text-xs font-bold uppercase tracking-wider text-brand-purple">
-                        {meetingType === 'Educational / Lecture' ? '6. Action Items' : '5. Action Items'}
+                        {meetingType === 'Educational / Lecture' ? (programs.length > 0 ? '8. Action Items' : '6. Action Items') : '5. Action Items'}
                       </h3>
                       {actions.length === 0 ? (
                         <p className="text-gray-400 italic">None identified.</p>

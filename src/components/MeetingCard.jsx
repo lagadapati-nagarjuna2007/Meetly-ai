@@ -6,6 +6,7 @@ import { useToast } from './Toast'
 import Modal from './Modal'
 import Button from './Button'
 import { jsPDF } from 'jspdf'
+import { formatDuration } from '../utils/durationHelper'
 
 export default function MeetingCard({ meeting, index = 0, onDeleted }) {
   const navigate = useNavigate()
@@ -547,6 +548,69 @@ export default function MeetingCard({ meeting, index = 0, onDeleted }) {
           bulletList(keyPoints)
         }
 
+        // Complete Source Code & Code Explanation (at the end of lecture notes)
+        const programs = Array.isArray(summaryData.programs)
+          ? summaryData.programs.filter(p => p && p.sourceCode && String(p.sourceCode).trim().length > 0)
+          : (summaryData.completeSourceCode && typeof summaryData.completeSourceCode === 'string' && summaryData.completeSourceCode.trim().length > 0)
+            ? [{
+                title: summaryData.programTitle || 'Complete Program',
+                language: summaryData.programLanguage || '',
+                sourceCode: summaryData.completeSourceCode,
+                explanation: summaryData.codeExplanation || ''
+              }]
+            : []
+
+        if (programs.length > 0) {
+          let sectionNum = keyPoints.length > 0 ? 5 : 4
+
+          // 1. COMPLETE SOURCE CODE
+          need(16)
+          sectionHeading(String(sectionNum), 'Complete Source Code')
+          Y += 2
+
+          programs.forEach((prog, pIdx) => {
+            const progTitle = prog.title || (programs.length > 1 ? `Program ${pIdx + 1}` : 'Complete Program')
+            const langSuffix = prog.language ? ` (${prog.language})` : ''
+            need(12)
+            doc.setFont('helvetica', 'bold')
+            doc.setFontSize(10)
+            doc.setTextColor(15, 23, 42)
+            const itemLabel = programs.length > 1 ? `${sectionNum}.${pIdx + 1} ` : ''
+            doc.text(`${itemLabel}${sanitize(progTitle)}${langSuffix}`, margin, Y)
+            Y += 5
+            doc.setFont('helvetica', 'normal')
+
+            // Render complete executable code with indentation and multi-page preservation
+            codeBlock(prog.sourceCode)
+            Y += 4
+          })
+
+          // 2. CODE EXPLANATION (immediately follows Complete Source Code)
+          sectionNum++
+          need(16)
+          sectionHeading(String(sectionNum), 'Code Explanation')
+          Y += 2
+
+          programs.forEach((prog, pIdx) => {
+            if (prog.explanation && String(prog.explanation).trim().length > 0) {
+              const progTitle = prog.title || (programs.length > 1 ? `Program ${pIdx + 1}` : 'Complete Program')
+              if (programs.length > 1) {
+                need(10)
+                doc.setFont('helvetica', 'bold')
+                doc.setFontSize(9.5)
+                doc.setTextColor(71, 85, 105)
+                doc.text(`Explanation for ${sanitize(progTitle)}:`, margin + 2, Y)
+                Y += 5
+              }
+              doc.setFont('helvetica', 'normal')
+              doc.setFontSize(9.5)
+              doc.setTextColor(51, 65, 85)
+              printWrapped(sanitize(prog.explanation), margin + 2, Y, contentW - 4, 5.2)
+              Y += 4
+            }
+          })
+        }
+
       // ═══════════════════════════════════════════════════════════════════════
       // TECHNICAL / DEVELOPMENT
       // ═══════════════════════════════════════════════════════════════════════
@@ -853,9 +917,9 @@ export default function MeetingCard({ meeting, index = 0, onDeleted }) {
       cursorY += 8
 
       doc.setFont('helvetica', 'bold')
-      doc.text('Duration:', margin, cursorY)
+      doc.text('Meeting Duration:', margin, cursorY)
       doc.setFont('helvetica', 'normal')
-      doc.text(meeting.duration || 'N/A', margin + 30, cursorY)
+      doc.text(meeting.duration || 'N/A', margin + 35, cursorY)
       cursorY += 12
 
       // Divider Line
@@ -867,9 +931,9 @@ export default function MeetingCard({ meeting, index = 0, onDeleted }) {
       doc.setFontSize(10)
       doc.setTextColor(15, 23, 42)
       doc.text('Participant Name', margin, cursorY)
-      doc.text('Meeting Duration', margin + 60, cursorY)
-      doc.text('Attendance %', margin + 110, cursorY)
-      doc.text('Status', margin + 145, cursorY)
+      doc.text('Participant Duration', margin + 65, cursorY)
+      doc.text('Attendance %', margin + 115, cursorY)
+      doc.text('Status', margin + 155, cursorY)
       cursorY += 6
 
       doc.setDrawColor(200, 200, 200)
@@ -885,23 +949,24 @@ export default function MeetingCard({ meeting, index = 0, onDeleted }) {
           // Repeat header
           doc.setFont('helvetica', 'bold')
           doc.text('Participant Name', margin, cursorY)
-          doc.text('Meeting Duration', margin + 60, cursorY)
-          doc.text('Attendance %', margin + 110, cursorY)
-          doc.text('Status', margin + 145, cursorY)
+          doc.text('Participant Duration', margin + 65, cursorY)
+          doc.text('Attendance %', margin + 115, cursorY)
+          doc.text('Status', margin + 155, cursorY)
           cursorY += 6
           doc.line(margin, cursorY, 210 - margin, cursorY)
           cursorY += 10
           doc.setFont('helvetica', 'normal')
         }
 
-        const durationFormatted = rec.meeting_duration_seconds >= 60 
-          ? `${Math.floor(rec.meeting_duration_seconds / 60)}m ${rec.meeting_duration_seconds % 60}s`
-          : `${rec.meeting_duration_seconds}s`
+        const participantSec = rec.participant_duration_seconds != null
+          ? rec.participant_duration_seconds
+          : (rec.presence_seconds != null ? rec.presence_seconds : 0)
+        const durationFormatted = rec.participant_duration_formatted || formatDuration(participantSec)
 
         console.log('[Attendance PDF Data]')
         console.log(`  participant=${rec.participant_name}`)
-        console.log(`  presence_seconds=${rec.presence_seconds}`)
-        console.log(`  meeting_duration_seconds=${rec.meeting_duration_seconds}`)
+        console.log(`  participant_duration_seconds=${participantSec}`)
+        console.log(`  durationFormatted=${durationFormatted}`)
         console.log(`  attendance_percentage=${rec.attendance_percentage}`)
         console.log(`  status=${rec.status}`)
 
@@ -909,18 +974,18 @@ export default function MeetingCard({ meeting, index = 0, onDeleted }) {
         const isPresent = rec.status === 'Present'
         doc.setTextColor(51, 65, 85) // Reset color to slate-700
         doc.text(rec.participant_name || 'Anonymous', margin, cursorY)
-        doc.text(durationFormatted, margin + 60, cursorY)
+        doc.text(durationFormatted, margin + 65, cursorY)
         const formattedPct = typeof rec.attendance_percentage === 'number'
           ? (rec.attendance_percentage % 1 === 0 ? `${rec.attendance_percentage}%` : `${Number(rec.attendance_percentage).toFixed(2)}%`)
           : `${rec.attendance_percentage}%`
-        doc.text(formattedPct, margin + 110, cursorY)
+        doc.text(formattedPct, margin + 115, cursorY)
         
         if (isPresent) {
           doc.setTextColor(16, 185, 129) // emerald-500 #10b981
         } else {
           doc.setTextColor(239, 68, 68) // red-500 #ef4444
         }
-        doc.text(rec.status, margin + 145, cursorY)
+        doc.text(rec.status, margin + 155, cursorY)
         
         cursorY += 8
       })

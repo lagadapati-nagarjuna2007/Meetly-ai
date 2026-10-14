@@ -16,6 +16,7 @@ export default function ParticipantVideoTile({
   participant,
   localParticipant,
   user,
+  localCamActive,
   camInitializing = false,
   camError = null,
   onRetryCam,
@@ -205,7 +206,9 @@ export default function ParticipantVideoTile({
     ? (user?.name || user?.full_name || participant?.name || 'You')
     : (participant?.name || 'Participant')
 
-  const isCameraEnabled = Boolean(participant?.isCameraEnabled)
+  const isCameraEnabled = isCurrentUser && typeof localCamActive === 'boolean'
+    ? Boolean(localCamActive && participant?.isCameraEnabled)
+    : Boolean(participant?.isCameraEnabled)
 
   return (
     <div
