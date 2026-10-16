@@ -50,7 +50,7 @@ const AIChatPanel = ({ meetingId }) => {
             <Sparkles size={11} className="animate-pulse" />
           </div>
           <span className="text-[10px] font-bold text-gray-400 uppercase tracking-wider">
-            Questions Remaining: {remainingQuestions} / 10
+            QUESTIONS REMAINING: {remainingQuestions} / 10
           </span>
         </div>
       </div>
@@ -100,21 +100,18 @@ const AIChatPanel = ({ meetingId }) => {
 
       {/* Input Area */}
       <div className="border-t border-white/5 pt-2 mt-2 bg-[#080913]">
-        {isLimitReached ? (
-          <div className="text-center p-3 rounded-xl bg-red-600/10 border border-red-500/20 text-[10px] font-bold text-red-400 uppercase tracking-wider leading-relaxed">
-            AI Assistant limit reached.
-            <br />
-            You have already used your 10 questions for this meeting.
+        {isLimitReached && (
+          <div className="text-center p-2.5 mb-2 rounded-xl bg-red-600/10 border border-red-500/20 text-[10px] font-bold text-red-400 uppercase tracking-wider leading-relaxed">
+            You have used all 10 AI Assistant questions for this meeting.
           </div>
-        ) : (
-          <ChatInput
-            value={inputVal}
-            onChange={(e) => setInputVal(e.target.value)}
-            onSend={handleSend}
-            disabled={isLoading || isLimitReached}
-            placeholder={isLoading ? 'AI is thinking...' : 'Ask anything...'}
-          />
         )}
+        <ChatInput
+          value={inputVal}
+          onChange={(e) => setInputVal(e.target.value)}
+          onSend={handleSend}
+          disabled={isLoading || isLimitReached}
+          placeholder={isLimitReached ? 'Limit reached (0 / 10 remaining)' : (isLoading ? 'AI is thinking...' : 'Ask anything...')}
+        />
       </div>
     </div>
   )

@@ -142,11 +142,12 @@ const useAIChat = () => {
 
       if (!chatRes.ok) {
         if (chatRes.status === 429) {
-          setError('AI Assistant limit reached. You have already used your 10 questions for this meeting.')
+          const limitMsg = chatData.message || 'You have used all 10 AI Assistant questions for this meeting.'
+          setError(limitMsg)
           setRemainingQuestions(0)
           const aiResponse = {
             sender: 'ai',
-            text: 'AI Assistant limit reached. You have already used your 10 questions for this meeting.',
+            text: limitMsg,
             timestamp: new Date().toLocaleTimeString('en-US', { hour: '2-digit', minute: '2-digit' })
           }
           setMessages((prev) => [...prev, aiResponse])
@@ -163,7 +164,7 @@ const useAIChat = () => {
       }
 
       setMessages((prev) => [...prev, aiResponse])
-      setRemainingQuestions(chatData.remainingQuestions ?? 10)
+      setRemainingQuestions(chatData.remainingQuestions ?? 0)
     } catch (err) {
       console.error('[AI Chat Error]:', err)
       const friendlyMessage = err.message || 'Friendly error. Connection issues or invalid API configuration.'

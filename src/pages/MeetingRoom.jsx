@@ -3986,7 +3986,7 @@ function MeetingRoomContent({
 
               {/* TAB: AI ASSISTANT */}
               {activeTab === 'ai' && (
-                <AIChatPanel meetingId={meetingData.meeting_id} />
+                <AIChatPanel meetingId={meetingData?.meeting_id} />
               )}
             </div>
           </div>

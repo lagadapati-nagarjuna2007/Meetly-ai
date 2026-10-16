@@ -2,7 +2,7 @@ import crypto from 'crypto'
 import bcrypt from 'bcrypt'
 import { AccessToken } from 'livekit-server-sdk'
 import { supabase } from '../config/supabase.js'
-import { clearMeetingCounters } from '../services/aiChat.service.js'
+import { clearMeetingCounters, cleanupLingeringQuotas } from '../services/aiChat.service.js'
 import { clearMeetingChat } from '../services/meetingChatService.js'
 import { scheduleCleanup, cancelCleanup } from '../services/meetingCleanup.js'
 import { authorizeHost } from '../utils/authHelper.js'
@@ -796,7 +796,7 @@ Stack/Caller: endMeeting inside meetingController.js
       console.log(`[Audit Log] Action: Meeting Ended | Timestamp: ${now} | MeetingCode: ${meeting.meeting_code} | HostId: ${req.user.id}`)
     }
 
-    clearMeetingCounters(meeting.meeting_id)
+    await clearMeetingCounters(meeting.meeting_id)
     if (meeting.room_name) {
       clearMeetingChat(meeting.room_name)
     }
@@ -1029,7 +1029,7 @@ export const deleteMeeting = async (req, res) => {
             })
         }
 
-        clearMeetingCounters(meeting.meeting_id)
+        await clearMeetingCounters(meeting.meeting_id)
         if (meeting.room_name) {
           clearMeetingChat(meeting.room_name)
           const io = req.app.get('io')
@@ -1071,7 +1071,7 @@ export const deleteMeeting = async (req, res) => {
 
     if (deleteMtgErr) throw deleteMtgErr
 
-    clearMeetingCounters(meeting.meeting_id)
+    await clearMeetingCounters(meeting.meeting_id)
     if (meeting.room_name) {
       clearMeetingChat(meeting.room_name)
       const io = req.app.get('io')
@@ -2316,7 +2316,8 @@ export const startRetentionCleanup = () => {
             console.error('[Cleanup Job Error] Failed to hard delete expired meetings:', deleteErr)
           } else {
             console.log('[Cleanup Job] Hard deleted expired meetings and their cascading records successfully.')
-            expiredIds.forEach(id => clearMeetingCounters(id))
+            await Promise.all(expiredIds.map(id => clearMeetingCounters(id)))
+            await cleanupLingeringQuotas()
           }
         } else {
           console.log('[Cleanup Job] All expired meetings are protected by active or retained recordings.')

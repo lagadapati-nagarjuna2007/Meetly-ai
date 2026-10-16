@@ -1,6 +1,9 @@
 import { supabase } from '../config/supabase.js'
 import {
   getRemainingRequests,
+  reserveQuestionQuota,
+  releaseQuestionQuota,
+  completeQuestionReservation,
   incrementRequestCounter,
   getAIChatResponse
 } from '../services/aiChat.service.js'
@@ -29,8 +32,8 @@ export const handleAIChatRequest = async (req, res) => {
 
     // 1. Verify the meeting exists
     const query = isUuid(meetingId)
-      ? supabase.from('meetings').select('meeting_id, host_id, meeting_status').eq('meeting_id', meetingId)
-      : supabase.from('meetings').select('meeting_id, host_id, meeting_status').eq('meeting_code', meetingId.trim().toUpperCase())
+      ? supabase.from('meetings').select('meeting_id, host_id, meeting_status, is_deleted').eq('meeting_id', meetingId)
+      : supabase.from('meetings').select('meeting_id, host_id, meeting_status, is_deleted').eq('meeting_code', meetingId.trim().toUpperCase())
 
     const { data: meeting, error: mtgErr } = await query.maybeSingle()
 
@@ -39,7 +42,7 @@ export const handleAIChatRequest = async (req, res) => {
       return res.status(404).json({ success: false, message: 'Meeting not found.' })
     }
 
-    if (meeting.meeting_status === 'Ended') {
+    if (meeting.meeting_status === 'Ended' || meeting.is_deleted === true) {
       console.log('[Meeting Validation] Ignoring request because meeting has ended.')
       return res.status(400).json({ success: false, message: 'This meeting has already ended.' })
     }
@@ -68,32 +71,46 @@ export const handleAIChatRequest = async (req, res) => {
       return res.status(403).json({ success: false, message: 'Access denied. You do not belong to this meeting.' })
     }
 
-    // 3. Check remaining requests
-    const remaining = getRemainingRequests(targetMeetingId, req.user.id)
-    if (remaining <= 0) {
+    // 3. Atomically check and reserve one question from the participant's quota BEFORE calling AI provider
+    const reservation = await reserveQuestionQuota(targetMeetingId, req.user.id, req.user.email)
+    if (!reservation.allowed) {
       return res.status(429).json({
         success: false,
-        message: 'You have reached the maximum of 10 AI questions for this meeting.'
+        message: reservation.message || 'You have used all 10 AI Assistant questions for this meeting.',
+        remainingQuestions: 0,
+        questionsUsed: reservation.questionsUsed ?? 10
       })
     }
 
-    // 4. Check if transcript is missing
+    // 4. Check if transcript is missing; if missing, refund reserved question
     if (!transcript || transcript.trim() === '') {
+      await releaseQuestionQuota(targetMeetingId, req.user.id, reservation.reservationId)
       return res.status(400).json({ success: false, message: 'Transcript not available yet.' })
     }
 
     // 5. Call LLM Service
-    const answer = await getAIChatResponse(transcript, question)
-
-    // 6. Only increment counter after a successful response
-    incrementRequestCounter(targetMeetingId, req.user.id)
-
-    const updatedRemaining = getRemainingRequests(targetMeetingId, req.user.id)
+    let answer
+    try {
+      answer = await getAIChatResponse(transcript, question)
+      // Settle reservation as completed on confirmed success so it cannot be refunded
+      if (reservation.reservationId) {
+        await completeQuestionReservation(targetMeetingId, req.user.id, reservation.reservationId)
+      }
+    } catch (providerErr) {
+      console.error('[AI Chat Provider Error]:', providerErr.message)
+      // Idempotently release reservation on confirmed provider failure
+      await releaseQuestionQuota(targetMeetingId, req.user.id, reservation.reservationId)
+      return res.status(500).json({
+        success: false,
+        message: providerErr.message || 'An error occurred with the AI model provider. Please try again.'
+      })
+    }
 
     return res.status(200).json({
       success: true,
       answer,
-      remainingQuestions: updatedRemaining
+      remainingQuestions: reservation.remainingQuestions,
+      questionsUsed: reservation.questionsUsed
     })
   } catch (err) {
     console.error('[AI Chat Controller Error]:', err)
@@ -117,19 +134,31 @@ export const handleGetRemainingRequests = async (req, res) => {
     }
 
     const query = isUuid(meetingId)
-      ? supabase.from('meetings').select('meeting_id').eq('meeting_id', meetingId)
-      : supabase.from('meetings').select('meeting_id').eq('meeting_code', meetingId.trim().toUpperCase())
+      ? supabase.from('meetings').select('meeting_id, meeting_status, is_deleted').eq('meeting_id', meetingId)
+      : supabase.from('meetings').select('meeting_id, meeting_status, is_deleted').eq('meeting_code', meetingId.trim().toUpperCase())
 
     const { data: meeting, error: mtgErr } = await query.maybeSingle()
     if (mtgErr) throw mtgErr
     if (!meeting) {
-      return res.status(404).json({ success: false, message: 'Meeting not found.' })
+      return res.status(404).json({ success: false, message: 'Meeting not found.', remainingQuestions: 0 })
     }
 
-    const remaining = getRemainingRequests(meeting.meeting_id, req.user.id)
+    if (meeting.meeting_status === 'Ended' || meeting.is_deleted === true) {
+      return res.status(200).json({
+        success: true,
+        remainingQuestions: 0,
+        questionsUsed: 10,
+        maxQuestions: 10,
+        meetingEnded: true
+      })
+    }
+
+    const remaining = await getRemainingRequests(meeting.meeting_id, req.user.id)
     return res.status(200).json({
       success: true,
-      remainingQuestions: remaining
+      remainingQuestions: remaining,
+      questionsUsed: Math.max(0, 10 - remaining),
+      maxQuestions: 10
     })
   } catch (err) {
     console.error('[AI Chat Get Remaining Error]:', err)

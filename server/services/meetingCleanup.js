@@ -82,7 +82,7 @@ Stack/Caller: setTimeout inside meetingCleanup.js
         }
 
         // 3. Clear meeting counters
-        clearMeetingCounters(meetingId)
+        await clearMeetingCounters(meetingId)
 
         // 4. Purge in-memory meeting chat state
         const targetRoomName = roomName || mtgData?.room_name
