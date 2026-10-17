@@ -406,23 +406,46 @@ export const joinMeeting = async (req, res) => {
       return res.status(400).json({ message: 'Meeting is locked by the host.' })
     }
 
-    // Step 0: Check Device Ban
-    if (fingerprint) {
-      const { data: banRecord, error: banCheckErr } = await supabase
-        .from('meeting_device_bans')
-        .select('*')
-        .eq('meeting_code', uppercaseCode)
-        .eq('device_fingerprint', fingerprint)
-        .maybeSingle()
+    // Validate browser fingerprint format
+    const isValidFingerprint = typeof fingerprint === 'string' && /^[a-zA-Z0-9_-]{8,64}$/.test(fingerprint)
+    if (!isValidFingerprint) {
+      return res.status(400).json({
+        success: false,
+        message: 'A valid browser device fingerprint is required to join this meeting.'
+      })
+    }
 
-      if (banCheckErr) throw banCheckErr
-      if (banRecord) {
-        console.log(`[Security] Join rejected. Device is banned. fingerprint: ${fingerprint}`)
-        return res.status(403).json({
-          success: false,
-          message: 'This device has been blocked by the meeting host.'
-        })
-      }
+    // Step 0: Check Device Ban
+    const { data: banRecord, error: banCheckErr } = await supabase
+      .from('meeting_device_bans')
+      .select('id, blocked_at')
+      .eq('meeting_code', uppercaseCode)
+      .eq('device_fingerprint', fingerprint)
+      .maybeSingle()
+
+    if (banCheckErr) throw banCheckErr
+    if (banRecord) {
+      console.log(`[Security] Join rejected. Device is banned. fingerprint: ${fingerprint}`)
+      return res.status(403).json({
+        success: false,
+        message: 'This device has been blocked by the meeting host.'
+      })
+    }
+
+    // Step 0.5: Verify user has not been previously removed/banned from this meeting
+    const { data: existingParticipantRecord } = await supabase
+      .from('participants')
+      .select('participant_status')
+      .eq('meeting_id', meeting.meeting_id)
+      .eq('user_id', req.user.id)
+      .maybeSingle()
+
+    if (existingParticipantRecord && existingParticipantRecord.participant_status === 'removed') {
+      console.log(`[Security] Join rejected. User ${req.user.id} has status 'removed' for meeting ${meeting.meeting_id}`)
+      return res.status(403).json({
+        success: false,
+        message: 'You have been removed from this meeting by the host.'
+      })
     }
 
     // Step 1: Clean up stale state before checking

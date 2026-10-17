@@ -471,7 +471,7 @@ io.on('connection', (socket) => {
     // Cancel pending cleanup for this room and verify chat restoration
     supabase
       .from('meetings')
-      .select('meeting_id, host_id, assigned_host_id, active_host_id, meeting_status, is_deleted, room_name')
+      .select('meeting_id, meeting_code, host_id, assigned_host_id, active_host_id, meeting_status, is_deleted, room_name')
       .eq('room_name', roomName)
       .maybeSingle()
       .then(async ({ data: meeting, error: mtgErr }) => {
@@ -489,17 +489,39 @@ io.on('connection', (socket) => {
 
         cancelCleanup(meeting.meeting_id)
 
-        // Verify participant membership and restore authorized in-memory chat history
+        // Verify participant membership, ban status, and restore authorized in-memory chat history
         if (joinedUserId) {
           const isHost = isUserHostOrCoHost(meeting, joinedUserId)
           let isMember = isHost
-          if (!isMember) {
+          if (!isHost) {
             const { data: partRow } = await supabase
               .from('participants')
-              .select('participant_id, participant_status')
+              .select('participant_id, participant_status, device_fingerprint')
               .eq('meeting_id', meeting.meeting_id)
               .eq('user_id', joinedUserId)
               .maybeSingle()
+
+            let isBanned = partRow?.participant_status === 'removed'
+
+            if (!isBanned && partRow?.device_fingerprint && meeting.meeting_code) {
+              const { data: banRow } = await supabase
+                .from('meeting_device_bans')
+                .select('id')
+                .eq('meeting_code', meeting.meeting_code)
+                .eq('device_fingerprint', partRow.device_fingerprint)
+                .maybeSingle()
+              if (banRow) isBanned = true
+            }
+
+            if (isBanned) {
+              console.log(`[Security Socket] Banned/removed participant ${joinedUserId} attempted to join room ${roomName}. Rejecting.`)
+              socket.leave(roomName)
+              removeSocketPresence(roomName, joinedUserId, socket.id)
+              socket.emit('participant_banned', { userId: joinedUserId })
+              if (typeof callback === 'function') callback({ success: false, error: 'This device has been blocked by the meeting host.' })
+              return
+            }
+
             if (partRow && ['joined', 'active', 'disconnected'].includes(partRow.participant_status)) {
               isMember = true
             }

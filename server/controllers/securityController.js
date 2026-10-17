@@ -26,6 +26,19 @@ const isUuid = (val) => {
 }
 
 /**
+ * Helper to get LiveKit RoomServiceClient if environment variables exist
+ */
+export const getRoomServiceClient = () => {
+  const apiKey = process.env.LIVEKIT_API_KEY
+  const apiSecret = process.env.LIVEKIT_API_SECRET
+  const livekitUrl = process.env.LIVEKIT_URL
+  if (!apiKey || !apiSecret || !livekitUrl) return null
+  const httpUrl = livekitUrl.replace(/^wss:/, 'https:').replace(/^ws:/, 'http:')
+  return new RoomServiceClient(httpUrl, apiKey, apiSecret)
+}
+
+
+/**
  * GET /api/meetings/security/pending/:meetingCode
  * Fetch list of pending join requests (host only)
  */
@@ -182,6 +195,24 @@ export const acceptJoinRequest = async (req, res) => {
         code: 'TRANSACTION_FAILED',
         message: txErr.message || 'Database transaction failed.'
       })
+    }
+
+    // 2.5. Verify the participant's device is not currently banned
+    if (fingerprint) {
+      const { data: bannedRow } = await supabase
+        .from('meeting_device_bans')
+        .select('id')
+        .eq('meeting_code', uppercaseCode)
+        .eq('device_fingerprint', fingerprint)
+        .maybeSingle()
+
+      if (bannedRow) {
+        return res.status(403).json({
+          success: false,
+          code: 'FORBIDDEN',
+          message: 'Cannot admit participant: this device is banned from the meeting.'
+        })
+      }
     }
 
     // 3. Fetch user record to issue LiveKit token
@@ -401,6 +432,30 @@ export const banDevice = async (req, res) => {
       .eq('meeting_id', meeting.meeting_id)
       .eq('user_id', userId)
 
+    // 2.6. Evict the participant server-side from LiveKit room
+    try {
+      const { data: targetUser } = await supabase
+        .from('users')
+        .select('email')
+        .eq('id', userId)
+        .maybeSingle()
+
+      const roomService = getRoomServiceClient()
+      if (roomService && meeting.room_name) {
+        const identities = Array.from(new Set([targetUser?.email, userId].filter(Boolean)))
+        for (const identity of identities) {
+          try {
+            await roomService.removeParticipant(meeting.room_name, identity)
+            console.log(`[Security] Successfully removed participant ${identity} from LiveKit room ${meeting.room_name}`)
+          } catch (lkErr) {
+            console.warn(`[Security] LiveKit removeParticipant notice for ${identity}: ${lkErr.message}`)
+          }
+        }
+      }
+    } catch (evictErr) {
+      console.warn(`[Security] Error during server-side LiveKit eviction: ${evictErr.message}`)
+    }
+
     // 3. Emit Socket.IO events (Post-Commit)
     const io = req.app.get('io')
     if (io) {
@@ -566,6 +621,30 @@ export const removeParticipant = async (req, res) => {
       if (updateErr) throw updateErr
     }
 
+    // 2.5. Evict the participant server-side from LiveKit room
+    try {
+      const { data: targetUser } = await supabase
+        .from('users')
+        .select('email')
+        .eq('id', userId)
+        .maybeSingle()
+
+      const roomService = getRoomServiceClient()
+      if (roomService && meeting.room_name) {
+        const identities = Array.from(new Set([targetUser?.email, userId].filter(Boolean)))
+        for (const identity of identities) {
+          try {
+            await roomService.removeParticipant(meeting.room_name, identity)
+            console.log(`[Security] Removed participant ${identity} from LiveKit room ${meeting.room_name}`)
+          } catch (lkErr) {
+            console.warn(`[Security] LiveKit removeParticipant notice for ${identity}: ${lkErr.message}`)
+          }
+        }
+      }
+    } catch (evictErr) {
+      console.warn(`[Security] Error during server-side LiveKit eviction: ${evictErr.message}`)
+    }
+
     // 3. Emit Socket.IO event (Post-Commit)
     const io = req.app.get('io')
     if (io) {
@@ -589,18 +668,6 @@ export const removeParticipant = async (req, res) => {
       message: 'Server error removing participant.'
     })
   }
-}
-
-/**
- * Helper to get LiveKit RoomServiceClient if environment variables exist
- */
-const getRoomServiceClient = () => {
-  const apiKey = process.env.LIVEKIT_API_KEY
-  const apiSecret = process.env.LIVEKIT_API_SECRET
-  const livekitUrl = process.env.LIVEKIT_URL
-  if (!apiKey || !apiSecret || !livekitUrl) return null
-  const httpUrl = livekitUrl.replace(/^wss:/, 'https:').replace(/^ws:/, 'http:')
-  return new RoomServiceClient(httpUrl, apiKey, apiSecret)
 }
 
 /**
