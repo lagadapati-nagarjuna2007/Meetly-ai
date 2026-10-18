@@ -3,6 +3,7 @@ import bcrypt from 'bcrypt'
 import jwt from 'jsonwebtoken'
 import { supabase } from '../config/supabase.js'
 import { sendOtpEmail } from '../services/emailService.js'
+import { checkLockout, recordFailedLogin, resetLockout, normalizeEmail } from '../services/authLockout.service.js'
 
 const JWT_EXPIRATION = 24 * 60 * 60 * 1000 // 24 hours in milliseconds
 
@@ -229,28 +230,74 @@ export const login = async (req, res) => {
       return res.status(400).json({ message: 'Email and password are required.' })
     }
 
-    const emailLower = email.toLowerCase()
+    const emailNorm = normalizeEmail(email)
 
-    // Find user
+    // 1. Check progressive lockout BEFORE password verification or user lookup
+    const lockoutStatus = await checkLockout(emailNorm)
+
+    // Fail closed: reject login if lockout verification failed
+    if (lockoutStatus.isVerified === false) {
+      console.warn(`[AUTH SECURITY] Lockout status could not be verified for ${emailNorm}. Refusing login.`)
+      return res.status(503).json({
+        message: 'Authentication service temporarily unavailable. Please try again later.'
+      })
+    }
+
+    if (lockoutStatus.isLocked) {
+      const remainingMinutes = Math.max(1, Math.ceil(lockoutStatus.remainingSeconds / 60))
+      res.setHeader('Retry-After', lockoutStatus.remainingSeconds)
+      return res.status(429).json({
+        message: `Too many failed login attempts. Account is temporarily locked. Please try again in ${remainingMinutes} minute${remainingMinutes === 1 ? '' : 's'}.`,
+        retryAfter: lockoutStatus.remainingSeconds,
+        lockedUntil: lockoutStatus.lockedUntil
+      })
+    }
+
+    // 2. Find user
     const { data: user, error: fetchErr } = await supabase
       .from('users')
       .select('*')
-      .eq('email', emailLower)
+      .eq('email', emailNorm)
       .maybeSingle()
 
     if (fetchErr) throw fetchErr
 
     if (!user) {
+      // Record failed attempt against normalized email (treats non-existent emails identically)
+      const failResult = await recordFailedLogin(emailNorm)
+      if (failResult.isLocked) {
+        const remainingMinutes = Math.max(1, Math.ceil(failResult.remainingSeconds / 60))
+        res.setHeader('Retry-After', failResult.remainingSeconds)
+        return res.status(429).json({
+          message: `Too many failed login attempts. Account is temporarily locked. Please try again in ${remainingMinutes} minute${remainingMinutes === 1 ? '' : 's'}.`,
+          retryAfter: failResult.remainingSeconds,
+          lockedUntil: failResult.lockedUntil
+        })
+      }
       return res.status(400).json({ message: 'Invalid Email or Password' })
     }
 
-    // Match password
+    // 3. Match password
     const isPasswordValid = await bcrypt.compare(password, user.password_hash)
     if (!isPasswordValid) {
+      // Record failed attempt against normalized email
+      const failResult = await recordFailedLogin(emailNorm)
+      if (failResult.isLocked) {
+        const remainingMinutes = Math.max(1, Math.ceil(failResult.remainingSeconds / 60))
+        res.setHeader('Retry-After', failResult.remainingSeconds)
+        return res.status(429).json({
+          message: `Too many failed login attempts. Account is temporarily locked. Please try again in ${remainingMinutes} minute${remainingMinutes === 1 ? '' : 's'}.`,
+          retryAfter: failResult.remainingSeconds,
+          lockedUntil: failResult.lockedUntil
+        })
+      }
       return res.status(400).json({ message: 'Invalid Email or Password' })
     }
 
-    // Generate JWT
+    // 4. Successful login: Reset failure streak and lockout tier
+    await resetLockout(emailNorm)
+
+    // 5. Generate JWT
     const token = jwt.sign(
       {
         id: user.id,
@@ -403,6 +450,9 @@ export const resetPassword = async (req, res) => {
 
     // 6. Delete OTP verification record
     await supabase.from('otp_verifications').delete().eq('email', emailLower)
+
+    // 7. Reset any lockout streak for this account
+    await resetLockout(emailLower)
 
     return res.status(200).json({ message: 'Password reset successful. You can now log in.' })
   } catch (err) {
@@ -598,6 +648,9 @@ export const googleLogin = async (req, res) => {
 
     // 5. Set secure HTTP-only cookie
     res.cookie('meetly_token', token, getCookieConfig())
+
+    // 6. Reset any existing lockout streak for this email
+    await resetLockout(emailLower)
 
     return res.status(200).json({
       token,
