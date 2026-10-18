@@ -95,44 +95,13 @@ const useAIChat = () => {
     const apiUrl = import.meta.env.VITE_API_URL || 'http://localhost:5000'
 
     try {
-      // 1. Fetch current transcript from backend
-      console.log('[AI Chat] Fetching current meeting transcript...')
-      const transcriptRes = await fetch(`${apiUrl}/api/meetings/${meetingId}/transcript`, {
-        method: 'GET',
-        headers: getAuthHeaders(),
-        credentials: 'include'
-      })
-
-      if (!transcriptRes.ok) {
-        throw new Error('Failed to retrieve current meeting transcript.')
-      }
-
-      const transcriptData = await transcriptRes.json()
-      const rawTranscript = transcriptData.transcript || ''
-
-      if (!rawTranscript || rawTranscript.trim() === '') {
-        // Handle Test 4: No transcript
-        const aiResponse = {
-          sender: 'ai',
-          text: 'Transcript not available yet.',
-          timestamp: new Date().toLocaleTimeString('en-US', { hour: '2-digit', minute: '2-digit' })
-        }
-        setMessages((prev) => [...prev, aiResponse])
-        setIsLoading(false)
-        return
-      }
-
-      // 2. Perform context optimization/chunking
-      const optimizedTranscript = optimizeTranscript(rawTranscript, question)
-
-      // 3. Submit question to AI Chat Assistant endpoint
-      console.log('[AI Chat] Sending optimized transcript and question to backend...')
+      // 1. Submit question to AI Chat Assistant endpoint (server uses authoritative stored transcript)
+      console.log('[AI Chat] Sending question to backend AI Assistant...')
       const chatRes = await fetch(`${apiUrl}/api/meetings/${meetingId}/ai-chat`, {
         method: 'POST',
         headers: getAuthHeaders(),
         body: JSON.stringify({
           meetingId,
-          transcript: optimizedTranscript,
           question
         }),
         credentials: 'include'
@@ -154,6 +123,18 @@ const useAIChat = () => {
           setIsLoading(false)
           return
         }
+
+        if (chatRes.status === 400 && chatData.message === 'Transcript not available yet.') {
+          const aiResponse = {
+            sender: 'ai',
+            text: 'Transcript not available yet.',
+            timestamp: new Date().toLocaleTimeString('en-US', { hour: '2-digit', minute: '2-digit' })
+          }
+          setMessages((prev) => [...prev, aiResponse])
+          setIsLoading(false)
+          return
+        }
+
         throw new Error(chatData.message || 'An error occurred during your AI Chat request.')
       }
 
