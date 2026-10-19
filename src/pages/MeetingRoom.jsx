@@ -3576,22 +3576,6 @@ function MeetingRoomContent({
             <span>LIVE</span>
           </span>
           <span className="text-gray-400 font-mono" title="Elapsed meeting time">{formatTimer(seconds)}</span>
-          {remainingSeconds !== null && (
-            <div
-              className={`flex items-center gap-1.5 px-2.5 py-0.5 rounded-full border text-xs font-mono font-bold transition-all ${
-                remainingSeconds <= 180
-                  ? 'bg-amber-500/15 border-amber-500/30 text-amber-400 animate-pulse shadow-sm shadow-amber-500/20'
-                  : 'bg-white/5 border-white/10 text-purple-300'
-              }`}
-              title="Time remaining until scheduled meeting end"
-            >
-              <Clock size={12} className={remainingSeconds <= 180 ? 'text-amber-400' : 'text-purple-400'} />
-              <span>
-                {formatCountdown(remainingSeconds)}
-                {remainingSeconds <= 180 ? ' left' : ''}
-              </span>
-            </div>
-          )}
           <span className="px-2 py-0.5 rounded bg-white/5 border border-white/10 text-gray-400 text-[10px] font-mono">
             {allParticipants.length} In Call
           </span>

@@ -70,7 +70,7 @@ export default function Login() {
   }
 
   return (
-    <div className="flex flex-col gap-5.5 text-left w-full max-w-[340px] mx-auto relative h-full justify-between">
+    <div className="flex flex-col gap-5.5 text-left w-full max-w-85 mx-auto relative h-full justify-between">
       {/* Upper content */}
       <div className="flex flex-col gap-5">
         {/* Title */}
