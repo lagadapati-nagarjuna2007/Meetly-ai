@@ -3445,6 +3445,15 @@ function MeetingRoomContent({
     })
   }, [allParticipants, participantSearchQuery])
 
+  // Derive authoritative remaining seconds for the header countdown:
+  // Uses remainingSeconds state (which ticks every second), with fallback to scheduled_end_time diff
+  // or initial duration_minutes * 60 so newly started meetings immediately show 05:00 / 15:00 / 30:00 / 40:00.
+  const displayRemainingSeconds = remainingSeconds !== null
+    ? remainingSeconds
+    : (meetingData?.scheduled_end_time
+        ? Math.max(0, Math.floor((new Date(meetingData.scheduled_end_time).getTime() - Date.now()) / 1000))
+        : (meetingData?.duration_minutes ? meetingData.duration_minutes * 60 : null))
+
   return (
     <div className="fixed inset-0 z-40 bg-[#04050b] flex flex-col items-stretch overflow-hidden text-left">
       {(isShuttingDown || meetingData?.meeting_status === 'Ended') && (
@@ -3575,7 +3584,7 @@ function MeetingRoomContent({
             <Radio size={14} className="animate-pulse" />
             <span>LIVE</span>
           </span>
-          <span className="text-gray-400 font-mono" title="Elapsed meeting time">{formatTimer(seconds)}</span>
+          <span className="text-gray-400 font-mono" title="Time remaining until scheduled meeting end">{formatCountdown(displayRemainingSeconds)}</span>
           <span className="px-2 py-0.5 rounded bg-white/5 border border-white/10 text-gray-400 text-[10px] font-mono">
             {allParticipants.length} In Call
           </span>
