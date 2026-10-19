@@ -7,6 +7,7 @@ import {
   leaveMeeting,
   endMeeting,
   extendMeeting,
+  triggerMeetingExpiration,
   lockMeeting,
   getMeetingDetails,
   getMeetingParticipants,
@@ -56,6 +57,7 @@ router.post('/leave', leaveMeeting)
 router.get('/leave', leaveMeeting) // Support for navigator.sendBeacon
 router.post('/end', endMeeting)
 router.post('/extend', extendMeeting)
+router.post('/expire', triggerMeetingExpiration)
 router.post('/lock', lockMeeting)
 router.post('/transcript', upload.single('file'), submitTranscriptChunk)
 router.post('/summary/generate', generateSummary)

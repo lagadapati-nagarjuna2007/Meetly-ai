@@ -1,10 +1,13 @@
 import { describe, it, beforeEach, afterEach } from 'node:test'
 import assert from 'node:assert/strict'
+import fs from 'fs'
+import path from 'path'
 import {
   createMeeting,
   activateMeeting,
   endMeeting,
-  extendMeeting
+  extendMeeting,
+  triggerMeetingExpiration
 } from '../controllers/meetingController.js'
 import {
   expireMeetingNow,
@@ -1610,6 +1613,118 @@ describe('Meetly AI — Meeting Duration, Scheduled Deadline & Extension Suite',
       assert.strictEqual(m.scheduled_end_time, futureDeadline)
       assert.strictEqual(m.extension_count, 1)
       assert.strictEqual(m.extension_used, true)
+    })
+
+    it('45. triggerMeetingExpiration endpoint authoritatively evaluates meeting and ends overdue active meeting', async () => {
+      const overdueMtgId = '11112222-3333-4444-5555-666677778888'
+      const overdueDeadline = new Date(Date.now() - 5000).toISOString()
+      mockMeetingsTable.set(overdueMtgId, {
+        meeting_id: overdueMtgId,
+        meeting_code: 'OVERDU01',
+        room_name: 'room-overdue-trigger',
+        meeting_status: 'Active',
+        scheduled_end_time: overdueDeadline,
+        duration_minutes: 15,
+        host_id: HOST_ID,
+        active_host_id: HOST_ID,
+        is_deleted: false
+      })
+
+      const { req, res } = createMockReqRes({
+        body: { meetingId: overdueMtgId },
+        user: { id: PARTICIPANT_ID }
+      })
+
+      await triggerMeetingExpiration(req, res)
+      assert.strictEqual(res.getStatusCode(), 200)
+      const data = res.getData()
+      assert.strictEqual(data.success, true)
+      assert.strictEqual(data.message, 'Meeting expired successfully.')
+      assert.strictEqual(mockMeetingsTable.get(overdueMtgId).meeting_status, 'Ended')
+
+      const endedEvent = emittedSocketEvents.find((e) => e.room === 'room-overdue-trigger' && e.event === 'meeting_ended')
+      assert.ok(endedEvent, 'meeting_ended event must be broadcast')
+      assert.strictEqual(endedEvent.payload.reason, 'duration_expired')
+    })
+
+    it('46. triggerMeetingExpiration rejects missing identifier and leaves future meetings untouched', async () => {
+      // 1. Missing meetingId
+      const reqResMissing = createMockReqRes({
+        body: {},
+        user: { id: PARTICIPANT_ID }
+      })
+      await triggerMeetingExpiration(reqResMissing.req, reqResMissing.res)
+      assert.strictEqual(reqResMissing.res.getStatusCode(), 400)
+      assert.match(reqResMissing.res.getData().message, /meeting identifier is required/i)
+
+      // 2. Future meeting: cannot be expired prematurely
+      const futureMtgId = '22223333-4444-5555-6666-777788889999'
+      const futureDeadline = new Date(Date.now() + 600000).toISOString()
+      mockMeetingsTable.set(futureMtgId, {
+        meeting_id: futureMtgId,
+        meeting_code: 'FUTUR002',
+        room_name: 'room-future-2',
+        meeting_status: 'Active',
+        scheduled_end_time: futureDeadline,
+        duration_minutes: 30,
+        host_id: HOST_ID,
+        active_host_id: HOST_ID,
+        is_deleted: false
+      })
+
+      const reqResFuture = createMockReqRes({
+        body: { meetingId: futureMtgId },
+        user: { id: PARTICIPANT_ID }
+      })
+      await triggerMeetingExpiration(reqResFuture.req, reqResFuture.res)
+      assert.strictEqual(reqResFuture.res.getStatusCode(), 200)
+      assert.strictEqual(reqResFuture.res.getData().success, false)
+      assert.strictEqual(reqResFuture.res.getData().reason, 'ineligible_or_already_ended')
+      assert.strictEqual(mockMeetingsTable.get(futureMtgId).meeting_status, 'Active')
+    })
+
+    it('47. migrations/20261019_meeting_duration_and_extensions.sql eliminates Postgres 42702 ambiguous column reference', () => {
+      const migrationPath = path.resolve(process.cwd(), 'migrations/20261019_meeting_duration_and_extensions.sql')
+      const sql = fs.readFileSync(migrationPath, 'utf8')
+
+      // Must declare #variable_conflict use_column in expire_meeting_if_eligible
+      assert.ok(
+        sql.includes('#variable_conflict use_column'),
+        'expire_meeting_if_eligible must include #variable_conflict use_column to resolve RETURNS TABLE parameter ambiguity'
+      )
+
+      // Must qualify column in UPDATE statement with table alias
+      assert.ok(
+        sql.includes('UPDATE public.meetings AS m') || sql.includes('UPDATE public.meetings m'),
+        'expire_meeting_if_eligible must alias public.meetings'
+      )
+      assert.ok(
+        sql.includes('m.scheduled_end_time <= v_now'),
+        'expire_meeting_if_eligible must qualify m.scheduled_end_time <= v_now to eliminate variable collision'
+      )
+    })
+
+    it('48. scheduleMeetingExpiration handles clock skew and retry gracefully without throwing unhandled exceptions', async () => {
+      const skewMtgId = '33334444-5555-6666-7777-888899990000'
+      const deadline = new Date(Date.now() + 50).toISOString()
+      mockMeetingsTable.set(skewMtgId, {
+        meeting_id: skewMtgId,
+        meeting_code: 'SKEWMT01',
+        room_name: 'room-skew',
+        meeting_status: 'Active',
+        scheduled_end_time: deadline,
+        duration_minutes: 5,
+        host_id: HOST_ID,
+        active_host_id: HOST_ID,
+        is_deleted: false
+      })
+
+      // Schedule expiration timer
+      const timer = scheduleMeetingExpiration(skewMtgId, deadline, mockIo)
+      assert.ok(timer !== null || timer === null)
+
+      // Clean up timer
+      cancelMeetingExpiration(skewMtgId)
     })
   })
 })

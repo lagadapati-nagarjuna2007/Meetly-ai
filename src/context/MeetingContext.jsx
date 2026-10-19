@@ -317,6 +317,25 @@ export function MeetingProvider({ children }) {
     }
   }
 
+  // 6b. EXPIRE MEETING (Authoritative deadline check - can be triggered by client countdown at 00:00)
+  const expireMeeting = async (meetingId) => {
+    try {
+      console.log('[MeetingContext] Requesting authoritative meeting expiration check:', meetingId)
+      const res = await fetch(`${API_URL}/expire`, {
+        method: 'POST',
+        headers: getAuthHeaders(),
+        body: JSON.stringify({ meetingId }),
+        credentials: 'include'
+      })
+
+      const data = await res.json()
+      return data
+    } catch (err) {
+      console.error('[MeetingContext] expireMeeting error:', err)
+      return { success: false, error: err.message }
+    }
+  }
+
   // 7. LOCK MEETING (Host only)
   const lockMeeting = async (meetingId, isLocked) => {
     const res = await fetch(`${API_URL}/lock`, {
@@ -515,6 +534,7 @@ export function MeetingProvider({ children }) {
         activateMeeting,
         leaveMeeting,
         endMeeting,
+        expireMeeting,
         lockMeeting,
         deleteMeeting,
         renameMeeting,

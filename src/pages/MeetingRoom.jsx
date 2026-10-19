@@ -199,6 +199,7 @@ function MeetingRoomInner() {
   const {
     fetchMeetingDetails,
     endMeeting,
+    expireMeeting,
     deleteMeeting,
     renameMeeting,
     leaveMeeting,
@@ -677,12 +678,14 @@ function MeetingRoomInner() {
         }
       })
 
-      socket.current.on('meeting_ended', async () => {
+      socket.current.on('meeting_ended', async (data) => {
         setEphemeralChatMessages([])
         setSelectedChatRecipient(null)
         setActiveChatConvTab('everyone')
-        showToast('The host has ended this meeting.', 'info')
-        console.log('[Frontend] Meeting ended. Redirecting user to dashboard.')
+        const endMsg = data?.message || (data?.reason === 'duration_expired' ? 'The meeting duration has ended.' : 'The host has ended this meeting.')
+        showToast(endMsg, 'info')
+        console.log('[Frontend] Meeting ended. Reason:', data?.reason, 'Redirecting user to dashboard.')
+        setMeetingData((prev) => (prev ? { ...prev, meeting_status: 'Ended' } : null))
         if (enableAiAttendanceRef.current && !isHostRef.current) {
           if (handleLeaveWithAttendanceRef.current) {
             await handleLeaveWithAttendanceRef.current()
@@ -1076,6 +1079,7 @@ function MeetingRoomInner() {
         user={user}
         attendanceConsent={attendanceConsent}
         endMeeting={endMeeting}
+        expireMeeting={expireMeeting}
         socket={socket}
         socketReady={socketReady}
         chatMessages={chatMessages}
@@ -1143,6 +1147,7 @@ function MeetingRoomContent({
   user,
   attendanceConsent,
   endMeeting,
+  expireMeeting,
   socket,
   socketReady,
   chatMessages,
@@ -1218,6 +1223,7 @@ function MeetingRoomContent({
   // Deduplication refs so 3-minute warning triggers exactly once per scheduled deadline
   const warningTriggeredDeadlineRef = useRef(null)
   const warningDismissedDeadlineRef = useRef(null)
+  const expirationTriggeredDeadlineRef = useRef(null)
 
   // Strict Rule: One-Time Extension Limit (Persisted in DB / meetingData)
   const isExtensionUsed = Boolean(
@@ -3011,6 +3017,21 @@ function MeetingRoomContent({
       const diffSec = Math.max(0, Math.floor((end - now) / 1000))
       setRemainingSeconds(diffSec)
 
+      // When countdown reaches 00:00 and meeting is Active, trigger backend expiration check
+      if (diffSec <= 0 && meetingData?.meeting_status === 'Active') {
+        if (expirationTriggeredDeadlineRef.current !== scheduledEndTime) {
+          expirationTriggeredDeadlineRef.current = scheduledEndTime
+          console.log('[Frontend] Countdown reached 00:00. Requesting authoritative meeting expiration check from backend...')
+          if (typeof expireMeeting === 'function' && meetingData?.meeting_id) {
+            expireMeeting(meetingData.meeting_id).then((res) => {
+              console.log('[Frontend] Expire meeting response:', res)
+            }).catch((err) => {
+              console.warn('[Frontend] Error requesting meeting expiration:', err)
+            })
+          }
+        }
+      }
+
       // Host 3-minute warning: trigger when remaining time <= 180s and > 0s
       // Strict Rule: Display ONLY ONCE, for the original deadline, and NEVER if extension is already used!
       if (diffSec <= 180 && diffSec > 0 && canManageMeeting && !isExtensionUsed) {
@@ -3027,7 +3048,7 @@ function MeetingRoomContent({
     calculateRemaining()
     const timer = setInterval(calculateRemaining, 1000)
     return () => clearInterval(timer)
-  }, [meetingData?.scheduled_end_time, canManageMeeting, isExtensionUsed])
+  }, [meetingData?.scheduled_end_time, meetingData?.meeting_id, meetingData?.meeting_status, canManageMeeting, isExtensionUsed, expireMeeting])
 
   // Transition meeting to ACTIVE and initialize media ONLY when room is connected
   useEffect(() => {

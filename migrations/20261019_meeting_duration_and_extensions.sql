@@ -277,6 +277,7 @@ LANGUAGE plpgsql
 SECURITY DEFINER
 SET search_path = public, pg_temp
 AS $$
+#variable_conflict use_column
 DECLARE
     v_now TIMESTAMPTZ := clock_timestamp();
     v_updated RECORD;
@@ -286,15 +287,15 @@ BEGIN
         RETURN;
     END IF;
 
-    UPDATE public.meetings
+    UPDATE public.meetings AS m
     SET meeting_status = 'Ended',
         ended_at = v_now,
         updated_at = v_now
-    WHERE meeting_id = p_meeting_id
-      AND meeting_status = 'Active'
-      AND scheduled_end_time IS NOT NULL
-      AND scheduled_end_time <= v_now
-    RETURNING meetings.meeting_id, meetings.room_name, meetings.meeting_code, meetings.host_id, meetings.scheduled_end_time, meetings.ended_at
+    WHERE m.meeting_id = p_meeting_id
+      AND m.meeting_status = 'Active'
+      AND m.scheduled_end_time IS NOT NULL
+      AND m.scheduled_end_time <= v_now
+    RETURNING m.meeting_id, m.room_name, m.meeting_code, m.host_id, m.scheduled_end_time, m.ended_at
     INTO v_updated;
 
     IF v_updated.meeting_id IS NOT NULL THEN

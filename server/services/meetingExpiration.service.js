@@ -79,7 +79,7 @@ export const expireMeetingNow = async (meetingId, ioInstance = null) => {
     }
 
     const row = rpcData[0]
-    const updatedMeeting = {
+    updatedMeeting = {
       meeting_id: idStr,
       room_name: row.room_name,
       meeting_code: row.meeting_code,
@@ -153,17 +153,66 @@ export const scheduleMeetingExpiration = (meetingId, scheduledEndTime, ioInstanc
   if (delayMs <= 0) {
     console.log(`[MeetingExpiration] Scheduled end time for ${idStr} has already passed. Expiring immediately.`)
     // Execute asynchronously to avoid blocking the caller
-    setImmediate(() => {
-      expireMeetingNow(idStr, ioInstance)
+    setImmediate(async () => {
+      const res = await expireMeetingNow(idStr, ioInstance)
+      if (!res?.success && res?.retryable) {
+        const retryTimer = setTimeout(() => {
+          meetingExpirationTimers.delete(idStr)
+          expireMeetingNow(idStr, ioInstance)
+        }, 2000)
+        if (retryTimer.unref) retryTimer.unref()
+        meetingExpirationTimers.set(idStr, retryTimer)
+      }
     })
     return null
   }
 
   console.log(`[MeetingExpiration] Scheduled expiration for meeting ${idStr} in ${Math.round(delayMs / 1000)}s (at ${scheduledEndTime})`)
 
-  const timer = setTimeout(() => {
+  const timer = setTimeout(async () => {
     meetingExpirationTimers.delete(idStr)
-    expireMeetingNow(idStr, ioInstance)
+    const res = await expireMeetingNow(idStr, ioInstance)
+    if (!res?.success) {
+      if (res?.retryable) {
+        console.warn(`[MeetingExpiration] Expiration for meeting ${idStr} failed with retryable error. Scheduling retry in 2000ms.`)
+        const retryTimer = setTimeout(() => {
+          meetingExpirationTimers.delete(idStr)
+          expireMeetingNow(idStr, ioInstance)
+        }, 2000)
+        if (retryTimer.unref) retryTimer.unref()
+        meetingExpirationTimers.set(idStr, retryTimer)
+      } else if (res?.reason === 'ineligible_or_already_ended') {
+        // Double-check if meeting is still Active in the database:
+        // Could be due to minor clock skew between app server and database clock_timestamp(),
+        // OR the host extended the meeting deadline.
+        try {
+          const { data: mtg } = await activeDbClient
+            .from('meetings')
+            .select('meeting_id, meeting_status, scheduled_end_time')
+            .eq('meeting_id', idStr)
+            .maybeSingle()
+
+          if (mtg && mtg.meeting_status === 'Active' && mtg.scheduled_end_time) {
+            const targetMs = new Date(mtg.scheduled_end_time).getTime()
+            const currentMs = Date.now()
+            if (targetMs > currentMs + 3000) {
+              console.log(`[MeetingExpiration] Meeting ${idStr} was extended. Rescheduling expiration timer for ${mtg.scheduled_end_time}.`)
+              scheduleMeetingExpiration(idStr, mtg.scheduled_end_time, ioInstance)
+            } else {
+              console.log(`[MeetingExpiration] Meeting ${idStr} still Active within clock skew window. Retrying expiration in 2000ms.`)
+              const retryTimer = setTimeout(() => {
+                meetingExpirationTimers.delete(idStr)
+                expireMeetingNow(idStr, ioInstance)
+              }, 2000)
+              if (retryTimer.unref) retryTimer.unref()
+              meetingExpirationTimers.set(idStr, retryTimer)
+            }
+          }
+        } catch (skewErr) {
+          console.warn(`[MeetingExpiration] Error inspecting meeting state after ineligible expiration:`, skewErr)
+        }
+      }
+    }
   }, delayMs)
 
   // Prevent node process from hanging if this timer is active during tests

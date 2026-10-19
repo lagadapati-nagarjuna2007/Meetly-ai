@@ -5,7 +5,7 @@ import { supabase } from '../config/supabase.js'
 import { clearMeetingCounters, cleanupLingeringQuotas } from '../services/aiChat.service.js'
 import { clearMeetingChat } from '../services/meetingChatService.js'
 import { scheduleCleanup, cancelCleanup } from '../services/meetingCleanup.js'
-import { scheduleMeetingExpiration, cancelMeetingExpiration } from '../services/meetingExpiration.service.js'
+import { scheduleMeetingExpiration, cancelMeetingExpiration, expireMeetingNow } from '../services/meetingExpiration.service.js'
 import { authorizeHost } from '../utils/authHelper.js'
 import { isMuteAllEnabled } from './securityController.js'
 import * as b2Service from '../services/b2Service.js'
@@ -1055,6 +1055,58 @@ export const extendMeeting = async (req, res) => {
     if (targetMeetingId) {
       inFlightExtensions.delete(targetMeetingId)
     }
+  }
+}
+
+// 5c. TRIGGER MEETING EXPIRATION (Database-authoritative deadline check)
+// May be called by any authenticated client or participant when remaining countdown hits 00:00.
+// Authoritatively evaluated via PostgreSQL clock_timestamp() inside expire_meeting_if_eligible.
+export const triggerMeetingExpiration = async (req, res) => {
+  try {
+    const { meetingId } = req.body
+    if (!meetingId) {
+      return res.status(400).json({ message: 'Meeting identifier is required.' })
+    }
+
+    let targetMeetingId = meetingId
+    if (!isUuid(meetingId)) {
+      const { data: mtg } = await supabase
+        .from('meetings')
+        .select('meeting_id')
+        .eq('meeting_code', String(meetingId).trim().toUpperCase())
+        .maybeSingle()
+      if (mtg?.meeting_id) {
+        targetMeetingId = mtg.meeting_id
+      }
+    }
+
+    const io = req.app.get('io')
+    const result = await expireMeetingNow(targetMeetingId, io)
+
+    if (result.success) {
+      return res.status(200).json({
+        success: true,
+        message: 'Meeting expired successfully.',
+        meeting: result.meeting
+      })
+    }
+
+    if (result.retryable) {
+      return res.status(503).json({
+        success: false,
+        message: 'Meeting expiration temporarily unavailable, retry queued.',
+        retryable: true
+      })
+    }
+
+    return res.status(200).json({
+      success: false,
+      message: 'Meeting is not eligible for expiration or has already ended.',
+      reason: result.reason
+    })
+  } catch (err) {
+    console.error('[Expire Meeting] Unexpected error:', err)
+    return res.status(500).json({ message: 'Server error expiring meeting.' })
   }
 }
 
