@@ -5,6 +5,7 @@ import { supabase } from '../config/supabase.js'
 import { clearMeetingCounters, cleanupLingeringQuotas } from '../services/aiChat.service.js'
 import { clearMeetingChat } from '../services/meetingChatService.js'
 import { scheduleCleanup, cancelCleanup } from '../services/meetingCleanup.js'
+import { scheduleMeetingExpiration, cancelMeetingExpiration } from '../services/meetingExpiration.service.js'
 import { authorizeHost } from '../utils/authHelper.js'
 import { isMuteAllEnabled } from './securityController.js'
 import * as b2Service from '../services/b2Service.js'
@@ -214,10 +215,15 @@ const generateUniqueMeetingCode = async () => {
 export const createMeeting = async (req, res) => {
   let createdMeetingId = null
   try {
-    const { meetingTitle, meetingType, meetingPassword, enableAiAnalyzer, enableAiAttendance } = req.body
+    const { meetingTitle, meetingType, meetingPassword, enableAiAnalyzer, enableAiAttendance, durationMinutes } = req.body
 
     if (!meetingTitle || !meetingTitle.trim()) {
       return res.status(400).json({ message: 'Meeting title is required.' })
+    }
+
+    const duration = Number(durationMinutes)
+    if (!durationMinutes || isNaN(duration) || ![5, 15, 30, 40].includes(duration)) {
+      return res.status(400).json({ message: 'Meeting duration is required and must be 5, 15, 30, or 40 minutes.' })
     }
 
     const type = meetingType || 'public'
@@ -225,7 +231,7 @@ export const createMeeting = async (req, res) => {
       return res.status(400).json({ message: 'Invalid meeting type.' })
     }
 
-    console.log(`[Create Meeting] User ${req.user.id} requested new meeting: "${meetingTitle.trim()}"`)
+    console.log(`[Create Meeting] User ${req.user.id} requested new meeting: "${meetingTitle.trim()}" (Duration: ${duration}m)`)
 
     // Step 1: Clean up stale meetings for this user with isCreateIntent = true
     await cleanupStaleMeetings(req.user.id, true)
@@ -261,6 +267,9 @@ export const createMeeting = async (req, res) => {
           is_deleted: false,
           meeting_password_hash: passwordHash,
           meeting_type: type,
+          duration_minutes: duration,
+          extension_count: 0,
+          extension_used: false,
           enable_ai_analyzer: !!enableAiAnalyzer,
           enable_ai_attendance: !!enableAiAttendance,
           // Explicitly set auto_admit=true so joinMeeting never gets NULL and
@@ -646,7 +655,9 @@ export const joinMeeting = async (req, res) => {
         ...meeting,
         active_host_id: activeHostId,
         assigned_host_id: meeting.assigned_host_id || null,
-        mute_all_enabled: muteAllEnabled
+        mute_all_enabled: muteAllEnabled,
+        extension_count: meeting.extension_count || 0,
+        extension_used: Boolean(meeting.extension_used)
       }
     })
   } catch (err) {
@@ -665,8 +676,8 @@ export const activateMeeting = async (req, res) => {
     }
 
     const query = isUuid(meetingId)
-      ? supabase.from('meetings').select('meeting_id, meeting_status').eq('meeting_id', meetingId)
-      : supabase.from('meetings').select('meeting_id, meeting_status').eq('meeting_code', meetingId.trim().toUpperCase())
+      ? supabase.from('meetings').select('meeting_id, meeting_code, room_name, meeting_status, duration_minutes, scheduled_end_time, extension_count, extension_used, started_at').eq('meeting_id', meetingId)
+      : supabase.from('meetings').select('meeting_id, meeting_code, room_name, meeting_status, duration_minutes, scheduled_end_time, extension_count, extension_used, started_at').eq('meeting_code', meetingId.trim().toUpperCase())
 
     const { data: meeting, error: fetchErr } = await query.maybeSingle()
 
@@ -680,24 +691,73 @@ export const activateMeeting = async (req, res) => {
       return res.status(400).json({ message: 'This meeting has already ended.' })
     }
 
+    const durationMins = meeting.duration_minutes || 30
+    let scheduledEndTime = meeting.scheduled_end_time
+
     if (meeting.meeting_status === 'Waiting') {
-      const now = new Date().toISOString()
+      const now = new Date()
+      const nowIso = now.toISOString()
+      scheduledEndTime = new Date(now.getTime() + durationMins * 60 * 1000).toISOString()
+
       const { error: updateErr } = await supabase
         .from('meetings')
         .update({
           meeting_status: 'Active',
-          started_at: now,
-          updated_at: now
+          started_at: nowIso,
+          scheduled_end_time: scheduledEndTime,
+          updated_at: nowIso
         })
         .eq('meeting_id', meeting.meeting_id)
 
       if (updateErr) throw updateErr
-      console.log(`[Activate] Meeting ${meeting.meeting_id} transitioned from 'Waiting' -> 'Active'`)
+      console.log(`[Activate] Meeting ${meeting.meeting_id} transitioned from 'Waiting' -> 'Active' (deadline: ${scheduledEndTime})`)
+
+      const io = req.app.get('io')
+      if (io && meeting.room_name) {
+        io.to(meeting.room_name).emit('meeting_activated', {
+          meetingId: meeting.meeting_id,
+          scheduledEndTime,
+          durationMinutes: durationMins,
+          extensionUsed: Boolean(meeting.extension_used),
+          extensionCount: meeting.extension_count || 0
+        })
+      }
+    } else if (meeting.meeting_status === 'Active' && !scheduledEndTime) {
+      // Robustness guard: active meeting without scheduled_end_time (e.g. pre-migration legacy row)
+      const now = new Date()
+      const nowIso = now.toISOString()
+      const baseTime = meeting.started_at ? new Date(meeting.started_at) : (meeting.created_at ? new Date(meeting.created_at) : now)
+      scheduledEndTime = new Date(baseTime.getTime() + durationMins * 60 * 1000).toISOString()
+
+      const { error: repairErr } = await supabase
+        .from('meetings')
+        .update({
+          scheduled_end_time: scheduledEndTime,
+          updated_at: nowIso
+        })
+        .eq('meeting_id', meeting.meeting_id)
+
+      if (repairErr) {
+        console.warn(`[Activate] Error backfilling missing scheduled_end_time for active meeting ${meeting.meeting_id}:`, repairErr)
+      } else {
+        console.log(`[Activate] Repaired missing scheduled_end_time for active meeting ${meeting.meeting_id} -> ${scheduledEndTime}`)
+      }
+    }
+
+    // Schedule expiration timer for active meeting
+    if (scheduledEndTime) {
+      scheduleMeetingExpiration(meeting.meeting_id, scheduledEndTime, req.app.get('io'))
     }
 
     cancelCleanup(meeting.meeting_id)
 
-    return res.status(200).json({ message: 'Meeting is now active.' })
+    return res.status(200).json({
+      message: 'Meeting is now active.',
+      scheduledEndTime,
+      durationMinutes: durationMins,
+      extensionUsed: Boolean(meeting.extension_used),
+      extensionCount: meeting.extension_count || 0
+    })
   } catch (err) {
     console.error('Activate meeting error:', err)
     return res.status(500).json({ message: 'Server error activating meeting.' })
@@ -836,12 +896,165 @@ Stack/Caller: endMeeting inside meetingController.js
       console.warn(`[End] io or room_name not available, participants may not receive meeting_ended event.`)
     }
 
+    cancelMeetingExpiration(meeting.meeting_id)
+
     console.log(`[End] Meeting ${meeting.meeting_id} ended by host ${req.user.id}. All participants marked as left.`)
 
     return res.status(200).json({ message: 'Meeting ended successfully.' })
   } catch (err) {
     console.error('End meeting error:', err)
     return res.status(500).json({ message: 'Server error while ending meeting.' })
+  }
+}
+
+// In-flight extension tracking to prevent concurrent race conditions / double clicks
+const inFlightExtensions = new Set()
+
+// 5b. EXTEND MEETING (Host only — Strict Rule: Maximum of ONE extension per meeting lifetime)
+export const extendMeeting = async (req, res) => {
+  let targetMeetingId = null
+  try {
+    const { meetingId, extensionMinutes } = req.body
+    console.log(`[Extend Meeting] extendMeeting called for meetingId: ${meetingId}, user: ${req.user?.id}, minutes: ${extensionMinutes}`)
+
+    if (!meetingId) {
+      return res.status(400).json({ message: 'Meeting identifier is required.' })
+    }
+
+    const minutes = Number(extensionMinutes)
+    if (!extensionMinutes || isNaN(minutes) || ![5, 10, 15].includes(minutes)) {
+      return res.status(400).json({ message: 'Extension minutes must be exactly 5, 10, or 15.' })
+    }
+
+    // Verify host authorization (Active Host or Original Host)
+    const auth = await authorizeHost(meetingId, req.user.id, 'manage')
+    if (!auth.passed) {
+      return res.status(auth.status).json({ message: auth.message })
+    }
+
+    const meeting = auth.meeting
+
+    if (meeting.is_deleted) {
+      return res.status(400).json({ message: 'Meeting has been deleted.' })
+    }
+
+    if (meeting.meeting_status !== 'Active') {
+      return res.status(400).json({ message: `Cannot extend meeting with status '${meeting.meeting_status}'. Only active meetings can be extended.` })
+    }
+
+    // STRICT RULE: Each meeting is allowed a maximum of ONE successful time extension for its entire lifetime.
+    if ((meeting.extension_count !== undefined && meeting.extension_count >= 1) || meeting.extension_used === true) {
+      console.log(`[Extend Meeting] Meeting ${meeting.meeting_id} has already consumed its one-time extension allowance.`)
+      return res.status(400).json({ message: 'This meeting has already used its one-time extension allowance.' })
+    }
+
+    const now = new Date()
+
+    // Deadline check: scheduled_end_time must not have already passed
+    if (meeting.scheduled_end_time && new Date(meeting.scheduled_end_time) <= now) {
+      return res.status(400).json({ message: 'Meeting scheduled end time has already elapsed.' })
+    }
+
+    // Concurrency lock: Prevent double-clicks and concurrent in-flight requests from racing
+    targetMeetingId = meeting.meeting_id
+    if (inFlightExtensions.has(targetMeetingId)) {
+      console.log(`[Extend Meeting] Extension request already in flight for meeting ${targetMeetingId}. Rejecting concurrent attempt.`)
+      return res.status(400).json({ message: 'An extension request is already in progress for this meeting.' })
+    }
+    inFlightExtensions.add(targetMeetingId)
+
+    let newEndTime = null
+
+    // Attempt atomic stored procedure (RPC) if available
+    try {
+      if (typeof supabase.rpc === 'function') {
+        const { data: rpcResult, error: rpcErr } = await supabase.rpc('extend_meeting_duration', {
+          p_meeting_id: meeting.meeting_id,
+          p_extension_minutes: minutes,
+          p_requester_id: req.user.id
+        })
+
+        if (!rpcErr && rpcResult && rpcResult.length > 0) {
+          const row = rpcResult[0]
+          if (!row.success) {
+            return res.status(400).json({ message: row.error_message || 'Failed to extend meeting.' })
+          }
+          newEndTime = row.new_scheduled_end_time
+        }
+      }
+    } catch (rpcEx) {
+      console.warn('[Extend Meeting] RPC extend_meeting_duration fallback to direct query:', rpcEx.message)
+    }
+
+    // Fallback to atomic direct query update if RPC is not present/available
+    if (!newEndTime) {
+      const baseTime = meeting.scheduled_end_time ? new Date(meeting.scheduled_end_time) : now
+      const calculatedEnd = new Date(baseTime.getTime() + minutes * 60 * 1000)
+      newEndTime = calculatedEnd.toISOString()
+
+      let updateQuery = supabase
+        .from('meetings')
+        .update({
+          scheduled_end_time: newEndTime,
+          extension_count: 1,
+          extension_used: true,
+          updated_at: now.toISOString()
+        })
+        .eq('meeting_id', meeting.meeting_id)
+        .eq('meeting_status', 'Active')
+        .or('and(extension_count.is.null,extension_used.is.null),and(extension_count.eq.0,extension_used.eq.false)')
+
+      if (meeting.scheduled_end_time) {
+        updateQuery = updateQuery.gt('scheduled_end_time', now.toISOString())
+      } else {
+        updateQuery = updateQuery.is('scheduled_end_time', null)
+      }
+
+      const { data: updatedMeeting, error: updateErr } = await updateQuery
+        .select('meeting_id, scheduled_end_time, extension_count, extension_used')
+        .maybeSingle()
+
+      if (updateErr) {
+        console.error('[Extend Meeting] Direct DB update failed:', updateErr)
+        return res.status(500).json({ message: 'Database error extending meeting.' })
+      }
+
+      if (!updatedMeeting) {
+        return res.status(400).json({ message: 'This meeting has already used its one-time extension allowance, or has already ended.' })
+      }
+    }
+
+    // Reschedule server expiration timer
+    const io = req.app.get('io')
+    scheduleMeetingExpiration(meeting.meeting_id, newEndTime, io)
+
+    // Broadcast meeting_extended event to all connected room participants
+    if (io && meeting.room_name) {
+      io.to(meeting.room_name).emit('meeting_extended', {
+        meetingId: meeting.meeting_id,
+        scheduledEndTime: newEndTime,
+        extensionMinutes: minutes,
+        extensionUsed: true,
+        extensionCount: 1
+      })
+      console.log(`[Extend Meeting] Broadcasted meeting_extended (+${minutes}m, new deadline: ${newEndTime}, one-time allowance consumed) to room: ${meeting.room_name}`)
+    }
+
+    return res.status(200).json({
+      success: true,
+      message: 'Meeting time successfully extended.',
+      scheduledEndTime: newEndTime,
+      extensionMinutes: minutes,
+      extensionUsed: true,
+      extensionCount: 1
+    })
+  } catch (err) {
+    console.error('[Extend Meeting] Unexpected error:', err)
+    return res.status(500).json({ message: 'Server error extending meeting.' })
+  } finally {
+    if (targetMeetingId) {
+      inFlightExtensions.delete(targetMeetingId)
+    }
   }
 }
 
@@ -920,7 +1133,9 @@ export const getMeetingDetails = async (req, res) => {
         ...meeting,
         active_host_id: activeHostId,
         assigned_host_id: meeting.assigned_host_id || null,
-        mute_all_enabled: muteAllEnabled
+        mute_all_enabled: muteAllEnabled,
+        extension_count: meeting.extension_count || 0,
+        extension_used: Boolean(meeting.extension_used)
       },
       participants
     })

@@ -71,7 +71,7 @@ export function MeetingProvider({ children }) {
 
   // 2. CREATE MEETING
   // Atomic creation: stores meeting details AND LiveKit token immediately in state
-  const createMeeting = async (title, type = 'public', password = '', enableAiAnalyzer = false, enableAiAttendance = false) => {
+  const createMeeting = async (title, type = 'public', password = '', enableAiAnalyzer = false, enableAiAttendance = false, durationMinutes = 30) => {
     if (creatingRef.current) {
       console.log('[MeetingContext] Create meeting already in-flight, ignoring duplicate call.')
       return currentMeeting
@@ -91,7 +91,8 @@ export function MeetingProvider({ children }) {
           meetingType: type,
           meetingPassword: password,
           enableAiAnalyzer,
-          enableAiAttendance
+          enableAiAttendance,
+          durationMinutes: Number(durationMinutes)
         }),
         credentials: 'include'
       })
@@ -114,6 +115,12 @@ export function MeetingProvider({ children }) {
         roomName: data.roomName || data.meeting.room_name,
         token: data.livekitToken,
         livekitUrl: data.livekitUrl,
+        durationMinutes: data.meeting?.duration_minutes || Number(durationMinutes),
+        duration_minutes: data.meeting?.duration_minutes || Number(durationMinutes),
+        scheduledEndTime: data.meeting?.scheduled_end_time || null,
+        scheduled_end_time: data.meeting?.scheduled_end_time || null,
+        extension_count: data.meeting?.extension_count || 0,
+        extension_used: Boolean(data.meeting?.extension_used),
         enableAiAnalyzer: data.meeting.enable_ai_analyzer,
         enableAiAttendance: data.meeting.enable_ai_attendance,
         active_host_id: data.meeting?.active_host_id || data.meeting?.host_id,
@@ -192,6 +199,10 @@ export function MeetingProvider({ children }) {
         roomName: data.roomName || data.meeting.room_name,
         token: data.token,
         livekitUrl: data.livekitUrl,
+        duration_minutes: data.meeting?.duration_minutes,
+        durationMinutes: data.meeting?.duration_minutes,
+        scheduled_end_time: data.meeting?.scheduled_end_time || null,
+        scheduledEndTime: data.meeting?.scheduled_end_time || null,
         active_host_id: data.meeting?.active_host_id || data.meeting?.host_id,
         assigned_host_id: data.meeting?.assigned_host_id || null
       }
@@ -224,20 +235,28 @@ export function MeetingProvider({ children }) {
   // 4. ACTIVATE MEETING
   // Called when LiveKit room connects successfully to transition status from Waiting -> Active
   const activateMeeting = async (meetingId) => {
-    if (!meetingId) return
+    if (!meetingId) return null
     try {
       console.log('[MeetingContext] Notifying backend activateMeeting for:', meetingId)
-      await fetch(`${API_URL}/activate`, {
+      const res = await fetch(`${API_URL}/activate`, {
         method: 'POST',
         headers: getAuthHeaders(),
         body: JSON.stringify({ meetingId }),
         credentials: 'include'
       })
+      const data = await res.json()
       if (currentMeeting) {
-        setCurrentMeeting((prev) => (prev ? { ...prev, status: 'Active' } : null))
+        setCurrentMeeting((prev) => (prev ? {
+          ...prev,
+          status: 'Active',
+          scheduled_end_time: data?.scheduledEndTime || prev.scheduled_end_time,
+          scheduledEndTime: data?.scheduledEndTime || prev.scheduledEndTime
+        } : null))
       }
+      return data
     } catch (err) {
       console.error('[MeetingContext] activateMeeting error:', err)
+      return null
     }
   }
 

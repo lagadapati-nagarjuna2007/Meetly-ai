@@ -13,6 +13,7 @@ import recordingRoutes from './routes/recording.js'
 import { supabase } from './config/supabase.js'
 import { startRetentionCleanup } from './controllers/meetingController.js'
 import { startRecordingRetentionCleanup } from './services/recordingRetention.js'
+import { initMeetingExpirationWorker } from './services/meetingExpiration.service.js'
 import { scheduleCleanup, cancelCleanup } from './services/meetingCleanup.js'
 import {
   CHAT_POLICIES,
@@ -95,6 +96,7 @@ const io = new Server(httpServer, {
   }
 })
 app.set('io', io)
+initMeetingExpirationWorker(io)
 
 // Active socket room tracking — multi-tab/multi-socket aware.
 // roomSockets: Map<roomName, Set<socketId>>  — tracks all socket IDs per room (for cleanup trigger)

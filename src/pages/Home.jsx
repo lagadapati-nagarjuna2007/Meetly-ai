@@ -30,6 +30,8 @@ export default function Home() {
   
   // Create Meeting Fields
   const [meetingName, setMeetingName] = useState('')
+  const [meetingDuration, setMeetingDuration] = useState(null)
+  const [durationError, setDurationError] = useState('')
   const [meetingType, setMeetingType] = useState('public')
   const [meetingPassword, setMeetingPassword] = useState('')
   const [enableAiAnalyzer, setEnableAiAnalyzer] = useState(false)
@@ -37,6 +39,18 @@ export default function Home() {
   
   // Create Success State
   const [createdMtg, setCreatedMtg] = useState(null)
+
+  const handleOpenCreateModal = () => {
+    setCreatedMtg(null)
+    setMeetingName('')
+    setMeetingDuration(null)
+    setDurationError('')
+    setMeetingType('public')
+    setMeetingPassword('')
+    setEnableAiAnalyzer(false)
+    setEnableAiAttendance(false)
+    setIsCreateOpen(true)
+  }
 
   // Join Meeting Fields
   const [joinId, setJoinId] = useState('')
@@ -50,13 +64,21 @@ export default function Home() {
       return
     }
 
+    const durationNum = Number(meetingDuration)
+    if (!meetingDuration || ![5, 15, 30, 40].includes(durationNum)) {
+      setDurationError('Please select a meeting duration')
+      showToast('Please select a meeting duration', 'error')
+      return
+    }
+
     try {
       const mtg = await createMeeting(
         meetingName.trim(),
         meetingType,
         meetingPassword,
         enableAiAnalyzer,
-        enableAiAttendance
+        enableAiAttendance,
+        durationNum
       )
       setCreatedMtg(mtg)
       showToast('Meeting created successfully!', 'success')
@@ -150,11 +172,8 @@ export default function Home() {
       <div className="grid grid-cols-1 md:grid-cols-2 gap-5">
         {/* New Meeting Card */}
         <div
-          onClick={() => {
-            setCreatedMtg(null)
-            setIsCreateOpen(true)
-          }}
-          className="bg-gradient-to-br from-[#4c1d95]/40 via-[#2e1065]/25 to-[#0c051a] hover:from-[#4c1d95]/50 hover:via-[#2e1065]/35 border border-purple-500/10 hover:border-purple-500/20 p-8 rounded-3xl flex flex-col items-center justify-between h-56 cursor-pointer transition-all duration-300 relative group overflow-hidden"
+          onClick={handleOpenCreateModal}
+          className="bg-gradient-to-br from-[#4c1d95]/40 via-[#2e1065]/25 to-[#0c051a] hover:from-[#4c1d95]/50 hover:via-[#2e1065]/35 border border-purple-500/10 hover:purple-500/20 p-8 rounded-3xl flex flex-col items-center justify-between h-56 cursor-pointer transition-all duration-300 relative group overflow-hidden"
         >
           {/* Top Video Icon */}
           <div className="w-12 h-12 rounded-2xl bg-purple-500/10 border border-purple-500/15 flex items-center justify-center text-purple-400 shadow-md mt-1">
@@ -225,10 +244,7 @@ export default function Home() {
                 <p className="text-[10px] text-gray-500">Create your first meeting.</p>
               </div>
               <button
-                onClick={() => {
-                  setCreatedMtg(null)
-                  setIsCreateOpen(true)
-                }}
+                onClick={handleOpenCreateModal}
                 className="mt-1 px-3 py-1.8 bg-[#7c3aed] hover:bg-[#8b5cf6] text-white rounded-xl text-[10px] font-bold transition-all duration-200 cursor-pointer shadow-md"
               >
                 Create Meeting
@@ -240,10 +256,7 @@ export default function Home() {
 
       {/* Floating Add Action Button (Overlaps page at bottom-right) */}
       <button
-        onClick={() => {
-          setCreatedMtg(null)
-          setIsCreateOpen(true)
-        }}
+        onClick={handleOpenCreateModal}
         className="fixed bottom-6 right-6 w-11 h-11 bg-[#7c3aed] hover:bg-[#8b5cf6] text-white rounded-full flex items-center justify-center shadow-lg shadow-purple-900/40 transition-all duration-200 cursor-pointer hover:rotate-90 z-20"
       >
         <Plus size={18} />
@@ -274,7 +287,15 @@ export default function Home() {
       </div>
 
       {/* CREATE MODAL */}
-      <Modal isOpen={isCreateOpen} onClose={() => setIsCreateOpen(false)} title="Create New Meeting">
+      <Modal
+        isOpen={isCreateOpen}
+        onClose={() => {
+          setIsCreateOpen(false)
+          setMeetingDuration(null)
+          setDurationError('')
+        }}
+        title="Create New Meeting"
+      >
         {!createdMtg ? (
           <form onSubmit={handleCreateSubmit} className="flex flex-col gap-4">
             <Input
@@ -284,6 +305,35 @@ export default function Home() {
               value={meetingName}
               onChange={(e) => setMeetingName(e.target.value)}
             />
+
+            <div className="flex flex-col gap-1 text-left">
+              <div className="flex items-center justify-between pl-0.5">
+                <label className="text-xs font-semibold text-gray-300">Meeting Duration</label>
+                <span className="text-[10px] text-gray-500 font-medium">Required</span>
+              </div>
+              <div className="grid grid-cols-4 gap-2 mt-1.5">
+                {[5, 15, 30, 40].map((mins) => (
+                  <button
+                    key={mins}
+                    type="button"
+                    onClick={() => {
+                      setMeetingDuration(mins)
+                      setDurationError('')
+                    }}
+                    className={`py-2.5 px-2 rounded-xl text-xs font-bold border transition-all duration-200 cursor-pointer ${
+                      meetingDuration === mins
+                        ? 'bg-[#7c3aed]/25 border-[#8b5cf6] text-white shadow-md shadow-purple-900/30'
+                        : 'bg-white/2 border-white/5 text-gray-400 hover:text-white hover:border-white/20'
+                    }`}
+                  >
+                    {mins} min
+                  </button>
+                ))}
+              </div>
+              {durationError && (
+                <span className="text-[10px] text-red-400 font-medium pl-0.5 mt-0.5">{durationError}</span>
+              )}
+            </div>
             
             <div className="flex flex-col gap-1 text-left">
               <label className="text-xs font-semibold text-gray-300 pl-0.5">Meeting Type</label>
@@ -363,7 +413,11 @@ export default function Home() {
               </button>
             </div>
 
-            <Button type="submit" disabled={isCreatingMeeting} className="w-full py-3 mt-2 text-xs font-bold">
+            <Button
+              type="submit"
+              disabled={isCreatingMeeting || !meetingName.trim() || !meetingDuration}
+              className="w-full py-3 mt-2 text-xs font-bold"
+            >
               {isCreatingMeeting ? 'Generating Code...' : 'Generate Meeting Code'}
             </Button>
           </form>

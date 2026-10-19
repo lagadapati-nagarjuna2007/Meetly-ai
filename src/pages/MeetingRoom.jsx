@@ -36,12 +36,14 @@ import {
   Lock,
   Unlock,
   AlertTriangle,
+  Clock,
   RefreshCw,
   Search,
   Smile,
   MoreHorizontal
 } from 'lucide-react'
 
+import Modal from '../components/Modal'
 import AIChatPanel from '../components/AIChatPanel'
 import ScreenShareView from '../components/ScreenShareView'
 import RecordingControlPopover from '../components/RecordingControlPopover'
@@ -785,6 +787,32 @@ function MeetingRoomInner() {
           showToast('The original host has rejoined the meeting.', 'info')
         }
       })
+      // ── Meeting Duration & Extension Socket Events ───────────────────────────
+      socket.current.on('meeting_extended', ({ scheduledEndTime, extensionMinutes, extensionUsed, extensionCount }) => {
+        console.log('[Socket] meeting_extended received:', scheduledEndTime, extensionMinutes)
+        setMeetingData((prev) => (prev ? {
+          ...prev,
+          scheduled_end_time: scheduledEndTime,
+          extension_used: extensionUsed !== undefined ? extensionUsed : true,
+          extension_count: extensionCount !== undefined ? extensionCount : 1
+        } : null))
+        setIsWarningModalOpen(false)
+        setIsExtensionModalOpen(false)
+        showToast(`Meeting time extended by ${extensionMinutes} minutes.`, 'success')
+      })
+
+      socket.current.on('meeting_activated', ({ scheduledEndTime, extensionUsed, extensionCount }) => {
+        console.log('[Socket] meeting_activated received:', scheduledEndTime)
+        if (scheduledEndTime) {
+          setMeetingData((prev) => (prev ? {
+            ...prev,
+            scheduled_end_time: scheduledEndTime,
+            meeting_status: 'Active',
+            extension_used: extensionUsed !== undefined ? extensionUsed : prev.extension_used,
+            extension_count: extensionCount !== undefined ? extensionCount : prev.extension_count
+          } : null))
+        }
+      })
       // ── End Host Management socket events ────────────────────────────────────
 
     } catch (socketErr) {
@@ -1180,6 +1208,23 @@ function MeetingRoomContent({
   // Timer state — must live here with all other useState calls to avoid hook-order violations
   const [seconds, setSeconds] = useState(0)
 
+  // Duration & Scheduled Expiration / Extension States
+  const [remainingSeconds, setRemainingSeconds] = useState(null)
+  const [isWarningModalOpen, setIsWarningModalOpen] = useState(false)
+  const [isExtensionModalOpen, setIsExtensionModalOpen] = useState(false)
+  const [selectedExtension, setSelectedExtension] = useState(null)
+  const [isSubmittingExtension, setIsSubmittingExtension] = useState(false)
+
+  // Deduplication refs so 3-minute warning triggers exactly once per scheduled deadline
+  const warningTriggeredDeadlineRef = useRef(null)
+  const warningDismissedDeadlineRef = useRef(null)
+
+  // Strict Rule: One-Time Extension Limit (Persisted in DB / meetingData)
+  const isExtensionUsed = Boolean(
+    meetingData?.extension_used ||
+    (meetingData?.extension_count != null && meetingData.extension_count >= 1)
+  )
+
   // Drawer Panel Toggles
   const [rightPanelOpen, setRightPanelOpen] = useState(true)
   const [activeTab, setActiveTab] = useState('chat') // chat | participants | ai
@@ -1549,6 +1594,8 @@ function MeetingRoomContent({
         setActivePopup(null)
         setRecordingPopoverAnchor(null)
         setShowEndConfirmModal(false)
+        setIsWarningModalOpen(false)
+        setIsExtensionModalOpen(false)
         setExpandedParticipantId(null)
       }
     }
@@ -2950,6 +2997,38 @@ function MeetingRoomContent({
     }
   }, [])
 
+  // Authoritative scheduled end countdown & 3-minute warning trigger
+  useEffect(() => {
+    const scheduledEndTime = meetingData?.scheduled_end_time
+    if (!scheduledEndTime) {
+      setRemainingSeconds(null)
+      return
+    }
+
+    const calculateRemaining = () => {
+      const end = new Date(scheduledEndTime).getTime()
+      const now = Date.now()
+      const diffSec = Math.max(0, Math.floor((end - now) / 1000))
+      setRemainingSeconds(diffSec)
+
+      // Host 3-minute warning: trigger when remaining time <= 180s and > 0s
+      // Strict Rule: Display ONLY ONCE, for the original deadline, and NEVER if extension is already used!
+      if (diffSec <= 180 && diffSec > 0 && canManageMeeting && !isExtensionUsed) {
+        if (
+          warningTriggeredDeadlineRef.current !== scheduledEndTime &&
+          warningDismissedDeadlineRef.current !== scheduledEndTime
+        ) {
+          warningTriggeredDeadlineRef.current = scheduledEndTime
+          setIsWarningModalOpen(true)
+        }
+      }
+    }
+
+    calculateRemaining()
+    const timer = setInterval(calculateRemaining, 1000)
+    return () => clearInterval(timer)
+  }, [meetingData?.scheduled_end_time, canManageMeeting, isExtensionUsed])
+
   // Transition meeting to ACTIVE and initialize media ONLY when room is connected
   useEffect(() => {
     console.log('[MeetingRoomContent useEffect initMedia] Checking room connection. roomState:', roomState, 'localParticipant:', !!localParticipant, 'alreadyInit:', mediaInitRef.current)
@@ -2965,7 +3044,15 @@ function MeetingRoomContent({
         if (!activatedRef.current && meetingData?.meeting_id) {
           activatedRef.current = true
           console.log('[Activate] LiveKit connected! Activating meeting:', meetingData.meeting_id)
-          activateMeeting(meetingData.meeting_id)
+          activateMeeting(meetingData.meeting_id).then((res) => {
+            if (res?.scheduledEndTime) {
+              setMeetingData((prev) => (prev ? {
+                ...prev,
+                scheduled_end_time: res.scheduledEndTime,
+                meeting_status: 'Active'
+              } : null))
+            }
+          }).catch(console.error)
         }
 
         if (!localParticipant || !effectiveMediaUserId || mediaInitRef.current) return
@@ -3023,7 +3110,8 @@ function MeetingRoomContent({
     showToast,
     getOrCreatePhysicalTrack,
     releasePhysicalCameraIfUnneeded,
-    forceTrackUpdate
+    forceTrackUpdate,
+    setMeetingData
   ])
 
 
@@ -3032,6 +3120,85 @@ function MeetingRoomContent({
     const m = Math.floor(sec / 60).toString().padStart(2, '0')
     const s = (sec % 60).toString().padStart(2, '0')
     return `${m}:${s}`
+  }
+
+  const formatCountdown = (sec) => {
+    if (sec == null || isNaN(sec)) return '00:00'
+    const totalSec = Math.max(0, Math.floor(sec))
+    const h = Math.floor(totalSec / 3600)
+    const m = Math.floor((totalSec % 3600) / 60)
+    const s = totalSec % 60
+    if (h > 0) {
+      return `${h}:${m.toString().padStart(2, '0')}:${s.toString().padStart(2, '0')}`
+    }
+    return `${m.toString().padStart(2, '0')}:${s.toString().padStart(2, '0')}`
+  }
+
+  // Handle Host 3-minute warning response: Decline extension
+  const handleDeclineExtension = () => {
+    if (meetingData?.scheduled_end_time) {
+      warningDismissedDeadlineRef.current = meetingData.scheduled_end_time
+    }
+    setIsWarningModalOpen(false)
+    showToast('Extension declined. The meeting will continue until the scheduled deadline.', 'info')
+  }
+
+  // Handle Host 3-minute warning response: Proceed to extension selector
+  const handleOpenExtensionModal = () => {
+    setIsWarningModalOpen(false)
+    setSelectedExtension(null)
+    setIsExtensionModalOpen(true)
+  }
+
+  // Handle Cancel Extension
+  const handleCancelExtension = () => {
+    setIsExtensionModalOpen(false)
+  }
+
+  // Handle Confirm Extension
+  const handleConfirmExtension = async () => {
+    if (!selectedExtension || ![5, 10, 15].includes(selectedExtension)) {
+      showToast('Please select an extension duration (+5, +10, or +15 minutes)', 'error')
+      return
+    }
+    if (isSubmittingExtension) return
+    setIsSubmittingExtension(true)
+
+    try {
+      const token = typeof window !== 'undefined' ? sessionStorage.getItem('meetly_auth_token') : null
+      const headers = { 'Content-Type': 'application/json' }
+      if (token) headers['Authorization'] = `Bearer ${token}`
+
+      const res = await fetch(`${import.meta.env.VITE_API_URL || 'http://localhost:5000'}/api/meetings/extend`, {
+        method: 'POST',
+        headers,
+        body: JSON.stringify({
+          meetingId: meetingData.meeting_id,
+          extensionMinutes: selectedExtension
+        }),
+        credentials: 'include'
+      })
+
+      const data = await res.json()
+      if (!res.ok) {
+        throw new Error(data.message || 'Failed to extend meeting')
+      }
+
+      setMeetingData((prev) => (prev ? {
+        ...prev,
+        scheduled_end_time: data.scheduledEndTime,
+        extension_used: true,
+        extension_count: 1
+      } : null))
+      setIsWarningModalOpen(false)
+      setIsExtensionModalOpen(false)
+      showToast(`Meeting time successfully extended by ${selectedExtension} minutes!`, 'success')
+    } catch (err) {
+      console.error('[MeetingRoom] Extension failed:', err)
+      showToast(err.message || 'Failed to extend meeting', 'error')
+    } finally {
+      setIsSubmittingExtension(false)
+    }
   }
 
   // Handle Mute All / Microphone Lock Toggle (Host Only)
@@ -3408,7 +3575,23 @@ function MeetingRoomContent({
             <Radio size={14} className="animate-pulse" />
             <span>LIVE</span>
           </span>
-          <span className="text-gray-400 font-mono">{formatTimer(seconds)}</span>
+          <span className="text-gray-400 font-mono" title="Elapsed meeting time">{formatTimer(seconds)}</span>
+          {remainingSeconds !== null && (
+            <div
+              className={`flex items-center gap-1.5 px-2.5 py-0.5 rounded-full border text-xs font-mono font-bold transition-all ${
+                remainingSeconds <= 180
+                  ? 'bg-amber-500/15 border-amber-500/30 text-amber-400 animate-pulse shadow-sm shadow-amber-500/20'
+                  : 'bg-white/5 border-white/10 text-purple-300'
+              }`}
+              title="Time remaining until scheduled meeting end"
+            >
+              <Clock size={12} className={remainingSeconds <= 180 ? 'text-amber-400' : 'text-purple-400'} />
+              <span>
+                {formatCountdown(remainingSeconds)}
+                {remainingSeconds <= 180 ? ' left' : ''}
+              </span>
+            </div>
+          )}
           <span className="px-2 py-0.5 rounded bg-white/5 border border-white/10 text-gray-400 text-[10px] font-mono">
             {allParticipants.length} In Call
           </span>
@@ -4485,6 +4668,96 @@ function MeetingRoomContent({
           </div>
         </div>
       )}
+
+      {/* 3-MINUTE WARNING MODAL (Host Only — Strict Rule: Display only once, never if already extended) */}
+      <Modal
+        isOpen={isWarningModalOpen && canManageMeeting && !isExtensionUsed}
+        onClose={handleDeclineExtension}
+        title="Meeting Ending Soon"
+      >
+        <div className="flex flex-col gap-4 text-center py-2 select-none">
+          <div className="w-12 h-12 rounded-full bg-amber-500/10 border border-amber-500/20 flex items-center justify-center text-amber-400 mx-auto">
+            <AlertTriangle size={24} />
+          </div>
+          <div className="flex flex-col gap-1">
+            <h3 className="text-sm font-bold text-white">Your meeting will end in 3 minutes</h3>
+            <p className="text-xs text-gray-400">
+              Do you want to extend the meeting? Time remaining:{' '}
+              <span className="font-mono text-amber-400 font-bold">
+                {formatCountdown(remainingSeconds)}
+              </span>
+            </p>
+          </div>
+          <div className="grid grid-cols-2 gap-3 mt-2">
+            <button
+              type="button"
+              onClick={handleDeclineExtension}
+              className="py-2.5 px-4 rounded-xl text-xs font-bold bg-white/5 border border-white/10 text-gray-300 hover:text-white hover:bg-white/10 transition-all cursor-pointer"
+            >
+              No, Don't Extend
+            </button>
+            <button
+              type="button"
+              onClick={handleOpenExtensionModal}
+              className="py-2.5 px-4 rounded-xl text-xs font-bold bg-[#7c3aed] hover:bg-[#8b5cf6] text-white shadow-md shadow-purple-900/30 transition-all cursor-pointer"
+            >
+              Yes, Extend Meeting
+            </button>
+          </div>
+        </div>
+      </Modal>
+
+      {/* HOST EXTEND MEETING TIME MODAL */}
+      <Modal
+        isOpen={isExtensionModalOpen && canManageMeeting && !isExtensionUsed}
+        onClose={handleCancelExtension}
+        title="Extend Meeting Time"
+      >
+        <div className="flex flex-col gap-4 text-left py-2 select-none">
+          <p className="text-xs text-gray-400">
+            Select additional time to add to the current scheduled deadline:
+          </p>
+          <div className="grid grid-cols-3 gap-2.5">
+            {[5, 10, 15].map((mins) => (
+              <button
+                key={mins}
+                type="button"
+                onClick={() => setSelectedExtension(mins)}
+                className={`py-3 px-3 rounded-xl text-xs font-bold border transition-all cursor-pointer flex flex-col items-center justify-center gap-1.5 ${
+                  selectedExtension === mins
+                    ? 'bg-[#7c3aed]/25 border-[#8b5cf6] text-white shadow-md shadow-purple-900/30'
+                    : 'bg-white/2 border-white/5 text-gray-400 hover:text-white hover:border-white/20'
+                }`}
+              >
+                <Clock size={16} className={selectedExtension === mins ? 'text-[#a78bfa]' : 'text-gray-500'} />
+                <span>+{mins} min</span>
+              </button>
+            ))}
+          </div>
+          <div className="grid grid-cols-2 gap-3 mt-3">
+            <button
+              type="button"
+              onClick={handleCancelExtension}
+              disabled={isSubmittingExtension}
+              className="py-2.5 px-4 rounded-xl text-xs font-bold bg-white/5 border border-white/10 text-gray-300 hover:text-white hover:bg-white/10 transition-all cursor-pointer"
+            >
+              Cancel
+            </button>
+            <button
+              type="button"
+              onClick={handleConfirmExtension}
+              disabled={!selectedExtension || isSubmittingExtension}
+              className={`py-2.5 px-4 rounded-xl text-xs font-bold transition-all flex items-center justify-center gap-1.5 ${
+                selectedExtension && !isSubmittingExtension
+                  ? 'bg-[#7c3aed] hover:bg-[#8b5cf6] text-white shadow-md shadow-purple-900/30 cursor-pointer'
+                  : 'bg-white/5 border border-white/5 text-gray-500 cursor-not-allowed'
+              }`}
+            >
+              {isSubmittingExtension ? 'Extending...' : 'Extend Meeting'}
+            </button>
+          </div>
+        </div>
+      </Modal>
     </div>
   )
 }
