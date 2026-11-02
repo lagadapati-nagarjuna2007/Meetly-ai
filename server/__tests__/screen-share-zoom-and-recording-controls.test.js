@@ -146,7 +146,7 @@ describe('Screen Share Zoom Controls & Recording Pause/Resume Lifecycle', () => 
       assert.deepEqual(pan, { x: 0, y: 0 }, 'Pan must reset to (0,0) when zoom returns to 100%')
     })
 
-    it('guarantees DOM transform isolation from underlying LiveKit track and MediaRecorder stream', () => {
+    it('guarantees DOM transform isolation from underlying MediaStreamTrack and MediaRecorder stream', () => {
       // Shared track mock
       const mockMediaStreamTrack = {
         kind: 'video',

@@ -1,6 +1,5 @@
 import crypto from 'crypto'
 import bcrypt from 'bcrypt'
-import { AccessToken } from 'livekit-server-sdk'
 import { supabase } from '../config/supabase.js'
 import { clearMeetingCounters, cleanupLingeringQuotas } from '../services/aiChat.service.js'
 import { clearMeetingChat } from '../services/meetingChatService.js'
@@ -10,6 +9,57 @@ import { authorizeHost } from '../utils/authHelper.js'
 import { isMuteAllEnabled } from './securityController.js'
 import * as b2Service from '../services/b2Service.js'
 import { formatDuration, calculateAttendancePercentage } from '../utils/durationHelper.js'
+import {
+  isCloudflareConfigured,
+  createCloudflareMeeting,
+  addCloudflareParticipant,
+  removeCloudflareParticipant,
+  endCloudflareMeeting,
+  refreshCloudflareParticipantToken
+} from '../config/cloudflareRealtime.js'
+
+// RealtimeKit presets (configured via environment or sensible defaults)
+const getCloudflareHostPreset = () => process.env.CLOUDFLARE_REALTIME_HOST_PRESET || 'meetly-host'
+const getCloudflareParticipantPreset = () => process.env.CLOUDFLARE_REALTIME_PARTICIPANT_PRESET || 'meetly-participant'
+
+// In-flight meeting creation tracking to prevent duplicate creation on concurrent double-clicks / retries
+const inFlightMeetingCreations = new Set()
+
+// Pluggable Cloudflare service reference allowing test dependency injection
+let cloudflareService = {
+  isConfigured: isCloudflareConfigured,
+  createMeeting: createCloudflareMeeting,
+  addParticipant: addCloudflareParticipant,
+  removeParticipant: removeCloudflareParticipant,
+  endMeeting: endCloudflareMeeting,
+  refreshToken: refreshCloudflareParticipantToken
+}
+
+export const setCloudflareService = (service) => {
+  cloudflareService = { ...cloudflareService, ...service }
+}
+
+export const resetCloudflareService = () => {
+  cloudflareService = {
+    isConfigured: isCloudflareConfigured,
+    createMeeting: createCloudflareMeeting,
+    addParticipant: addCloudflareParticipant,
+    removeParticipant: removeCloudflareParticipant,
+    endMeeting: endCloudflareMeeting,
+    refreshToken: refreshCloudflareParticipantToken
+  }
+}
+
+// Helper to detect schema cache or column-not-found errors during migrations
+const isColumnNotFoundError = (err, columnName) => {
+  if (!err) return false
+  const msg = (err.message || '').toLowerCase()
+  return (
+    err.code === 'PGRST204' ||
+    err.code === '42703' ||
+    (columnName && msg.includes(columnName.toLowerCase()))
+  )
+}
 
 // UUID validation helper
 const isUuid = (val) => {
@@ -214,6 +264,9 @@ const generateUniqueMeetingCode = async () => {
 // Atomic operation: Cleanup -> Validate -> Create Meeting (Waiting) -> Insert Host Participant -> Generate Token -> Return
 export const createMeeting = async (req, res) => {
   let createdMeetingId = null
+  let cfMeeting = null
+  let cfHostParticipant = null
+
   try {
     const { meetingTitle, meetingType, meetingPassword, enableAiAnalyzer, enableAiAttendance, durationMinutes } = req.body
 
@@ -231,6 +284,12 @@ export const createMeeting = async (req, res) => {
       return res.status(400).json({ message: 'Invalid meeting type.' })
     }
 
+    // Concurrency lock: Prevent duplicate meeting creation on rapid double-clicks / retries
+    if (inFlightMeetingCreations.has(req.user.id)) {
+      return res.status(409).json({ message: 'Meeting creation is already in progress. Please wait.' })
+    }
+    inFlightMeetingCreations.add(req.user.id)
+
     console.log(`[Create Meeting] User ${req.user.id} requested new meeting: "${meetingTitle.trim()}" (Duration: ${duration}m)`)
 
     // Step 1: Clean up stale meetings for this user with isCreateIntent = true
@@ -243,7 +302,7 @@ export const createMeeting = async (req, res) => {
       return res.status(400).json({ message: 'You are already in an active meeting.' })
     }
 
-    // Step 3: Generate meeting code & LiveKit room name
+    // Step 3: Generate meeting code & room name
     const code = await generateUniqueMeetingCode()
     const roomName = crypto.randomUUID()
 
@@ -252,36 +311,90 @@ export const createMeeting = async (req, res) => {
       passwordHash = await bcrypt.hash(meetingPassword, 10)
     }
 
-    // Step 4: Insert meeting into DB with status 'Waiting' (Host created, waiting for LiveKit connect)
+    // Fetch latest user profile from DB as authoritative source for host display name
+    const { data: currentUserRecord } = await supabase
+      .from('users')
+      .select('full_name, email')
+      .eq('id', req.user.id)
+      .maybeSingle()
+
+    const displayName = currentUserRecord?.full_name?.trim() || req.user.full_name || req.user.name || 'Anonymous'
+
+    // Step 3.5: Provision Cloudflare RealtimeKit meeting & enroll host (if configured)
+    if (cloudflareService.isConfigured()) {
+      try {
+        cfMeeting = await cloudflareService.createMeeting({
+          title: meetingTitle.trim()
+        })
+        console.log(`[Cloudflare RealtimeKit] Created meeting room ${cfMeeting.id}`)
+
+        cfHostParticipant = await cloudflareService.addParticipant(cfMeeting.id, {
+          name: displayName,
+          presetName: getCloudflareHostPreset(),
+          customParticipantId: req.user.id
+        })
+        console.log(`[Cloudflare RealtimeKit] Enrolled host participant ${cfHostParticipant.participantId}`)
+      } catch (cfErr) {
+        console.error('[Cloudflare RealtimeKit] Meeting/Host creation failed:', cfErr.message)
+        // Clean up orphaned Cloudflare meeting if addParticipant failed after createMeeting succeeded
+        if (cfMeeting?.id) {
+          try {
+            await cloudflareService.endMeeting(cfMeeting.id)
+          } catch (cfCleanupErr) {
+            console.warn('[Cloudflare RealtimeKit] Orphan cleanup warning:', cfCleanupErr.message)
+          }
+        }
+        return res.status(502).json({
+          success: false,
+          message: `Cloudflare RealtimeKit meeting creation failed: ${cfErr.message}`
+        })
+      }
+    }
+
+    // Step 4: Insert meeting into DB with status 'Waiting' (Host created, waiting for connect)
     console.log(`[HOST CREATE DEBUG]\nhost_id: ${req.user.id}\nactive_host_id: ${req.user.id}`)
 
-    const { data: meeting, error: meetingErr } = await supabase
+    const meetingPayload = {
+      meeting_code: code,
+      room_name: roomName,
+      meeting_title: meetingTitle.trim(),
+      host_id: req.user.id,
+      meeting_status: 'Waiting',
+      is_deleted: false,
+      meeting_password_hash: passwordHash,
+      meeting_type: type,
+      duration_minutes: duration,
+      extension_count: 0,
+      extension_used: false,
+      enable_ai_analyzer: !!enableAiAnalyzer,
+      enable_ai_attendance: !!enableAiAttendance,
+      auto_admit: true,
+      active_host_id: req.user.id,
+      assigned_host_id: null
+    }
+
+    if (cfMeeting?.id) {
+      meetingPayload.cloudflare_meeting_id = cfMeeting.id
+    }
+
+    let { data: meeting, error: meetingErr } = await supabase
       .from('meetings')
-      .insert([
-        {
-          meeting_code: code,
-          room_name: roomName,
-          meeting_title: meetingTitle.trim(),
-          host_id: req.user.id,
-          meeting_status: 'Waiting',
-          is_deleted: false,
-          meeting_password_hash: passwordHash,
-          meeting_type: type,
-          duration_minutes: duration,
-          extension_count: 0,
-          extension_used: false,
-          enable_ai_analyzer: !!enableAiAnalyzer,
-          enable_ai_attendance: !!enableAiAttendance,
-          // Explicitly set auto_admit=true so joinMeeting never gets NULL and
-          // can't accidentally route participants to the waiting room
-          auto_admit: true,
-          // Initialize Active Host as the meeting creator (Original Host)
-          active_host_id: req.user.id,
-          assigned_host_id: null
-        }
-      ])
+      .insert([meetingPayload])
       .select()
       .single()
+
+    // Backward-compatible schema fallback: if cloudflare_meeting_id does not exist in DB yet
+    if (meetingErr && cfMeeting?.id && isColumnNotFoundError(meetingErr, 'cloudflare_meeting_id')) {
+      console.warn('[Schema Notice] Column "cloudflare_meeting_id" not in "meetings". Retrying insert without it.')
+      delete meetingPayload.cloudflare_meeting_id
+      const retryRes = await supabase
+        .from('meetings')
+        .insert([meetingPayload])
+        .select()
+        .single()
+      meeting = retryRes.data
+      meetingErr = retryRes.error
+    }
 
     if (meetingErr) {
       console.error('[Create Error] Failed to insert meeting into DB:', meetingErr)
@@ -294,17 +407,31 @@ export const createMeeting = async (req, res) => {
     console.log(`[Create Success] Inserted meeting ${code} (${createdMeetingId}) with status 'Waiting'`)
 
     // Step 5: Insert Host as first participant with status 'joined'
-    const { error: partErr } = await supabase
+    const hostPartPayload = {
+      meeting_id: createdMeetingId,
+      user_id: req.user.id,
+      role: 'host',
+      participant_status: 'joined',
+      joined_at: new Date().toISOString()
+    }
+
+    if (cfHostParticipant?.participantId) {
+      hostPartPayload.cloudflare_participant_id = cfHostParticipant.participantId
+    }
+
+    let { error: partErr } = await supabase
       .from('participants')
-      .insert([
-        {
-          meeting_id: createdMeetingId,
-          user_id: req.user.id,
-          role: 'host',
-          participant_status: 'joined',
-          joined_at: new Date().toISOString()
-        }
-      ])
+      .insert([hostPartPayload])
+
+    // Backward-compatible schema fallback: if cloudflare_participant_id does not exist in DB yet
+    if (partErr && cfHostParticipant?.participantId && isColumnNotFoundError(partErr, 'cloudflare_participant_id')) {
+      console.warn('[Schema Notice] Column "cloudflare_participant_id" not in "participants". Retrying insert without it.')
+      delete hostPartPayload.cloudflare_participant_id
+      const retryPart = await supabase
+        .from('participants')
+        .insert([hostPartPayload])
+      partErr = retryPart.error
+    }
 
     if (partErr) {
       console.error('[Create Error] Participant insertion failed, triggering rollback:', partErr)
@@ -312,43 +439,13 @@ export const createMeeting = async (req, res) => {
       throw partErr
     }
 
-    // Step 6: Generate LiveKit token for host
-    const apiKey = process.env.LIVEKIT_API_KEY
-    const apiSecret = process.env.LIVEKIT_API_SECRET
-    const livekitUrl = process.env.LIVEKIT_URL
-
-    if (!apiKey || !apiSecret) {
-      console.error('[Create Error] Missing LiveKit environment variables')
+    // Step 6: Verify Cloudflare RealtimeKit configuration
+    if (!cloudflareService.isConfigured()) {
+      console.error('[Create Error] Cloudflare RealtimeKit is not configured')
       await supabase.from('participants').delete().eq('meeting_id', createdMeetingId)
       await supabase.from('meetings').delete().eq('meeting_id', createdMeetingId)
-      return res.status(500).json({ message: 'LiveKit credentials missing on server.' })
+      return res.status(500).json({ message: 'Cloudflare RealtimeKit credentials missing on server.' })
     }
-
-    // Fetch latest user profile from DB as the authoritative source for display name
-    const { data: currentUserRecord } = await supabase
-      .from('users')
-      .select('full_name, email')
-      .eq('id', req.user.id)
-      .maybeSingle()
-
-    const displayName = currentUserRecord?.full_name?.trim() || req.user.full_name || req.user.name || 'Anonymous'
-
-    const at = new AccessToken(apiKey, apiSecret, {
-      identity: req.user.email || req.user.id,
-      name: displayName,
-      metadata: JSON.stringify({ userId: req.user.id, role: 'host' })
-    })
-
-    at.addGrant({
-      roomJoin: true,
-      room: roomName,
-      canPublish: true,
-      canSubscribe: true
-    })
-
-    const token = await at.toJwt()
-
-    console.log(`[Create Token Issued] Host ${req.user.id} issued LiveKit token for room ${roomName}`)
 
     // Structured Audit Logging
     const timestamp = new Date().toISOString()
@@ -359,9 +456,13 @@ export const createMeeting = async (req, res) => {
       meetingId: createdMeetingId,
       meetingCode: code,
       roomName,
-      livekitToken: token,
-      livekitUrl: livekitUrl || 'ws://localhost:7880',
-      meeting
+      cloudflareMeetingId: cfMeeting?.id || null,
+      cloudflareToken: cfHostParticipant?.token || null,
+      cloudflareParticipantId: cfHostParticipant?.participantId || null,
+      meeting: {
+        ...meeting,
+        cloudflare_meeting_id: cfMeeting?.id || meeting.cloudflare_meeting_id || null
+      }
     })
   } catch (err) {
     console.error('Create meeting error:', err)
@@ -373,22 +474,34 @@ export const createMeeting = async (req, res) => {
         console.error('Rollback error:', rbErr)
       }
     }
-    return res.status(500).json({ message: err.message || 'Server error during meeting creation.' })
+    // Prevent orphaned Cloudflare meeting if DB insertion failed after Cloudflare creation
+    if (cfMeeting?.id) {
+      try {
+        await cloudflareService.endMeeting(cfMeeting.id)
+      } catch (cfCleanupErr) {
+        console.warn('[Rollback] Failed to clean up orphaned Cloudflare meeting:', cfCleanupErr.message)
+      }
+    }
+    const isCfError = err.code?.toString().startsWith('CLOUDFLARE') || err.message?.includes('Cloudflare')
+    const statusCode = isCfError ? 502 : 500
+    return res.status(statusCode).json({ message: err.message || 'Server error during meeting creation.' })
+  } finally {
+    inFlightMeetingCreations.delete(req.user.id)
   }
 }
 
 // 2. JOIN MEETING
-// Idempotent join: Upsert participant -> Issue LiveKit Token -> Return
+// Idempotent join: Upsert participant -> Issue Cloudflare RealtimeKit Token -> Return
 export const joinMeeting = async (req, res) => {
   try {
-    const { meetingCode, password, deviceFingerprint } = req.body
+    const { meetingCode, password, deviceFingerprint, fingerprint: bodyFingerprint } = req.body
 
     if (!meetingCode || !meetingCode.trim()) {
       return res.status(400).json({ message: 'Meeting code is required.' })
     }
 
     const uppercaseCode = meetingCode.trim().toUpperCase()
-    const fingerprint = (deviceFingerprint || '').trim()
+    const fingerprint = (deviceFingerprint || bodyFingerprint || '').trim()
 
     console.log(`[Join Meeting] User ${req.user.id} joining code: ${uppercaseCode} | fingerprint: ${fingerprint}`)
 
@@ -421,39 +534,6 @@ export const joinMeeting = async (req, res) => {
       return res.status(400).json({
         success: false,
         message: 'A valid browser device fingerprint is required to join this meeting.'
-      })
-    }
-
-    // Step 0: Check Device Ban
-    const { data: banRecord, error: banCheckErr } = await supabase
-      .from('meeting_device_bans')
-      .select('id, blocked_at')
-      .eq('meeting_code', uppercaseCode)
-      .eq('device_fingerprint', fingerprint)
-      .maybeSingle()
-
-    if (banCheckErr) throw banCheckErr
-    if (banRecord) {
-      console.log(`[Security] Join rejected. Device is banned. fingerprint: ${fingerprint}`)
-      return res.status(403).json({
-        success: false,
-        message: 'This device has been blocked by the meeting host.'
-      })
-    }
-
-    // Step 0.5: Verify user has not been previously removed/banned from this meeting
-    const { data: existingParticipantRecord } = await supabase
-      .from('participants')
-      .select('participant_status')
-      .eq('meeting_id', meeting.meeting_id)
-      .eq('user_id', req.user.id)
-      .maybeSingle()
-
-    if (existingParticipantRecord && existingParticipantRecord.participant_status === 'removed') {
-      console.log(`[Security] Join rejected. User ${req.user.id} has status 'removed' for meeting ${meeting.meeting_id}`)
-      return res.status(403).json({
-        success: false,
-        message: 'You have been removed from this meeting by the host.'
       })
     }
 
@@ -490,7 +570,7 @@ export const joinMeeting = async (req, res) => {
       // Check if user is already joined (to handle reconnects / refreshes)
       const { data: currentPart } = await supabase
         .from('participants')
-        .select('participant_status')
+        .select('participant_status, joined_at')
         .eq('meeting_id', meeting.meeting_id)
         .eq('user_id', req.user.id)
         .maybeSingle()
@@ -499,16 +579,76 @@ export const joinMeeting = async (req, res) => {
       const isApprovedRejoin = currentPart && (currentPart.participant_status === 'joined' || currentPart.participant_status === 'disconnected')
 
       if (!isApprovedRejoin) {
-        // Check if there is already a pending request
-        const { data: existingRequest, error: reqErr } = await supabase
-          .from('meeting_join_requests')
-          .select('*')
-          .eq('meeting_code', uppercaseCode)
-          .eq('user_id', req.user.id)
-          .maybeSingle()
+        // Handle in-flight or stale 'enrolling' state
+        if (currentPart && currentPart.participant_status === 'enrolling') {
+          const isStale = currentPart.joined_at && (Date.now() - new Date(currentPart.joined_at).getTime() > 30000)
+          if (isStale) {
+            // Clean up stale enrolling record so user can re-request admission cleanly
+            await supabase
+              .from('participants')
+              .delete()
+              .eq('meeting_id', meeting.meeting_id)
+              .eq('user_id', req.user.id)
+              .eq('participant_status', 'enrolling')
+          } else {
+            return res.status(200).json({
+              success: true,
+              status: 'waiting',
+              message: 'Admission is currently in progress.'
+            })
+          }
+        }
 
-        if (reqErr) throw reqErr
-        if (existingRequest) {
+        // Step 3.5.1: Atomic Waiting-Room Request Creation under Transaction Advisory Lock
+        const { data: joinReqData, error: joinReqErr } = await supabase
+          .rpc('create_join_request_tx', {
+            p_meeting_code: uppercaseCode,
+            p_user_id: req.user.id,
+            p_device_fingerprint: fingerprint
+          })
+
+        if (joinReqErr) {
+          console.error('[Security] create_join_request_tx failed:', joinReqErr.message)
+          if (joinReqErr.message?.includes('banned')) {
+            return res.status(403).json({
+              success: false,
+              message: 'This device has been blocked by the meeting host.'
+            })
+          }
+          if (joinReqErr.message?.includes('removed')) {
+            return res.status(403).json({
+              success: false,
+              message: 'You have been removed from this meeting by the host.'
+            })
+          }
+          if (joinReqErr.message?.includes('already admitted')) {
+            return res.status(409).json({
+              success: false,
+              code: 'ALREADY_ADMITTED',
+              message: 'You have already been admitted to this meeting.'
+            })
+          }
+          if (joinReqErr.message?.includes('fingerprint changed concurrently')) {
+            return res.status(409).json({
+              success: false,
+              code: 'CONCURRENCY_CONFLICT',
+              message: 'Device fingerprint changed during request creation. Please retry.'
+            })
+          }
+          if (joinReqErr.message?.includes('ended')) {
+            return res.status(400).json({
+              success: false,
+              message: 'This meeting has already ended.'
+            })
+          }
+          return res.status(400).json({
+            success: false,
+            message: joinReqErr.message || 'Failed to submit join request.'
+          })
+        }
+
+        const isDuplicate = Boolean(joinReqData?.is_duplicate)
+        if (isDuplicate) {
           console.log(`[Security] Duplicate join request blocked for user ${req.user.id}`)
           return res.status(200).json({
             success: true,
@@ -516,20 +656,6 @@ export const joinMeeting = async (req, res) => {
             message: 'Your join request is already waiting for host approval.'
           })
         }
-
-        // Create a new pending request
-        const { error: insertReqErr } = await supabase
-          .from('meeting_join_requests')
-          .insert([
-            {
-              meeting_code: uppercaseCode,
-              user_id: req.user.id,
-              device_fingerprint: fingerprint || 'unknown-fingerprint',
-              status: 'pending'
-            }
-          ])
-
-        if (insertReqErr) throw insertReqErr
 
         // Structured Audit Logging
         const reqTimestamp = new Date().toISOString()
@@ -550,67 +676,46 @@ export const joinMeeting = async (req, res) => {
       }
     }
 
-    // Step 4: Idempotent Participant Upsert
-    const { data: existingParticipant } = await supabase
-      .from('participants')
-      .select('*')
-      .eq('meeting_id', meeting.meeting_id)
-      .eq('user_id', req.user.id)
-      .maybeSingle()
+    // Step 4: Atomic Participant Admission under Transaction Advisory Lock
+    const { data: admitData, error: admitErr } = await supabase
+      .rpc('auto_admit_participant_tx', {
+        p_meeting_code: uppercaseCode,
+        p_user_id: req.user.id,
+        p_device_fingerprint: fingerprint,
+        p_role: role
+      })
 
-    if (existingParticipant) {
-      const { error: updateErr } = await supabase
-        .from('participants')
-        .update({
-          participant_status: 'joined',
-          joined_at: new Date().toISOString(),
-          left_at: null,
-          device_fingerprint: fingerprint
+    if (admitErr) {
+      console.error('[Security] auto_admit_participant_tx failed:', admitErr.message)
+      if (admitErr.message?.includes('banned')) {
+        return res.status(403).json({
+          success: false,
+          message: 'This device has been blocked by the meeting host.'
         })
-        .eq('participant_id', existingParticipant.participant_id)
-
-      if (updateErr) throw updateErr
-      console.log(`[Join] Reactivated existing participant record for user ${req.user.id}`)
-    } else {
-      const { error: insertErr } = await supabase
-        .from('participants')
-        .insert([
-          {
-            meeting_id: meeting.meeting_id,
-            user_id: req.user.id,
-            role,
-            participant_status: 'joined',
-            joined_at: new Date().toISOString(),
-            device_fingerprint: fingerprint
-          }
-        ])
-
-      if (insertErr) {
-        if (insertErr.code === '23505') {
-          console.log(`[Join] Duplicate key detected (race condition). Updating existing record.`)
-          await supabase
-            .from('participants')
-            .update({
-              participant_status: 'joined',
-              joined_at: new Date().toISOString(),
-              left_at: null,
-              device_fingerprint: fingerprint
-            })
-            .eq('meeting_id', meeting.meeting_id)
-            .eq('user_id', req.user.id)
-        } else {
-          throw insertErr
-        }
       }
-    }
-
-    // Step 5: Issue LiveKit Token
-    const apiKey = process.env.LIVEKIT_API_KEY
-    const apiSecret = process.env.LIVEKIT_API_SECRET
-    const livekitUrl = process.env.LIVEKIT_URL
-
-    if (!apiKey || !apiSecret) {
-      return res.status(500).json({ message: 'LiveKit server credentials missing.' })
+      if (admitErr.message?.includes('removed')) {
+        return res.status(403).json({
+          success: false,
+          message: 'You have been removed from this meeting by the host.'
+        })
+      }
+      if (admitErr.message?.includes('ended')) {
+        return res.status(400).json({
+          success: false,
+          message: 'This meeting has already ended.'
+        })
+      }
+      if (admitErr.message?.includes('fingerprint changed concurrently')) {
+        return res.status(409).json({
+          success: false,
+          code: 'CONCURRENCY_CONFLICT',
+          message: 'Device fingerprint changed concurrently; please retry.'
+        })
+      }
+      return res.status(400).json({
+        success: false,
+        message: admitErr.message || 'Database admission failed.'
+      })
     }
 
     // Fetch latest user profile from DB as the authoritative source for display name
@@ -622,20 +727,72 @@ export const joinMeeting = async (req, res) => {
 
     const displayName = currentUserRecord?.full_name?.trim() || req.user.full_name || req.user.name || 'Anonymous'
 
-    const at = new AccessToken(apiKey, apiSecret, {
-      identity: req.user.email || req.user.id,
-      name: displayName,
-      metadata: JSON.stringify({ userId: req.user.id, role })
-    })
+    // Step 4.5: Cloudflare RealtimeKit Enrollment (only after atomic database admission succeeds!)
+    let cfParticipant = null
+    let cloudflareMeetingId = meeting.cloudflare_meeting_id || null
 
-    at.addGrant({
-      roomJoin: true,
-      room: meeting.room_name,
-      canPublish: true,
-      canSubscribe: true
-    })
+    if (cloudflareService.isConfigured()) {
+      // Lazy provision Cloudflare meeting if host is joining and meeting predates migration
+      if (!cloudflareMeetingId && isHost) {
+        try {
+          const cfMtg = await cloudflareService.createMeeting({
+            title: meeting.meeting_title || 'Meetly AI Meeting'
+          })
+          cloudflareMeetingId = cfMtg.id
+          meeting.cloudflare_meeting_id = cfMtg.id
+          await supabase
+            .from('meetings')
+            .update({ cloudflare_meeting_id: cfMtg.id })
+            .eq('meeting_id', meeting.meeting_id)
+            .catch(() => {})
+          console.log(`[Cloudflare RealtimeKit] Lazily provisioned meeting ${cloudflareMeetingId}`)
+        } catch (cfErr) {
+          console.warn('[Join Meeting] Lazy Cloudflare meeting creation warning:', cfErr.message)
+        }
+      }
 
-    const token = await at.toJwt()
+      if (cloudflareMeetingId) {
+        const presetName = isHost ? getCloudflareHostPreset() : getCloudflareParticipantPreset()
+        try {
+          cfParticipant = await cloudflareService.addParticipant(cloudflareMeetingId, {
+            name: displayName,
+            presetName,
+            customParticipantId: req.user.id
+          })
+          console.log(`[Cloudflare RealtimeKit] Participant ${req.user.id} enrolled (preset: ${presetName})`)
+        } catch (cfEnrollErr) {
+          console.error('[Cloudflare RealtimeKit] Participant enrollment failed:', cfEnrollErr.message)
+          // DB rollback: Remove falsely admitted participant record so DB integrity is preserved
+          try {
+            await supabase
+              .from('participants')
+              .delete()
+              .eq('meeting_id', meeting.meeting_id)
+              .eq('user_id', req.user.id)
+          } catch (_) {}
+
+          return res.status(502).json({
+            success: false,
+            message: `Failed to enroll in Cloudflare RealtimeKit session: ${cfEnrollErr.message}`
+          })
+        }
+      }
+    }
+
+    if (cfParticipant?.participantId) {
+      try {
+        await supabase
+          .from('participants')
+          .update({ cloudflare_participant_id: cfParticipant.participantId })
+          .eq('meeting_id', meeting.meeting_id)
+          .eq('user_id', req.user.id)
+      } catch (_) {}
+    }
+
+    // Step 5: Verify Cloudflare RealtimeKit configuration
+    if (!cloudflareService.isConfigured()) {
+      return res.status(500).json({ message: 'Cloudflare RealtimeKit credentials missing on server.' })
+    }
 
     cancelCleanup(meeting.meeting_id)
 
@@ -648,11 +805,13 @@ export const joinMeeting = async (req, res) => {
 
     return res.status(200).json({
       message: 'Joined meeting successfully.',
-      token,
       roomName: meeting.room_name,
-      livekitUrl: livekitUrl || 'ws://localhost:7880',
+      cloudflareToken: cfParticipant?.token || null,
+      cloudflareMeetingId: cloudflareMeetingId || null,
+      cloudflareParticipantId: cfParticipant?.participantId || null,
       meeting: {
         ...meeting,
+        cloudflare_meeting_id: cloudflareMeetingId || meeting.cloudflare_meeting_id || null,
         active_host_id: activeHostId,
         assigned_host_id: meeting.assigned_host_id || null,
         mute_all_enabled: muteAllEnabled,
@@ -775,8 +934,8 @@ export const leaveMeeting = async (req, res) => {
     }
 
     const query = isUuid(meetingId)
-      ? supabase.from('meetings').select('meeting_id, meeting_code, room_name').eq('meeting_id', meetingId)
-      : supabase.from('meetings').select('meeting_id, meeting_code, room_name').eq('meeting_code', meetingId.trim().toUpperCase())
+      ? supabase.from('meetings').select('meeting_id, meeting_code, room_name, cloudflare_meeting_id').eq('meeting_id', meetingId)
+      : supabase.from('meetings').select('meeting_id, meeting_code, room_name, cloudflare_meeting_id').eq('meeting_code', meetingId.trim().toUpperCase())
 
     const { data: meeting, error: fetchErr } = await query.maybeSingle()
 
@@ -784,6 +943,14 @@ export const leaveMeeting = async (req, res) => {
     if (!meeting) {
       return res.status(404).json({ message: 'Meeting not found.' })
     }
+
+    // Fetch existing participant record to obtain cloudflare_participant_id if available
+    const { data: participant } = await supabase
+      .from('participants')
+      .select('participant_id, cloudflare_participant_id, participant_status')
+      .eq('meeting_id', meeting.meeting_id)
+      .eq('user_id', req.user.id)
+      .maybeSingle()
 
     const now = new Date().toISOString()
 
@@ -800,6 +967,16 @@ export const leaveMeeting = async (req, res) => {
 
     console.log(`[Leave] User ${req.user.id} left meeting ${meeting.meeting_id}`)
 
+    // Evict participant from Cloudflare RealtimeKit room if applicable
+    if (meeting.cloudflare_meeting_id && participant?.cloudflare_participant_id && cloudflareService.isConfigured()) {
+      try {
+        await cloudflareService.removeParticipant(meeting.cloudflare_meeting_id, participant.cloudflare_participant_id)
+        console.log(`[Leave] Successfully removed Cloudflare participant ${participant.cloudflare_participant_id} from meeting ${meeting.cloudflare_meeting_id}`)
+      } catch (cfErr) {
+        console.warn(`[Leave] Cloudflare removeParticipant warning for ${participant.cloudflare_participant_id}:`, cfErr.message)
+      }
+    }
+
     // Check if 0 active/joined participants remain in meeting
     const { data: remaining } = await supabase
       .from('participants')
@@ -811,7 +988,7 @@ export const leaveMeeting = async (req, res) => {
       scheduleCleanup(meeting.meeting_id, meeting.meeting_code, meeting.room_name)
     }
 
-    return res.status(200).json({ message: 'Left meeting successfully.' })
+    return res.status(200).json({ success: true, message: 'Left meeting successfully.' })
   } catch (err) {
     console.error('Leave meeting error:', err)
     return res.status(500).json({ message: 'Server error while leaving meeting.' })
@@ -897,6 +1074,16 @@ Stack/Caller: endMeeting inside meetingController.js
     }
 
     cancelMeetingExpiration(meeting.meeting_id)
+
+    // Deactivate Cloudflare RealtimeKit meeting room if provisioned
+    if (meeting.cloudflare_meeting_id && cloudflareService.isConfigured()) {
+      try {
+        await cloudflareService.endMeeting(meeting.cloudflare_meeting_id)
+        console.log(`[Cloudflare RealtimeKit] Deactivated meeting ${meeting.cloudflare_meeting_id}`)
+      } catch (cfEndErr) {
+        console.warn(`[Cloudflare RealtimeKit] Deactivation warning for ${meeting.cloudflare_meeting_id}:`, cfEndErr.message)
+      }
+    }
 
     console.log(`[End] Meeting ${meeting.meeting_id} ended by host ${req.user.id}. All participants marked as left.`)
 
@@ -1581,11 +1768,22 @@ export const submitTranscriptChunk = async (req, res) => {
     transcriptFormData.append('response_format', 'verbose_json')
 
     console.log('[Transcript Chunk] Step 1 — Sending audio to Groq Whisper (transcriptions, verbose_json)...')
-    const groqTranscriptRes = await fetch('https://api.groq.com/openai/v1/audio/transcriptions', {
-      method: 'POST',
-      headers: { 'Authorization': `Bearer ${apiKey}` },
-      body: transcriptFormData
-    })
+    let groqTranscriptRes
+    try {
+      groqTranscriptRes = await fetch('https://api.groq.com/openai/v1/audio/transcriptions', {
+        method: 'POST',
+        headers: { 'Authorization': `Bearer ${apiKey}` },
+        body: transcriptFormData,
+        signal: AbortSignal.timeout(8000)
+      })
+    } catch (fetchErr) {
+      if (fetchErr.name === 'TimeoutError' || fetchErr.name === 'AbortError') {
+        console.error('[Transcript Chunk Error] Groq transcriptions API request timed out after 8s.')
+        return res.status(504).json({ message: 'Transcription request timed out.' })
+      }
+      console.error('[Transcript Chunk Error] Groq transcriptions fetch network error:', fetchErr.message)
+      return res.status(502).json({ message: 'Failed to connect to transcription service.' })
+    }
 
     if (!groqTranscriptRes.ok) {
       const errorText = await groqTranscriptRes.text()
@@ -1663,7 +1861,8 @@ export const submitTranscriptChunk = async (req, res) => {
         const groqTranslationRes = await fetch('https://api.groq.com/openai/v1/audio/translations', {
           method: 'POST',
           headers: { 'Authorization': `Bearer ${apiKey}` },
-          body: translationFormData
+          body: translationFormData,
+          signal: AbortSignal.timeout(8000)
         })
 
         if (!groqTranslationRes.ok) {
@@ -1680,7 +1879,11 @@ export const submitTranscriptChunk = async (req, res) => {
           }
         }
       } catch (translationErr) {
-        console.warn('[Transcript Chunk] Translation call failed (non-fatal) — storing raw only. Error:', translationErr.message)
+        if (translationErr.name === 'TimeoutError' || translationErr.name === 'AbortError') {
+          console.warn('[Transcript Chunk] Translation call timed out after 8s — storing raw only.')
+        } else {
+          console.warn('[Transcript Chunk] Translation call failed (non-fatal) — storing raw only. Error:', translationErr.message)
+        }
       }
     } else if (!needsTranslation) {
       englishTranscript = transcribedText
@@ -2629,6 +2832,13 @@ export const startRetentionCleanup = () => {
 }
 
 // 16. SUBMIT ATTENDANCE (AI Face Detection record)
+const parseUtcDate = (val) => {
+  if (!val) return null
+  if (val instanceof Date) return val
+  const str = String(val).trim()
+  return new Date(str.endsWith('Z') || /[+-]\d{2}(:\d{2})?$/.test(str) ? str : str + 'Z')
+}
+
 export const submitAttendance = async (req, res) => {
   try {
     const {
@@ -2651,18 +2861,69 @@ export const submitAttendance = async (req, res) => {
       return res.status(400).json({ message: 'Meeting ID is required.' })
     }
 
-    // Fetch the meeting to check host_id and meeting timestamps (started_at, ended_at, created_at)
-    const { data: meetingCheck, error: mErrCheck } = await supabase
-      .from('meetings')
-      .select('host_id, started_at, ended_at, created_at')
-      .eq('meeting_id', meetingId)
-      .maybeSingle()
+    if (!req.user?.id) {
+      console.error('[Attendance Error] Missing req.user.id')
+      return res.status(401).json({ message: 'Authentication required.' })
+    }
+
+    // Fetch the meeting to check host roles and meeting timestamps
+    const meetingQuery = isUuid(meetingId)
+      ? supabase.from('meetings').select('meeting_id, host_id, active_host_id, assigned_host_id, started_at, ended_at, created_at').eq('meeting_id', meetingId)
+      : supabase.from('meetings').select('meeting_id, host_id, active_host_id, assigned_host_id, started_at, ended_at, created_at').eq('meeting_code', meetingId.trim().toUpperCase())
+
+    const { data: meetingCheck, error: mErrCheck } = await meetingQuery.maybeSingle()
 
     if (mErrCheck) {
       console.error('[Attendance Error] Failed to fetch meeting details:', mErrCheck)
-    } else if (meetingCheck && meetingCheck.host_id === req.user.id) {
-      console.log('[Attendance] Bypassing attendance submission: User is the meeting host.')
-      return res.status(200).json({ message: 'Host attendance bypassed.' })
+    }
+
+    const targetMeetingId = meetingCheck?.meeting_id || meetingId
+
+    // Server-side host eligibility check: exclude all host roles (Original host, Active host, Assigned host)
+    if (meetingCheck && req.user?.id) {
+      const userIdStr = String(req.user.id).trim().toLowerCase()
+      const isOriginalHost = meetingCheck.host_id && String(meetingCheck.host_id).trim().toLowerCase() === userIdStr
+      const isActiveHost = meetingCheck.active_host_id && String(meetingCheck.active_host_id).trim().toLowerCase() === userIdStr
+      const isAssignedHost = meetingCheck.assigned_host_id && String(meetingCheck.assigned_host_id).trim().toLowerCase() === userIdStr
+
+      if (isOriginalHost || isActiveHost || isAssignedHost) {
+        const hostRole = isOriginalHost ? 'original host' : (isActiveHost ? 'active host' : 'assigned host')
+        console.log(`[Attendance Skipped] User ${req.user.id} is the ${hostRole} for meeting ${targetMeetingId}. Attendance tracking is excluded for host roles.`)
+        return res.status(200).json({
+          success: true,
+          message: `Attendance skipped: ${hostRole} is excluded from attendance tracking.`,
+          skipped: true
+        })
+      }
+    }
+
+    // Participant eligibility check: Only admitted participants can record attendance
+    const { data: part, error: partErr } = await supabase
+      .from('participants')
+      .select('participant_id, participant_status')
+      .eq('meeting_id', targetMeetingId)
+      .eq('user_id', req.user.id)
+      .maybeSingle()
+
+    if (partErr) {
+      console.error('[Attendance Error] Error checking participant status:', partErr)
+      return res.status(500).json({ message: 'Failed to verify participant membership.' })
+    }
+
+    const admittedStatuses = ['joined', 'left', 'disconnected', 'enrolling']
+    const isAdmitted = part && admittedStatuses.includes(part.participant_status)
+
+    if (!isAdmitted || part?.participant_status === 'removed') {
+      const reason = !part
+        ? 'User has not joined this meeting.'
+        : part.participant_status === 'removed'
+          ? 'User has been removed from this meeting.'
+          : `User status '${part.participant_status}' is not eligible for attendance.`
+      console.log(`[Attendance Rejected] User ${req.user.id} rejected from attendance for meeting ${targetMeetingId}: ${reason}`)
+      return res.status(403).json({
+        message: 'Access denied. Only admitted participants can record attendance.',
+        reason
+      })
     }
 
     const incomingPresence = presenceSeconds !== undefined ? Number(presenceSeconds) : 0
@@ -2671,7 +2932,7 @@ export const submitAttendance = async (req, res) => {
     const isOverwrite = isFinalSubmit === true
 
     console.log('[Attendance Backend Received]', {
-      meetingId,
+      meetingId: targetMeetingId,
       userId: req.user.id,
       incomingPresence,
       incomingDuration,
@@ -2682,7 +2943,7 @@ export const submitAttendance = async (req, res) => {
     const { data: existingRecord, error: fetchErr } = await supabase
       .from('meeting_attendance')
       .select('presence_seconds, meeting_duration_seconds, camera_permission')
-      .eq('meeting_id', meetingId)
+      .eq('meeting_id', targetMeetingId)
       .eq('user_id', req.user.id)
       .maybeSingle()
 
@@ -2693,43 +2954,35 @@ export const submitAttendance = async (req, res) => {
     }
 
     let finalPresence
-    let finalDuration
     let finalCameraPermission
 
-    if (existingRecord && !isOverwrite) {
-      // Reconnect path: frontend lost its state (no isFinalSubmit flag) — accumulate
-      console.log('[Attendance] Accumulating (reconnect): old presence =', existingRecord.presence_seconds, '+ new =', incomingPresence)
+    if (existingRecord && !req.body.forceOverwrite) {
+      // Rejoin / reconnect path: preserve previous attendance and accumulate session presence
+      console.log('[Attendance Continuity] Accumulating attendance: old presence =', existingRecord.presence_seconds, '+ incoming =', incomingPresence)
       finalPresence = (existingRecord.presence_seconds || 0) + incomingPresence
-      finalDuration = (existingRecord.meeting_duration_seconds || 0) + incomingDuration
       finalCameraPermission = existingRecord.camera_permission || incomingCamPermission
     } else {
-      // Final submit path: frontend sends authoritative total — overwrite
-      if (existingRecord && isOverwrite) {
-        console.log('[Attendance] Overwriting stale record. Old presence =', existingRecord.presence_seconds, '→ New presence =', incomingPresence)
-      } else {
-        console.log('[Attendance] First submission (no existing record). Presence =', incomingPresence)
-      }
+      // Initial submission or administrative forceOverwrite
+      console.log('[Attendance Continuity] Initial attendance record. Presence =', incomingPresence)
       finalPresence = incomingPresence
-      finalDuration = incomingDuration
       finalCameraPermission = incomingCamPermission
     }
 
     // Clamp to sane values
     finalPresence = Math.max(0, finalPresence)
-    finalDuration = Math.max(0, finalDuration)
 
     // Total meeting duration from DB timestamps (started_at to ended_at/now)
     let totalMeetingSec = 0
     if (meetingCheck) {
-      const start = meetingCheck.started_at || meetingCheck.created_at
-      const end = meetingCheck.ended_at || new Date().toISOString()
-      if (start) {
-        totalMeetingSec = Math.max(1, Math.round((new Date(end) - new Date(start)) / 1000))
+      const start = parseUtcDate(meetingCheck.started_at || meetingCheck.created_at)
+      const end = parseUtcDate(meetingCheck.ended_at || new Date().toISOString())
+      if (start && end) {
+        totalMeetingSec = Math.max(1, Math.round((end.getTime() - start.getTime()) / 1000))
       }
     }
-    // Fallback if meeting timestamps were missing
+    // Fallback if meeting timestamps were missing: use maximum of recorded duration or incoming duration (do not accumulate denominator)
     if (totalMeetingSec <= 0) {
-      totalMeetingSec = finalDuration > 0 ? finalDuration : Math.max(1, finalPresence)
+      totalMeetingSec = Math.max(existingRecord?.meeting_duration_seconds || 0, incomingDuration || 0, finalPresence, 1)
     }
 
     // Calculate attendance using official formula: (Participant Duration / Total Meeting Duration) * 100
@@ -2751,9 +3004,9 @@ export const submitAttendance = async (req, res) => {
       .from('meeting_attendance')
       .upsert(
         {
-          meeting_id: meetingId,
+          meeting_id: targetMeetingId,
           user_id: req.user.id,
-          meeting_duration_seconds: finalDuration,
+          meeting_duration_seconds: totalMeetingSec,
           presence_seconds: finalPresence,
           attendance_percentage: finalPercentage,
           status: finalStatus,
@@ -2773,7 +3026,7 @@ export const submitAttendance = async (req, res) => {
     const { data: verifyRow } = await supabase
       .from('meeting_attendance')
       .select('presence_seconds, attendance_percentage, status')
-      .eq('meeting_id', meetingId)
+      .eq('meeting_id', targetMeetingId)
       .eq('user_id', req.user.id)
       .maybeSingle()
 
@@ -2808,27 +3061,55 @@ export const getAttendanceReport = async (req, res) => {
     const meeting = auth.meeting
 
     const hostId = meeting?.host_id
+    const activeHostId = meeting?.active_host_id
+    const assignedHostId = meeting?.assigned_host_id
+
+    // Collect all host role IDs (lowercase for reliable string comparison)
+    const hostRoleIds = new Set(
+      [hostId, activeHostId, assignedHostId]
+        .filter(Boolean)
+        .map((id) => String(id).trim().toLowerCase())
+    )
 
     // Compute total meeting duration in seconds
-    const start = meeting?.started_at ? new Date(meeting.started_at) : (meeting?.created_at ? new Date(meeting.created_at) : null)
-    const end = meeting?.ended_at ? new Date(meeting.ended_at) : new Date()
-    const totalMtgSec = start ? Math.max(1, Math.round((end - start) / 1000)) : 0
+    const start = parseUtcDate(meeting?.started_at || meeting?.created_at)
+    const end = parseUtcDate(meeting?.ended_at || new Date().toISOString())
+    const totalMtgSec = (start && end) ? Math.max(1, Math.round((end.getTime() - start.getTime()) / 1000)) : 0
 
     console.log('[Attendance Report]')
     console.log(`  meetingId=${meetingId}`)
     console.log(`  meetingFound=${!!meeting}`)
     console.log(`  hostId=${hostId}`)
+    console.log(`  activeHostId=${activeHostId}`)
+    console.log(`  assignedHostId=${assignedHostId}`)
     console.log(`  totalMtgSec=${totalMtgSec}`)
+
+    // Fetch participants for this meeting to verify admission status
+    const targetMeetingId = meeting?.meeting_id || meetingId
+    const { data: participantsList, error: partListErr } = await supabase
+      .from('participants')
+      .select('user_id, participant_status')
+      .eq('meeting_id', targetMeetingId)
+
+    if (partListErr) {
+      console.warn('[Attendance Report Warning] Failed to fetch participants list:', partListErr)
+    }
+
+    const admittedStatuses = new Set(['joined', 'left', 'disconnected', 'enrolling'])
+    const participantStatusMap = new Map()
+    if (participantsList && participantsList.length > 0) {
+      participantsList.forEach((p) => {
+        if (p.user_id) {
+          participantStatusMap.set(String(p.user_id).trim().toLowerCase(), p.participant_status)
+        }
+      })
+    }
 
     // Join users table to get the user's full_name dynamically
     let query = supabase
       .from('meeting_attendance')
       .select('*, user:user_id ( full_name )')
-      .eq('meeting_id', meetingId)
-
-    if (hostId) {
-      query = query.neq('user_id', hostId)
-    }
+      .eq('meeting_id', targetMeetingId)
 
     const { data: records, error } = await query
 
@@ -2837,19 +3118,43 @@ export const getAttendanceReport = async (req, res) => {
       return res.status(500).json({ message: 'Failed to retrieve attendance logs.' })
     }
 
-    console.log(`  records found=${records?.length ?? 0}`)
-    if (records && records.length > 0) {
-      records.forEach((r, i) => {
+    // Filter out all host roles and ineligible participants from attendance report so only admitted participants appear
+    const participantRecords = (records || []).filter((rec) => {
+      if (!rec.user_id) return false
+      const recUserId = String(rec.user_id).trim().toLowerCase()
+
+      // Exclude host roles
+      const isHostRecord = hostRoleIds.has(recUserId)
+      if (isHostRecord) {
+        console.log(`[Attendance Report] Excluded host record for user_id=${rec.user_id} from attendance report.`)
+        return false
+      }
+
+      // Exclude ineligible participants if participant table records are available
+      if (participantStatusMap.size > 0) {
+        const pStatus = participantStatusMap.get(recUserId)
+        if (!pStatus || !admittedStatuses.has(pStatus) || pStatus === 'removed') {
+          console.log(`[Attendance Report] Excluded ineligible participant record for user_id=${rec.user_id} (status='${pStatus || 'not_found'}') from attendance report.`)
+          return false
+        }
+      }
+
+      return true
+    })
+
+    console.log(`  records found=${participantRecords.length}`)
+    if (participantRecords && participantRecords.length > 0) {
+      participantRecords.forEach((r, i) => {
         console.log(`  record[${i}] user_id=${r.user_id} presence_seconds=${r.presence_seconds} status=${r.status}`)
       })
     }
 
-    const rowCount = records?.length || 0
-    console.log(`[Attendance] Attendance SELECT returned ${rowCount} rows`)
+    const rowCount = participantRecords.length
+    console.log(`[Attendance] Attendance SELECT returned ${rowCount} participant rows`)
 
     // Map records — calculate percentage using total meeting duration as denominator:
     // Attendance Percentage = (Participant Attendance Duration / Total Meeting Duration) * 100
-    const mapped = (records || []).map((rec) => {
+    const mapped = participantRecords.map((rec) => {
       const pAttendanceSec = Math.max(0, rec.presence_seconds != null ? Number(rec.presence_seconds) : 0)
       const storedDuration = rec.meeting_duration_seconds != null ? Number(rec.meeting_duration_seconds) : 0
 

@@ -264,9 +264,19 @@ export const getMeetingTranscriptText = async (req, res) => {
     const isLiveHost = isOriginalHost || isActiveHost || isAssignedHost
 
     if (meeting.meeting_status === 'Ended') {
-      // Completed meeting: Only the permanent Original Host can access transcript history
+      // Completed meeting: Host or authorized participants who were in the meeting can access transcript history
       if (!isOriginalHost) {
-        return res.status(403).json({ success: false, message: 'Access denied. Only the Original Host can access completed meeting transcripts.' })
+        const { data: part, error: partErr } = await supabase
+          .from('participants')
+          .select('participant_id, participant_status')
+          .eq('meeting_id', targetMeetingId)
+          .eq('user_id', req.user?.id)
+          .maybeSingle()
+
+        if (partErr) throw partErr
+        if (!part || part.participant_status === 'removed') {
+          return res.status(403).json({ success: false, message: 'Access denied. You do not belong to this meeting.' })
+        }
       }
     } else {
       // Live meeting: Either an authorized host or an active participant can fetch transcript
@@ -287,7 +297,7 @@ export const getMeetingTranscriptText = async (req, res) => {
 
     const { data: chunks, error: fetchErr } = await supabase
       .from('meeting_transcripts')
-      .select('speaker_name, transcript, english_transcript')
+      .select('id, speaker_name, transcript, english_transcript, created_at')
       .eq('meeting_id', targetMeetingId)
       .order('created_at', { ascending: true })
 
@@ -299,9 +309,21 @@ export const getMeetingTranscriptText = async (req, res) => {
       .map(c => `${c.speaker_name}: ${c.english_transcript || c.transcript}`)
       .join('\n')
 
+    const structuredChunks = (chunks || []).map((c) => {
+      const createdAt = c.created_at ? new Date(c.created_at) : new Date()
+      return {
+        id: c.id,
+        speaker: c.speaker_name || 'Participant',
+        text: c.english_transcript || c.transcript || '',
+        time: createdAt.toLocaleTimeString('en-US', { hour: '2-digit', minute: '2-digit' }),
+        createdAt: c.created_at
+      }
+    })
+
     return res.status(200).json({
       success: true,
-      transcript: transcriptText
+      transcript: transcriptText,
+      chunks: structuredChunks
     })
   } catch (err) {
     console.error('[AI Chat Transcript Get Error]:', err)

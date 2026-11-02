@@ -17,9 +17,14 @@ export function MeetingProvider({ children }) {
   const { user } = useAuth()
   const [meetings, setMeetings] = useState([])
   const [currentMeeting, setCurrentMeeting] = useState(null)
-  const [livekitToken, setLivekitToken] = useState(null)
-  const [livekitUrl, setLivekitUrl] = useState(null)
   const [roomName, setRoomName] = useState(null)
+
+  // Cloudflare RealtimeKit state (Sole meeting provider)
+  const [cloudflareToken, setCloudflareToken] = useState(null)
+  const [cloudflareMeetingId, setCloudflareMeetingId] = useState(null)
+  const [cloudflareParticipantId, setCloudflareParticipantId] = useState(null)
+  const [providerOverride, setProviderOverride] = useState(null)
+
   const [isLoading, setIsLoading] = useState(false)
 
   // Single-flight state flags to prevent duplicate simultaneous requests
@@ -31,6 +36,28 @@ export function MeetingProvider({ children }) {
   const creatingRef = useRef(false)
   const joiningRef = useRef(false)
   const leavingRef = useRef(false)
+
+  // Cloudflare RealtimeKit is the sole provider
+  const activeProvider = cloudflareToken ? 'cloudflare' : null
+
+  // Validates and sets provider override ('cloudflare' | null)
+  const setActiveProvider = useCallback((provider) => {
+    if (provider === null || provider === 'cloudflare') {
+      setProviderOverride(provider)
+    } else {
+      console.warn(`[MeetingContext] Invalid provider override '${provider}' ignored. Cloudflare RealtimeKit is the sole provider.`)
+    }
+  }, [])
+
+  // Helper to cleanly reset all meeting credentials and provider state
+  const clearCredentials = useCallback(() => {
+    setCurrentMeeting(null)
+    setRoomName(null)
+    setCloudflareToken(null)
+    setCloudflareMeetingId(null)
+    setCloudflareParticipantId(null)
+    setProviderOverride(null)
+  }, [])
 
   // 1. Fetch recent active meetings
   const refreshMeetings = useCallback(async () => {
@@ -59,18 +86,15 @@ export function MeetingProvider({ children }) {
   // Reload/Reset meeting state when user changes or logs out
   useEffect(() => {
     if (!user) {
-      setCurrentMeeting(null)
-      setLivekitToken(null)
-      setLivekitUrl(null)
-      setRoomName(null)
+      clearCredentials()
       setMeetings([])
     } else {
       refreshMeetings()
     }
-  }, [user, refreshMeetings])
+  }, [user, refreshMeetings, clearCredentials])
 
   // 2. CREATE MEETING
-  // Atomic creation: stores meeting details AND LiveKit token immediately in state
+  // Atomic creation: stores meeting details and Cloudflare credentials
   const createMeeting = async (title, type = 'public', password = '', enableAiAnalyzer = false, enableAiAttendance = false, durationMinutes = 30) => {
     if (creatingRef.current) {
       console.log('[MeetingContext] Create meeting already in-flight, ignoring duplicate call.')
@@ -102,7 +126,11 @@ export function MeetingProvider({ children }) {
         throw new Error(data.message || 'Failed to create meeting')
       }
 
-      console.log('[MeetingContext] createMeeting backend success. Setting currentMeeting and LiveKit token...')
+      console.log('[MeetingContext] createMeeting backend success. Setting currentMeeting and credentials...')
+
+      const cfToken = data.cloudflareToken || null
+      const cfMeetingId = data.cloudflareMeetingId || data.meeting?.cloudflare_meeting_id || null
+      const cfParticipantId = data.cloudflareParticipantId || null
 
       const activeMtg = {
         id: data.meetingCode || data.meeting.meeting_code,
@@ -113,8 +141,10 @@ export function MeetingProvider({ children }) {
         status: data.meeting.meeting_status,
         type: data.meeting.meeting_type,
         roomName: data.roomName || data.meeting.room_name,
-        token: data.livekitToken,
-        livekitUrl: data.livekitUrl,
+        cloudflareToken: cfToken,
+        cloudflareMeetingId: cfMeetingId,
+        cloudflareParticipantId: cfParticipantId,
+        cloudflare_meeting_id: cfMeetingId,
         durationMinutes: data.meeting?.duration_minutes || Number(durationMinutes),
         duration_minutes: data.meeting?.duration_minutes || Number(durationMinutes),
         scheduledEndTime: data.meeting?.scheduled_end_time || null,
@@ -131,13 +161,15 @@ export function MeetingProvider({ children }) {
         meeting_id: activeMtg.dbId,
         host_id: activeMtg.host_id,
         assigned_host_id: activeMtg.assigned_host_id,
-        active_host_id: activeMtg.active_host_id
+        active_host_id: activeMtg.active_host_id,
+        hasCloudflareToken: Boolean(cfToken)
       })
 
       setCurrentMeeting(activeMtg)
-      setLivekitToken(data.livekitToken)
-      setLivekitUrl(data.livekitUrl)
       setRoomName(data.roomName || data.meeting.room_name)
+      setCloudflareToken(cfToken)
+      setCloudflareMeetingId(cfMeetingId)
+      setCloudflareParticipantId(cfParticipantId)
 
       await refreshMeetings()
       return activeMtg
@@ -152,7 +184,7 @@ export function MeetingProvider({ children }) {
   }
 
   // 3. JOIN MEETING
-  // Idempotent join: returns LiveKit token and meeting state
+  // Idempotent join: returns provider tokens and meeting state
   const joinMeeting = async (code, password = '', deviceFingerprint = '') => {
     if (joiningRef.current) {
       console.log('[MeetingContext] Join meeting already in-flight for code:', code)
@@ -186,7 +218,11 @@ export function MeetingProvider({ children }) {
         return { status: 'waiting', message: data.message }
       }
 
-      console.log('[MeetingContext] joinMeeting backend success. Setting currentMeeting and LiveKit token...')
+      console.log('[MeetingContext] joinMeeting backend success. Setting currentMeeting and credentials...')
+
+      const cfToken = data.cloudflareToken || null
+      const cfMeetingId = data.cloudflareMeetingId || data.meeting?.cloudflare_meeting_id || null
+      const cfParticipantId = data.cloudflareParticipantId || null
 
       const activeMtg = {
         id: data.meeting.meeting_code,
@@ -197,8 +233,10 @@ export function MeetingProvider({ children }) {
         status: data.meeting.meeting_status,
         type: data.meeting.meeting_type,
         roomName: data.roomName || data.meeting.room_name,
-        token: data.token,
-        livekitUrl: data.livekitUrl,
+        cloudflareToken: cfToken,
+        cloudflareMeetingId: cfMeetingId,
+        cloudflareParticipantId: cfParticipantId,
+        cloudflare_meeting_id: cfMeetingId,
         duration_minutes: data.meeting?.duration_minutes,
         durationMinutes: data.meeting?.duration_minutes,
         scheduled_end_time: data.meeting?.scheduled_end_time || null,
@@ -211,13 +249,15 @@ export function MeetingProvider({ children }) {
         meeting_id: activeMtg.dbId,
         host_id: activeMtg.host_id,
         assigned_host_id: activeMtg.assigned_host_id,
-        active_host_id: activeMtg.active_host_id
+        active_host_id: activeMtg.active_host_id,
+        hasCloudflareToken: Boolean(cfToken)
       })
 
       setCurrentMeeting(activeMtg)
-      setLivekitToken(data.token)
       setRoomName(data.roomName)
-      setLivekitUrl(data.livekitUrl)
+      setCloudflareToken(cfToken)
+      setCloudflareMeetingId(cfMeetingId)
+      setCloudflareParticipantId(cfParticipantId)
 
       await refreshMeetings()
 
@@ -233,7 +273,7 @@ export function MeetingProvider({ children }) {
   }
 
   // 4. ACTIVATE MEETING
-  // Called when LiveKit room connects successfully to transition status from Waiting -> Active
+  // Called when room connects successfully to transition status from Waiting -> Active
   const activateMeeting = async (meetingId) => {
     if (!meetingId) return null
     try {
@@ -277,10 +317,7 @@ export function MeetingProvider({ children }) {
     } catch (err) {
       console.error('[MeetingContext] Failed to notify backend on leave:', err)
     } finally {
-      setCurrentMeeting(null)
-      setLivekitToken(null)
-      setLivekitUrl(null)
-      setRoomName(null)
+      clearCredentials()
       leavingRef.current = false
       setIsLeavingMeeting(false)
       refreshMeetings()
@@ -297,17 +334,13 @@ export function MeetingProvider({ children }) {
         body: JSON.stringify({ meetingId }),
         credentials: 'include'
       })
-
       const data = await res.json()
       if (!res.ok) {
         throw new Error(data.message || 'Failed to end meeting')
       }
 
       if (currentMeeting?.id === meetingId || currentMeeting?.dbId === meetingId) {
-        setCurrentMeeting(null)
-        setLivekitToken(null)
-        setLivekitUrl(null)
-        setRoomName(null)
+        clearCredentials()
       }
       await refreshMeetings()
       return true
@@ -371,10 +404,7 @@ export function MeetingProvider({ children }) {
     }
 
     if (currentMeeting?.id === idOrCode || currentMeeting?.dbId === idOrCode) {
-      setCurrentMeeting(null)
-      setLivekitToken(null)
-      setLivekitUrl(null)
-      setRoomName(null)
+      clearCredentials()
     }
     await refreshMeetings()
     return true
@@ -416,7 +446,7 @@ export function MeetingProvider({ children }) {
   }
 
   // 11. GET SINGLE MEETING DETAILS
-  const fetchMeetingDetails = async (idOrCode) => {
+  const fetchMeetingDetails = useCallback(async (idOrCode) => {
     const res = await fetch(`${API_URL}/details/${idOrCode}`, {
       method: 'GET',
       headers: getAuthHeaders(),
@@ -427,10 +457,10 @@ export function MeetingProvider({ children }) {
       throw new Error(data.message || 'Failed to fetch meeting details')
     }
     return await res.json()
-  }
+  }, [])
 
   // 12. GET LIST OF ACTIVE PARTICIPANTS
-  const fetchMeetingParticipants = async (idOrCode) => {
+  const fetchMeetingParticipants = useCallback(async (idOrCode) => {
     const res = await fetch(`${API_URL}/participants/${idOrCode}`, {
       method: 'GET',
       headers: getAuthHeaders(),
@@ -441,10 +471,10 @@ export function MeetingProvider({ children }) {
       throw new Error(data.message || 'Failed to fetch meeting participants')
     }
     return await res.json()
-  }
+  }, [])
 
   // 13. GENERATE MEETING SUMMARY
-  const generateMeetingSummary = async (meetingId) => {
+  const generateMeetingSummary = useCallback(async (meetingId) => {
     const res = await fetch(`${API_URL}/summary/generate`, {
       method: 'POST',
       headers: getAuthHeaders(),
@@ -456,10 +486,10 @@ export function MeetingProvider({ children }) {
       throw new Error(data.message || 'Unable to generate meeting summary. Please try again.')
     }
     return data.summary
-  }
+  }, [])
 
   // FETCH STORED SUMMARY
-  const fetchMeetingSummary = async (meetingId) => {
+  const fetchMeetingSummary = useCallback(async (meetingId) => {
     const res = await fetch(`${API_URL}/summary/${meetingId}`, {
       method: 'GET',
       headers: getAuthHeaders(),
@@ -470,10 +500,10 @@ export function MeetingProvider({ children }) {
       throw new Error(data.message || 'Unable to fetch meeting summary.')
     }
     return data.summary
-  }
+  }, [])
 
   // 14. SUBMIT ATTENDANCE RECORD
-  const submitAttendanceRecord = async (record) => {
+  const submitAttendanceRecord = useCallback(async (record) => {
     const res = await fetch(`${API_URL}/attendance`, {
       method: 'POST',
       headers: getAuthHeaders(),
@@ -485,10 +515,10 @@ export function MeetingProvider({ children }) {
       throw new Error(data.message || 'Failed to submit attendance.')
     }
     return data
-  }
+  }, [])
 
   // 15. GET ATTENDANCE REPORT
-  const getAttendanceReport = async (meetingId) => {
+  const getAttendanceReport = useCallback(async (meetingId) => {
     const res = await fetch(`${API_URL}/attendance/report/${meetingId}`, {
       method: 'GET',
       headers: getAuthHeaders(),
@@ -499,10 +529,10 @@ export function MeetingProvider({ children }) {
       throw new Error(data.message || 'Failed to retrieve attendance logs.')
     }
     return data
-  }
+  }, [])
 
   // 16. CLEAR ATTENDANCE RECORDS (After successful download)
-  const clearAttendanceRecords = async (meetingId) => {
+  const clearAttendanceRecords = useCallback(async (meetingId) => {
     const res = await fetch(`${API_URL}/attendance/report/${meetingId}`, {
       method: 'DELETE',
       headers: getAuthHeaders(),
@@ -513,18 +543,37 @@ export function MeetingProvider({ children }) {
       throw new Error(data.message || 'Failed to clear attendance logs.')
     }
     return data
-  }
+  }, [])
+
+  // 17. GET TRANSCRIPT TEXT & STRUCTURED CHUNKS
+  const fetchMeetingTranscript = useCallback(async (meetingId) => {
+    const res = await fetch(`${API_URL}/${meetingId}/transcript`, {
+      method: 'GET',
+      headers: getAuthHeaders(),
+      credentials: 'include'
+    })
+    const data = await res.json()
+    if (!res.ok) {
+      throw new Error(data.message || 'Unable to fetch meeting transcript.')
+    }
+    return data
+  }, [])
 
   return (
     <MeetingContext.Provider
       value={{
         meetings,
         currentMeeting,
-        livekitToken,
-        livekitUrl,
-        setLivekitToken,
-        setLivekitUrl,
         roomName,
+        cloudflareToken,
+        setCloudflareToken,
+        cloudflareMeetingId,
+        setCloudflareMeetingId,
+        cloudflareParticipantId,
+        setCloudflareParticipantId,
+        activeProvider,
+        setActiveProvider,
+        clearCredentials,
         isLoading,
         isCreatingMeeting,
         isJoiningMeeting,
@@ -543,6 +592,7 @@ export function MeetingProvider({ children }) {
         fetchMeetingParticipants,
         generateMeetingSummary,
         fetchMeetingSummary,
+        fetchMeetingTranscript,
         submitAttendanceRecord,
         getAttendanceReport,
         clearAttendanceRecords,

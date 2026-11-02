@@ -1,7 +1,15 @@
 import { useState, useRef, useEffect, useCallback } from 'react'
-import { RoomEvent, Track } from 'livekit-client'
+import {
+  detectProvider,
+  extractInitialAudioTracks,
+  subscribeToRoomAudio,
+  connectTrackToMixer,
+  disconnectTrackFromMixer,
+  disconnectAllTracksFromMixer,
+  isLiveAudioTrack
+} from '../components/meeting/screenRecorderAudioUtils.js'
 
-const API_BASE = `${import.meta.env.VITE_API_URL || 'http://localhost:5000'}/api/meetings`
+const API_BASE = `${import.meta?.env?.VITE_API_URL || 'http://localhost:5000'}/api/meetings`
 
 const getAuthHeaders = () => {
   const token = typeof window !== 'undefined' ? sessionStorage.getItem('meetly_auth_token') : null
@@ -16,7 +24,8 @@ const getAuthHeaders = () => {
  * Negotiates best supported video MIME type for MediaRecorder.
  */
 const getSupportedMimeType = () => {
-  if (typeof window === 'undefined' || !window.MediaRecorder) return ''
+  const mr = typeof window !== 'undefined' ? window.MediaRecorder : typeof MediaRecorder !== 'undefined' ? MediaRecorder : null
+  if (!mr || typeof mr.isTypeSupported !== 'function') return ''
   const candidates = [
     'video/webm;codecs=vp9,opus',
     'video/webm;codecs=vp8,opus',
@@ -25,7 +34,7 @@ const getSupportedMimeType = () => {
     'video/mp4'
   ]
   for (const candidate of candidates) {
-    if (MediaRecorder.isTypeSupported(candidate)) {
+    if (mr.isTypeSupported(candidate)) {
       return candidate
     }
   }
@@ -45,15 +54,47 @@ const sanitizeUrlForLog = (url) => {
   }
 }
 
-export function useScreenRecorder({
-  meetingId,
-  room,
-  localParticipant,
-  participants = [],
-  socket,
-  showToast = () => {}
-}) {
-  const [recordingState, setRecordingState] = useState('idle') // idle | starting | recording | finalizing | ready | failed
+/**
+ * Screen recorder hook supporting Cloudflare RealtimeKit audio mixing,
+ * 5 MiB chunk multipart buffering, Backblaze B2 upload with server fallback, and lifecycle cleanup.
+ */
+export function useScreenRecorder(arg1, arg2) {
+  // Support both object syntax: useScreenRecorder({ meetingId, room, localParticipant, participants, socket, showToast, activeProvider })
+  // and positional syntax: useScreenRecorder(room, participants, options)
+  let meetingId
+  let room
+  let localParticipant
+  let participants = []
+  let socket
+  let showToast = () => {}
+  let activeProvider
+
+  const isRoomInstance = arg1 && (typeof arg1.on === 'function' || arg1.remoteParticipants || arg1.self)
+  if (arg1 && typeof arg1 === 'object' && !isRoomInstance) {
+    ({
+      meetingId,
+      room,
+      localParticipant,
+      participants = [],
+      socket,
+      showToast = () => {},
+      activeProvider
+    } = arg1)
+  } else {
+    room = arg1
+    participants = Array.isArray(arg2) ? arg2 : (arg2 || [])
+    if (arguments[2] && typeof arguments[2] === 'object') {
+      ({
+        meetingId,
+        localParticipant,
+        socket,
+        showToast = () => {},
+        activeProvider
+      } = arguments[2])
+    }
+  }
+
+  const [recordingState, setRecordingState] = useState('idle') // idle | starting | recording | paused | finalizing | ready | failed
   const [recordingDuration, setRecordingDuration] = useState(0)
   const [isRoomRecording, setIsRoomRecording] = useState(false)
   const [includeTabAudio, setIncludeTabAudio] = useState(false)
@@ -67,6 +108,9 @@ export function useScreenRecorder({
   const remoteAudioNodesMapRef = useRef(new Map())
   const recordingTimerRef = useRef(null)
   const recordingIdRef = useRef(null)
+  const unsubscribeAudioRef = useRef(null)
+  const meetingIdRef = useRef(meetingId)
+  meetingIdRef.current = meetingId
 
   // Multipart buffer queue
   const bufferRef = useRef({
@@ -80,7 +124,44 @@ export function useScreenRecorder({
     uploadErrors: []
   })
 
-  // 1. Listen for room recording status broadcast from Socket.IO
+  // 1. Unmount cleanup: cancel timer, stop capture stream, close audio context, detach listeners, abort if in-flight
+  useEffect(() => {
+    return () => {
+      if (recordingTimerRef.current) {
+        clearInterval(recordingTimerRef.current)
+        recordingTimerRef.current = null
+      }
+      if (typeof unsubscribeAudioRef.current === 'function') {
+        try { unsubscribeAudioRef.current() } catch (_) {}
+        unsubscribeAudioRef.current = null
+      }
+      disconnectAllTracksFromMixer(remoteAudioNodesMapRef.current)
+      if (screenCaptureStreamRef.current) {
+        screenCaptureStreamRef.current.getTracks().forEach(t => {
+          try { t.stop() } catch (_) {}
+        })
+        screenCaptureStreamRef.current = null
+      }
+      if (screenAudioContextRef.current && screenAudioContextRef.current.state !== 'closed') {
+        screenAudioContextRef.current.close().catch(() => {})
+        screenAudioContextRef.current = null
+      }
+      if (screenMediaRecorderRef.current && screenMediaRecorderRef.current.state !== 'inactive') {
+        try { screenMediaRecorderRef.current.stop() } catch (_) {}
+        screenMediaRecorderRef.current = null
+      }
+      const recId = recordingIdRef.current
+      if (recId && bufferRef.current && !bufferRef.current.isFinalizing && meetingIdRef.current) {
+        fetch(`${API_BASE}/${meetingIdRef.current}/recording/abort`, {
+          method: 'POST',
+          headers: getAuthHeaders(),
+          body: JSON.stringify({ recordingId: recId, reason: 'component_unmounted' })
+        }).catch(() => {})
+      }
+    }
+  }, [])
+
+  // 2. Listen for room recording status broadcast from Socket.IO
   useEffect(() => {
     const currentSocket = socket?.current
     if (!currentSocket) return
@@ -176,7 +257,7 @@ export function useScreenRecorder({
     throw lastErr
   }
 
-  // 2. Stop capture & finalize multipart upload
+  // 3. Stop capture & finalize multipart upload
   const stopRecording = useCallback(async (triggerReason = 'user_stop') => {
     if (bufferRef.current.isFinalizing) return
     bufferRef.current.isFinalizing = true
@@ -291,9 +372,24 @@ export function useScreenRecorder({
         }).catch(() => {})
       }
     } finally {
-      // Clean up recording-owned tracks only
+      // Unsubscribe room audio event listeners
+      if (typeof unsubscribeAudioRef.current === 'function') {
+        try {
+          unsubscribeAudioRef.current()
+        } catch (unsubErr) {
+          console.warn('[Screen Recording] Error unsubscribing audio listeners:', unsubErr)
+        }
+        unsubscribeAudioRef.current = null
+      }
+
+      // Disconnect all audio nodes from Web Audio mixer
+      disconnectAllTracksFromMixer(remoteAudioNodesMapRef.current)
+
+      // Clean up recording-owned tracks only (display capture stream)
       if (screenCaptureStreamRef.current) {
-        screenCaptureStreamRef.current.getTracks().forEach(t => t.stop())
+        screenCaptureStreamRef.current.getTracks().forEach(t => {
+          try { t.stop() } catch (_) {}
+        })
         screenCaptureStreamRef.current = null
       }
 
@@ -304,7 +400,6 @@ export function useScreenRecorder({
       }
 
       screenMixDestRef.current = null
-      remoteAudioNodesMapRef.current.clear()
       screenMediaRecorderRef.current = null
       bufferRef.current.isFinalizing = false
     }
@@ -374,7 +469,7 @@ export function useScreenRecorder({
     }
   }, [showToast, stopRecording])
 
-  // 3. Start screen recording
+  // 4. Start screen recording
   const startRecording = useCallback(async () => {
     if (recordingState === 'recording' || recordingState === 'starting') return
 
@@ -435,78 +530,103 @@ export function useScreenRecorder({
       const recId = initData.recordingId
       recordingIdRef.current = recId
 
-      // Step 4: Build Web Audio API Mixer for LiveKit room conversation
+      // Step 4: Build Web Audio API Mixer for meeting conversation (Cloudflare RealtimeKit)
       const AudioCtx = window.AudioContext || window.webkitAudioContext
       const audioCtx = new AudioCtx()
       screenAudioContextRef.current = audioCtx
       const mixDest = audioCtx.createMediaStreamDestination()
       screenMixDestRef.current = mixDest
 
-      // 4a. Connect local microphone track from LiveKit without re-requesting mic permissions
-      const localMicPub = localParticipant?.getTrackPublication(Track.Source.Microphone)
-      if (localMicPub?.track?.mediaStreamTrack) {
-        try {
-          const localMicSource = audioCtx.createMediaStreamSource(new MediaStream([localMicPub.track.mediaStreamTrack]))
-          localMicSource.connect(mixDest)
-          console.log('[Screen Recording Mixer] Connected local microphone track.')
-        } catch (e) {
-          console.warn('[Screen Recording Mixer] Error connecting local mic:', e)
-        }
+      // Clear any stale node mappings before starting fresh
+      disconnectAllTracksFromMixer(remoteAudioNodesMapRef.current)
+      if (typeof unsubscribeAudioRef.current === 'function') {
+        try { unsubscribeAudioRef.current() } catch (_) {}
+        unsubscribeAudioRef.current = null
       }
 
-      // 4b. Connect subscribed remote participant audio tracks
-      if (participants && participants.length > 0) {
-        participants.forEach(p => {
-          p.audioTrackPublications?.forEach(pub => {
-            if (pub.track?.mediaStreamTrack) {
-              try {
-                const remoteSource = audioCtx.createMediaStreamSource(new MediaStream([pub.track.mediaStreamTrack]))
-                remoteSource.connect(mixDest)
-                remoteAudioNodesMapRef.current.set(pub.track.sid, remoteSource)
-              } catch (e) {
-                console.warn('[Screen Recording Mixer] Error connecting remote track:', e)
-              }
-            }
-          })
+      // Detect provider and extract initial tracks (local mic and remote participants)
+      const effectiveProvider = detectProvider({ room, localParticipant, participants, activeProvider })
+      console.log(`[Screen Recording Mixer] Initializing audio mixer for provider: ${effectiveProvider}`)
+
+      const { localTrack, remoteTracks } = extractInitialAudioTracks({
+        provider: effectiveProvider,
+        room,
+        localParticipant,
+        participants,
+        activeProvider
+      })
+
+      // 4a. Connect initial local microphone track if live
+      if (localTrack && isLiveAudioTrack(localTrack)) {
+        connectTrackToMixer({
+          audioCtx,
+          mixDest,
+          track: localTrack,
+          trackKey: 'local-mic',
+          connectedNodesMap: remoteAudioNodesMapRef.current
+        })
+        console.log('[Screen Recording Mixer] Connected initial local microphone track.')
+      }
+
+      // 4b. Connect initial subscribed remote participant audio tracks
+      if (Array.isArray(remoteTracks)) {
+        remoteTracks.forEach(({ id, track }) => {
+          if (track && isLiveAudioTrack(track)) {
+            connectTrackToMixer({
+              audioCtx,
+              mixDest,
+              track,
+              trackKey: id,
+              connectedNodesMap: remoteAudioNodesMapRef.current
+            })
+            console.log(`[Screen Recording Mixer] Connected initial remote audio track: ${id}`)
+          }
         })
       }
 
-      // 4c. Dynamically attach/detach LiveKit audio tracks as participants join/leave
-      if (room) {
-        const handleTrackSubscribed = (track) => {
-          if (track.kind === 'audio' && track.mediaStreamTrack && screenAudioContextRef.current) {
-            try {
-              const src = screenAudioContextRef.current.createMediaStreamSource(new MediaStream([track.mediaStreamTrack]))
-              src.connect(screenMixDestRef.current)
-              remoteAudioNodesMapRef.current.set(track.sid, src)
-              console.log('[Screen Recording Mixer] Connected newly subscribed remote audio track:', track.sid)
-            } catch (err) {
-              console.warn('[Screen Recording Mixer] Error subscribing remote track:', err)
-            }
+      // 4c. Dynamically attach/detach audio tracks as participants join, leave, or toggle mic
+      const unsubscribeAudio = subscribeToRoomAudio({
+        provider: effectiveProvider,
+        room,
+        localParticipant,
+        participants,
+        activeProvider,
+        onTrackAdded: ({ id, participantId, track, isLocal }) => {
+          if (!screenAudioContextRef.current || !screenMixDestRef.current) return
+          const trackKey = isLocal ? 'local-mic' : id
+          const connected = connectTrackToMixer({
+            audioCtx: screenAudioContextRef.current,
+            mixDest: screenMixDestRef.current,
+            track,
+            trackKey,
+            connectedNodesMap: remoteAudioNodesMapRef.current
+          })
+          if (connected) {
+            console.log(`[Screen Recording Mixer] Connected dynamic ${isLocal ? 'local mic' : 'remote track'}: ${trackKey} (participant: ${participantId})`)
+          }
+        },
+        onTrackRemoved: ({ id, participantId, isLocal }) => {
+          const trackKey = isLocal ? 'local-mic' : id
+          const removed = disconnectTrackFromMixer(trackKey, remoteAudioNodesMapRef.current)
+          if (removed) {
+            console.log(`[Screen Recording Mixer] Disconnected dynamic ${isLocal ? 'local mic' : 'remote track'}: ${trackKey} (participant: ${participantId})`)
           }
         }
-
-        const handleTrackUnsubscribed = (track) => {
-          if (track.kind === 'audio') {
-            const node = remoteAudioNodesMapRef.current.get(track.sid)
-            if (node) {
-              try { node.disconnect() } catch (_) {}
-              remoteAudioNodesMapRef.current.delete(track.sid)
-            }
-          }
-        }
-
-        room.on(RoomEvent.TrackSubscribed, handleTrackSubscribed)
-        room.on(RoomEvent.TrackUnsubscribed, handleTrackUnsubscribed)
-      }
+      })
+      unsubscribeAudioRef.current = unsubscribeAudio
 
       // 4d. Optional browser tab audio (if user checked and browser returned track)
       if (includeTabAudio) {
         const displayAudioTracks = displayStream.getAudioTracks()
-        if (displayAudioTracks.length > 0) {
+        if (displayAudioTracks.length > 0 && isLiveAudioTrack(displayAudioTracks[0])) {
           try {
-            const tabAudioSource = audioCtx.createMediaStreamSource(new MediaStream([displayAudioTracks[0]]))
-            tabAudioSource.connect(mixDest)
+            connectTrackToMixer({
+              audioCtx,
+              mixDest,
+              track: displayAudioTracks[0],
+              trackKey: 'tab-audio',
+              connectedNodesMap: remoteAudioNodesMapRef.current
+            })
             console.log('[Screen Recording Mixer] Connected optional browser tab audio track.')
           } catch (e) {
             console.warn('[Screen Recording Mixer] Error connecting tab audio:', e)
@@ -584,16 +704,40 @@ export function useScreenRecorder({
       }, 1000)
     } catch (err) {
       console.error('[Screen Recording Error] Start failed:', err)
-      if (displayStream) {
-        displayStream.getTracks().forEach(t => t.stop())
+      if (typeof unsubscribeAudioRef.current === 'function') {
+        try { unsubscribeAudioRef.current() } catch (_) {}
+        unsubscribeAudioRef.current = null
       }
+      disconnectAllTracksFromMixer(remoteAudioNodesMapRef.current)
+      if (screenAudioContextRef.current && screenAudioContextRef.current.state !== 'closed') {
+        screenAudioContextRef.current.close().catch(() => {})
+        screenAudioContextRef.current = null
+      }
+      screenMixDestRef.current = null
+      if (displayStream) {
+        displayStream.getTracks().forEach(t => {
+          try { t.stop() } catch (_) {}
+        })
+      }
+      screenCaptureStreamRef.current = null
+      screenMediaRecorderRef.current = null
       setRecordingState('idle')
       if (err.name !== 'NotAllowedError') {
         setErrorMessage(err.message)
         showToast(`Could not start recording: ${err.message}`, 'error')
       }
     }
-  }, [recordingState, includeTabAudio, meetingId, localParticipant, participants, room, showToast, stopRecording])
+  }, [
+    recordingState,
+    includeTabAudio,
+    meetingId,
+    localParticipant,
+    participants,
+    room,
+    showToast,
+    stopRecording,
+    activeProvider
+  ])
 
   return {
     recordingState,

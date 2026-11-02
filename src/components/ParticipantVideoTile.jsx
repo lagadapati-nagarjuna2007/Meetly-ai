@@ -1,6 +1,5 @@
-import React, { useState, useRef, useEffect, useCallback } from 'react'
-import { VideoTrack } from '@livekit/components-react'
-import { Track } from 'livekit-client'
+import React, { useState, useRef, useEffect, useCallback, useId } from 'react'
+import UniversalVideoTrack from './VideoTrack'
 import {
   ZoomIn,
   ZoomOut,
@@ -27,6 +26,7 @@ export default function ParticipantVideoTile({
   className = ''
 }) {
   const containerRef = useRef(null)
+  const instanceId = useId()
   const [zoom, setZoom] = useState(100)
   const [pan, setPan] = useState({ x: 0, y: 0 })
   const [isDragging, setIsDragging] = useState(false)
@@ -194,21 +194,64 @@ export default function ParticipantVideoTile({
     }
   }
 
-  // Determine metadata role
+  // Resolve host status: RealtimeKit isHost boolean + metadata role fallback
   let role = 'participant'
-  try {
-    const meta = JSON.parse(participant?.metadata || '{}')
-    role = meta.role || 'participant'
-  } catch (_) {}
+  if (participant?.isHost) {
+    role = 'host'
+  } else {
+    try {
+      const meta = typeof participant?.metadata === 'string'
+        ? JSON.parse(participant.metadata || '{}')
+        : (participant?.metadata || {})
+      role = meta.role || 'participant'
+    } catch (_) {}
+  }
 
-  const isCurrentUser = participant?.identity === localParticipant?.identity
+  // Resolve local participant identity:
+  // 1. RealtimeKit: customParticipantId matched against user.id or localParticipant.customParticipantId
+  // 2. Identity equality check
+  const isCurrentUser = Boolean(
+    (participant?.customParticipantId && user?.id && participant.customParticipantId === user.id) ||
+    (participant?.customParticipantId && localParticipant?.customParticipantId &&
+      participant.customParticipantId === localParticipant.customParticipantId) ||
+    (participant?.identity && localParticipant?.identity &&
+      participant.identity === localParticipant.identity) ||
+    (participant && localParticipant && participant === localParticipant)
+  )
+
   const displayName = isCurrentUser
     ? (user?.name || user?.full_name || participant?.name || 'You')
     : (participant?.name || 'Participant')
 
-  const isCameraEnabled = isCurrentUser && typeof localCamActive === 'boolean'
-    ? Boolean(localCamActive && participant?.isCameraEnabled)
+  // Resolve video tracks (RealtimeKit MediaStreamTrack)
+  const participantVideoTrack = participant?.videoTrack || null
+  const localParticipantVideoTrack = localParticipant?.videoTrack || null
+
+  // Unique session keys for React elements
+  const rtkVideoKey = participant?.id
+    ? `rtk-${participant.id}`
+    : `rtk-${instanceId}`
+
+  const localRtkVideoKey = localParticipant?.id
+    ? `rtk-local-${localParticipant.id}`
+    : `rtk-local-${instanceId}`
+
+  // Resolve camera active state (RealtimeKit: participant.videoEnabled)
+  const isParticipantCameraActive = participant?.videoEnabled !== undefined
+    ? Boolean(participant.videoEnabled)
     : Boolean(participant?.isCameraEnabled)
+
+  const isCameraEnabled = isCurrentUser && typeof localCamActive === 'boolean'
+    ? Boolean(localCamActive && isParticipantCameraActive)
+    : Boolean(isParticipantCameraActive)
+
+  const isLocalParticipantCameraActive = localParticipant?.videoEnabled !== undefined
+    ? Boolean(localParticipant.videoEnabled)
+    : Boolean(localParticipant?.isCameraEnabled)
+
+  const isLocalCameraRenderable = typeof localCamActive === 'boolean'
+    ? Boolean(localCamActive && isLocalParticipantCameraActive)
+    : Boolean(isLocalParticipantCameraActive)
 
   return (
     <div
@@ -237,10 +280,21 @@ export default function ParticipantVideoTile({
           }}
         >
           {isCameraEnabled ? (
-            <VideoTrack
-              trackRef={{ participant, source: Track.Source.Camera }}
-              className="w-full h-full object-cover pointer-events-none"
-            />
+            participantVideoTrack ? (
+              <UniversalVideoTrack
+                key={rtkVideoKey}
+                track={participantVideoTrack}
+                className="w-full h-full object-cover pointer-events-none"
+              />
+            ) : (
+              /* RealtimeKit video is enabled, but track is null/connecting: safe loading state */
+              <div className="w-full h-full bg-slate-950 flex flex-col items-center justify-center gap-3">
+                <div className="w-8 h-8 rounded-full border-2 border-white/10 border-t-purple-500 animate-spin" />
+                <span className="text-[10px] font-semibold text-gray-400 uppercase tracking-widest">
+                  Connecting video...
+                </span>
+              </div>
+            )
           ) : isCurrentUser && camInitializing ? (
             <div className="w-full h-full bg-slate-950 flex flex-col items-center justify-center gap-3">
               <div className="w-8 h-8 rounded-full border-2 border-white/10 border-t-purple-500 animate-spin" />
@@ -414,11 +468,19 @@ export default function ParticipantVideoTile({
             isThumbDragging ? 'cursor-grabbing shadow-purple-500/30' : 'cursor-grab'
           }`}
         >
-          {localParticipant.isCameraEnabled ? (
-            <VideoTrack
-              trackRef={{ participant: localParticipant, source: Track.Source.Camera }}
-              className="absolute inset-0 w-full h-full object-cover pointer-events-none"
-            />
+          {isLocalCameraRenderable ? (
+            localParticipantVideoTrack ? (
+              <UniversalVideoTrack
+                key={localRtkVideoKey}
+                track={localParticipantVideoTrack}
+                className="absolute inset-0 w-full h-full object-cover pointer-events-none"
+              />
+            ) : (
+              <div className="absolute inset-0 bg-slate-900 flex flex-col items-center justify-center gap-1.5 pointer-events-none">
+                <div className="w-6 h-6 rounded-full border-2 border-white/10 border-t-purple-500 animate-spin" />
+                <span className="text-[9px] text-gray-400 font-medium">Connecting...</span>
+              </div>
+            )
           ) : (
             <div className="absolute inset-0 bg-slate-900 flex flex-col items-center justify-center gap-1.5 pointer-events-none">
               <div className="w-10 h-10 rounded-full bg-[#7c3aed]/20 border border-[#7c3aed]/40 flex items-center justify-center text-[#8b5cf6] font-bold text-sm">

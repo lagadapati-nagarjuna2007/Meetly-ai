@@ -1,16 +1,28 @@
-import React, { useState, useRef, useEffect, useCallback } from 'react'
-import { VideoTrack } from '@livekit/components-react'
+import React, { useState, useRef, useEffect, useCallback, useId } from 'react'
+import UniversalVideoTrack from './VideoTrack'
 import { ZoomIn, ZoomOut, Maximize2, Minimize2 } from 'lucide-react'
 
 // Standard zoom presets matching desktop meeting software
 const ZOOM_PRESETS = [50, 67, 75, 90, 100, 125, 150, 175, 200, 250]
 
+function isNativeMediaStreamTrack(obj) {
+  if (!obj || typeof obj !== 'object') return false
+  if (typeof MediaStreamTrack !== 'undefined' && obj instanceof MediaStreamTrack) return true
+  return typeof obj.kind === 'string' &&
+    typeof obj.readyState === 'string' &&
+    (typeof obj.addEventListener === 'function' || typeof obj.stop === 'function') &&
+    !obj.publication &&
+    !obj.source
+}
+
 export default function ScreenShareView({
   trackRef,
+  track,
   participant,
   className = ''
 }) {
   const containerRef = useRef(null)
+  const instanceId = useId()
   const [zoom, setZoom] = useState(100)
   const [pan, setPan] = useState({ x: 0, y: 0 })
   const [isDragging, setIsDragging] = useState(false)
@@ -84,7 +96,7 @@ export default function ScreenShareView({
     }
     try {
       e.currentTarget.setPointerCapture(e.pointerId)
-    } catch (_) {}
+    } catch {}
   }
 
   const handlePointerMove = (e) => {
@@ -110,7 +122,7 @@ export default function ScreenShareView({
         if (e.currentTarget.hasPointerCapture(e.pointerId)) {
           e.currentTarget.releasePointerCapture(e.pointerId)
         }
-      } catch (_) {}
+      } catch {}
     }
   }
 
@@ -128,7 +140,32 @@ export default function ScreenShareView({
     }
   }
 
-  const presenterName = participant?.name || participant?.identity || 'User'
+  // Resolve native MediaStreamTrack
+  let nativeTrack = null
+  if (isNativeMediaStreamTrack(track)) {
+    nativeTrack = track
+  } else if (track?.mediaStreamTrack && isNativeMediaStreamTrack(track.mediaStreamTrack)) {
+    nativeTrack = track.mediaStreamTrack
+  } else if (isNativeMediaStreamTrack(trackRef)) {
+    nativeTrack = trackRef
+  } else if (trackRef?.mediaStreamTrack && isNativeMediaStreamTrack(trackRef.mediaStreamTrack)) {
+    nativeTrack = trackRef.mediaStreamTrack
+  } else if (trackRef?.track && isNativeMediaStreamTrack(trackRef.track)) {
+    nativeTrack = trackRef.track
+  }
+
+  if (!nativeTrack && participant?.screenShareTracks?.video) {
+    nativeTrack = participant.screenShareTracks.video
+  }
+
+  // Stable session key for React elements
+  const rtkVideoKey = nativeTrack?.id
+    ? `rtk-screen-${nativeTrack.id}`
+    : (participant?.id ? `rtk-screen-${participant.id}` : `rtk-screen-${instanceId}`)
+
+  const presenterName = participant?.name ||
+    participant?.identity ||
+    (participant?.customParticipantId ? 'Participant' : 'User')
 
   return (
     <div
@@ -207,10 +244,18 @@ export default function ScreenShareView({
             transition: isDragging ? 'none' : 'transform 0.15s cubic-bezier(0.2, 0, 0, 1)'
           }}
         >
-          <VideoTrack
-            trackRef={trackRef}
-            className="w-full h-full object-contain bg-black pointer-events-none"
-          />
+          {nativeTrack ? (
+            <UniversalVideoTrack
+              key={rtkVideoKey}
+              track={nativeTrack}
+              className="w-full h-full object-contain bg-black pointer-events-none"
+            />
+          ) : (
+            <div className="w-full h-full bg-slate-950 flex flex-col items-center justify-center gap-2 pointer-events-none">
+              <div className="w-8 h-8 rounded-full border-2 border-white/10 border-t-sky-500 animate-spin" />
+              <span className="text-xs text-gray-400 font-medium">Connecting presentation...</span>
+            </div>
+          )}
         </div>
       </div>
 

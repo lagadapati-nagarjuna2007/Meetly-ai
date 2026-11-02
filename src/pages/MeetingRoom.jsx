@@ -1,18 +1,6 @@
 import React, { useState, useEffect, useRef, useCallback, useMemo } from 'react'
 import { useParams, useNavigate } from 'react-router-dom'
 import { io } from 'socket.io-client'
-import {
-  LiveKitRoom,
-  useTracks,
-  useLocalParticipant,
-  useParticipants,
-  VideoTrack,
-  RoomAudioRenderer,
-  useMaybeRoomContext,
-  useConnectionState
-} from '@livekit/components-react'
-import { Track, RoomEvent, AudioPresets, ConnectionQuality, ConnectionState } from 'livekit-client'
-
 
 import { useMeetings } from '../context/MeetingContext'
 import { useAuth } from '../context/AuthContext'
@@ -50,6 +38,11 @@ import RecordingControlPopover from '../components/RecordingControlPopover'
 import ParticipantVideoTile from '../components/ParticipantVideoTile'
 import ExpandedParticipantStage from '../components/ExpandedParticipantStage'
 import MeetingChat, { mergeAndSortMessages } from '../components/MeetingChat'
+import RealtimeKitAdapter from '../components/meeting/RealtimeKitAdapter'
+import {
+  resolveEffectiveProvider,
+  shouldMountProvider
+} from '../components/meeting/providerSelectionUtils'
 import { useScreenRecorder } from '../hooks/useScreenRecorder'
 import {
   resolveMediaUserId,
@@ -120,14 +113,17 @@ const isUuid = (val) => {
 /**
  * Robust participant user_id resolver.
  * Priority:
- *  1. p.metadata JSON (contains { userId, role })
- *  2. p.identity (if already a valid UUID)
- *  3. p.userId (if property directly exists and is a UUID)
- *  4. dbParticipants lookup by email or user_id
+ *  1. p.customParticipantId (RealtimeKit Meetly user UUID)
+ *  2. p.metadata JSON (contains { userId, role })
+ *  3. p.identity (if already a valid UUID)
+ *  4. p.userId (if property directly exists and is a UUID)
+ *  5. dbParticipants lookup by email or user_id
  */
 const resolveParticipantUserId = (p, dbParticipantsList = []) => {
   if (!p) return null
-  // 1. Try parsing metadata (from LiveKit token)
+  if (p.customParticipantId && isUuid(p.customParticipantId)) {
+    return p.customParticipantId
+  }
   if (p.metadata) {
     try {
       const meta = typeof p.metadata === 'string' ? JSON.parse(p.metadata) : p.metadata
@@ -136,17 +132,14 @@ const resolveParticipantUserId = (p, dbParticipantsList = []) => {
       }
     } catch (e) {}
   }
-  // 2. Check if identity itself is a valid UUID
   if (p.identity && isUuid(p.identity)) {
     return p.identity
   }
-  // 3. Check if userId property directly exists on participant
   if (p.userId && isUuid(p.userId)) {
     return p.userId
   }
-  // 4. Fallback: match p.identity against dbParticipants list (by user.email or user_id)
   if (Array.isArray(dbParticipantsList) && dbParticipantsList.length > 0) {
-    const pIdent = String(p.identity || '').trim().toLowerCase()
+    const pIdent = String(p.identity || p.name || '').trim().toLowerCase()
     const matched = dbParticipantsList.find(dbP => {
       const dbEmail = String(dbP.user?.email || '').trim().toLowerCase()
       const dbUid = String(dbP.user_id || '').trim().toLowerCase()
@@ -162,12 +155,12 @@ const resolveParticipantUserId = (p, dbParticipantsList = []) => {
 /**
  * Returns human-readable display name for a given user UUID.
  */
-const getDisplayNameForUserId = (uid, livekitParticipants = [], dbParticipantsList = []) => {
+const getDisplayNameForUserId = (uid, participantsList = [], dbParticipantsList = []) => {
   if (!uid) return null
   const targetUid = String(uid).trim().toLowerCase()
 
-  // First check in LiveKit participants
-  for (const p of (livekitParticipants || [])) {
+  // First check in active room participants
+  for (const p of (participantsList || [])) {
     const pUid = resolveParticipantUserId(p, dbParticipantsList)
     if (pUid && pUid.toLowerCase() === targetUid) {
       return p.name || p.identity || targetUid
@@ -205,14 +198,40 @@ function MeetingRoomInner() {
     leaveMeeting,
     lockMeeting,
     activateMeeting,
-    livekitToken,
-    livekitUrl,
-    setLivekitToken,
-    setLivekitUrl,
-    joinMeeting
+    cloudflareToken,
+    cloudflareMeetingId,
+    cloudflareParticipantId,
+    setCloudflareToken,
+    setCloudflareMeetingId,
+    setCloudflareParticipantId,
+    activeProvider,
+    setActiveProvider,
+    clearCredentials,
+    joinMeeting,
+    isJoiningMeeting
   } = useMeetings()
   const { showToast } = useToast()
   const navigate = useNavigate()
+
+  // Track session provider to prevent mid-call switching once established
+  const sessionProviderRef = useRef(null)
+
+  // Resolve effective media provider (Cloudflare RealtimeKit is sole provider)
+  const effectiveProvider = useMemo(() => {
+    return resolveEffectiveProvider({
+      activeProvider,
+      cloudflareToken
+    })
+  }, [activeProvider, cloudflareToken])
+
+  useEffect(() => {
+    if (effectiveProvider && !sessionProviderRef.current) {
+      sessionProviderRef.current = effectiveProvider
+    }
+    if (!effectiveProvider) {
+      sessionProviderRef.current = null
+    }
+  }, [effectiveProvider])
 
   const [meetingData, setMeetingData] = useState(null)
   const originalHostId = meetingData?.host_id || meetingData?.hostId
@@ -248,7 +267,12 @@ function MeetingRoomInner() {
     }
   }, [isHost])
   const [isWaitingForApproval, setIsWaitingForApproval] = useState(false)
+  const isWaitingForApprovalRef = useRef(isWaitingForApproval)
+  useEffect(() => {
+    isWaitingForApprovalRef.current = isWaitingForApproval
+  }, [isWaitingForApproval])
   const [isLoading, setIsLoading] = useState(true)
+  const [isJoinInFlight, setIsJoinInFlight] = useState(false)
   const [roomError, setRoomError] = useState(null)
   const [attendanceConsent, setAttendanceConsent] = useState(null)
   const joinAttemptedRef = useRef(false)
@@ -307,7 +331,7 @@ function MeetingRoomInner() {
     }
   }, [meetingData, isHost, fetchWaitingRequests])
 
-  console.log('[MeetingRoom Render] id:', id, 'isLoading:', isLoading, 'hasMeetingData:', !!meetingData, 'hasToken:', !!livekitToken, 'roomError:', roomError)
+  console.log('[MeetingRoom Render] id:', id, 'isLoading:', isLoading, 'hasMeetingData:', !!meetingData, 'effectiveProvider:', effectiveProvider, 'hasCloudflareToken:', !!cloudflareToken, 'roomError:', roomError)
 
   // 1. Fetch meeting metadata on mount and verify login session
   useEffect(() => {
@@ -369,7 +393,12 @@ function MeetingRoomInner() {
 
   // 2. Auto-join meeting room if Token is missing (e.g. on F5 Refresh)
   useEffect(() => {
-    console.log('[MeetingRoom useEffect 2] ensureToken check. meetingData:', !!meetingData, 'hasToken:', !!livekitToken, 'attempted:', joinAttemptedRef.current, 'attendanceConsent:', attendanceConsent)
+    const hasValidCredentials = Boolean(
+      (effectiveProvider === 'cloudflare' && cloudflareToken) ||
+      cloudflareToken
+    )
+
+    console.log('[MeetingRoom useEffect 2] ensureToken check. meetingData:', !!meetingData, 'hasValidCredentials:', hasValidCredentials, 'attempted:', joinAttemptedRef.current, 'attendanceConsent:', attendanceConsent)
 
     let timeoutId = null
     const ensureToken = async () => {
@@ -377,7 +406,7 @@ function MeetingRoomInner() {
         console.log('[MeetingRoom useEffect 2] Intentional leave in progress, skipping auto-join.')
         return
       }
-      if (meetingData && !livekitToken && !joinAttemptedRef.current) {
+      if (meetingData && !hasValidCredentials && !joinAttemptedRef.current) {
         // If AI Attendance is enabled, wait until consent is resolved before joining
         if (meetingData.enable_ai_attendance && attendanceConsent === null) {
           console.log('[MeetingRoom useEffect 2] AI Attendance is enabled, waiting for user consent.')
@@ -385,29 +414,30 @@ function MeetingRoomInner() {
         }
 
         joinAttemptedRef.current = true
+        setIsJoinInFlight(true)
         console.log('[MeetingRoom useEffect 2] Starting auto-join for meeting code:', meetingData.meeting_code)
 
         // Set a 15 second safety timeout to prevent infinite loading
         timeoutId = setTimeout(() => {
-          if (!livekitToken) {
+          if (!cloudflareToken) {
             console.error('[MeetingRoom useEffect 2] Connection timeout reached (15s)')
-            setRoomError('Connection to LiveKit room timed out. Please check your credentials or network.')
+            setRoomError('Connection to meeting room timed out. Please check your credentials or network.')
             setIsLoading(false)
           }
         }, 15000)
 
-        let fingerprint = ''
         try {
-          console.log('[Security] Browser fingerprint generated.')
-          const FingerprintJS = (await import('@fingerprintjs/fingerprintjs')).default
-          const fp = await FingerprintJS.load()
-          const fpResult = await fp.get()
-          fingerprint = fpResult.visitorId
-        } catch (fpErr) {
-          console.error('[Security Error] Failed to generate browser fingerprint:', fpErr)
-        }
+          let fingerprint = ''
+          try {
+            console.log('[Security] Browser fingerprint generated.')
+            const FingerprintJS = (await import('@fingerprintjs/fingerprintjs')).default
+            const fp = await FingerprintJS.load()
+            const fpResult = await fp.get()
+            fingerprint = fpResult.visitorId
+          } catch (fpErr) {
+            console.error('[Security Error] Failed to generate browser fingerprint:', fpErr)
+          }
 
-        try {
           const res = await joinMeeting(meetingData.meeting_code, '', fingerprint)
           if (res && res.status === 'waiting') {
             console.log('[MeetingRoom useEffect 2] Join pending approval, entering waiting room.')
@@ -424,6 +454,7 @@ function MeetingRoomInner() {
           setRoomError(msg)
           showToast(msg, 'error')
         } finally {
+          setIsJoinInFlight(false)
           if (timeoutId && !isWaitingForApproval) clearTimeout(timeoutId)
         }
       }
@@ -434,23 +465,36 @@ function MeetingRoomInner() {
     return () => {
       if (timeoutId) clearTimeout(timeoutId)
     }
-  }, [meetingData, livekitToken, joinMeeting, showToast, attendanceConsent, isWaitingForApproval])
+  }, [meetingData, cloudflareToken, effectiveProvider, joinMeeting, showToast, attendanceConsent, isWaitingForApproval])
 
 
+
+  const isLeavingMeetingRef = useRef(false)
 
   const handleLeave = useCallback(async () => {
+    if (isLeavingMeetingRef.current) {
+      console.log('[MeetingRoom] handleLeave already in-flight, skipping duplicate call.')
+      return
+    }
+    isLeavingMeetingRef.current = true
     console.log('[MeetingRoom] handleLeave triggered')
     isIntentionalLeaveRef.current = true
-    if (meetingData) {
-      try {
-        await leaveMeeting(meetingData.meeting_id)
-      } catch (e) {
-        console.error('[MeetingRoom] leaveMeeting error:', e)
+    if (sessionProviderRef) sessionProviderRef.current = null
+
+    try {
+      if (meetingData) {
+        try {
+          await leaveMeeting(meetingData.meeting_id)
+        } catch (e) {
+          console.error('[MeetingRoom] leaveMeeting error:', e)
+        }
       }
+    } finally {
+      clearCredentials?.()
+      showToast('You left the meeting.', 'info')
+      navigate('/')
     }
-    showToast('You left the meeting.', 'info')
-    navigate('/')
-  }, [meetingData, leaveMeeting, navigate, showToast])
+  }, [meetingData, leaveMeeting, clearCredentials, navigate, showToast])
 
   useEffect(() => {
     handleLeaveRef.current = handleLeave
@@ -462,14 +506,16 @@ function MeetingRoomInner() {
     if (!confirmEnd) return
 
     isIntentionalLeaveRef.current = true
+    if (sessionProviderRef) sessionProviderRef.current = null
     try {
       await endMeeting(meetingData.meeting_id)
       showToast('Meeting ended successfully.', 'success')
+      clearCredentials?.()
       navigate('/')
     } catch (err) {
       showToast(err.message || 'Failed to end meeting', 'error')
     }
-  }, [meetingData, endMeeting, navigate, showToast])
+  }, [meetingData, endMeeting, clearCredentials, navigate, showToast])
 
   const handleDeleteMeeting = useCallback(async () => {
     if (!meetingData) return
@@ -477,14 +523,16 @@ function MeetingRoomInner() {
     if (!confirmDel) return
 
     isIntentionalLeaveRef.current = true
+    if (sessionProviderRef) sessionProviderRef.current = null
     try {
       await deleteMeeting(meetingData.meeting_id)
       showToast('Meeting deleted successfully.', 'success')
+      clearCredentials?.()
       navigate('/')
     } catch (err) {
       showToast(err.message || 'Failed to delete meeting', 'error')
     }
-  }, [meetingData, deleteMeeting, navigate, showToast])
+  }, [meetingData, deleteMeeting, clearCredentials, navigate, showToast])
 
   const handleRename = useCallback(async () => {
     if (!meetingData) return
@@ -514,14 +562,6 @@ function MeetingRoomInner() {
   }, [meetingData, showToast])
 
 
-
-  const serverUrl = livekitUrl || import.meta.env.VITE_LIVEKIT_URL
-
-  useEffect(() => {
-    if (livekitToken && serverUrl) {
-      console.log('[LiveKit Connection] Connecting LiveKitRoom to serverUrl:', serverUrl)
-    }
-  }, [livekitToken, serverUrl])
 
   // Configure Socket.IO connection
   useEffect(() => {
@@ -615,14 +655,47 @@ function MeetingRoomInner() {
         setChatMessages((prev) => [...prev, msg])
       })
 
-      socket.current.on('participant_accepted', ({ userId, token, livekitUrl }) => {
-        const currentUserId = user?.id
+      socket.current.on('participant_accepted', (payload) => {
+        const {
+          userId,
+          cloudflareToken: incomingCfToken,
+          cloudflareMeetingId: incomingCfMeetingId,
+          cloudflareParticipantId: incomingCfPartId
+        } = payload || {}
+
+        const currentUserId = user?.id || userIdRef.current
         console.log('[Security Socket] participant_accepted received for user:', userId, 'current user:', currentUserId)
-        if (currentUserId && userId === currentUserId) {
+
+        // 1. Validate the authenticated user ID
+        if (
+          !currentUserId ||
+          !userId ||
+          String(userId).trim().toLowerCase() !== String(currentUserId).trim().toLowerCase()
+        ) {
+          return
+        }
+
+        // 2. Ignore duplicate admission events (e.g. if already admitted and out of waiting room)
+        if (!isWaitingForApprovalRef.current) {
+          console.log('[Security Socket] Ignoring duplicate participant_accepted event (already admitted).')
+          return
+        }
+
+        // 3. Determine provider credentials and validate
+        const hasCf = Boolean(typeof incomingCfToken === 'string' && incomingCfToken.trim())
+
+        if (hasCf) {
+          // Cloudflare RealtimeKit credentials received
+          setCloudflareToken(incomingCfToken.trim())
+          if (incomingCfMeetingId) setCloudflareMeetingId(incomingCfMeetingId)
+          if (incomingCfPartId && setCloudflareParticipantId) setCloudflareParticipantId(incomingCfPartId)
+          if (setActiveProvider) setActiveProvider('cloudflare')
+
           showToast('Admitted to meeting by host!', 'success')
-          setLivekitToken(token)
-          setLivekitUrl(livekitUrl)
+          // Set isWaitingForApproval to false only after valid Cloudflare credentials are received
           setIsWaitingForApproval(false)
+        } else {
+          console.warn('[Security Socket] participant_accepted event received without usable Cloudflare credentials')
         }
       })
 
@@ -648,8 +721,8 @@ function MeetingRoomInner() {
             socket.current.disconnect()
             socket.current = null
           }
-          setLivekitToken(null)
-          setLivekitUrl(null)
+          if (sessionProviderRef) sessionProviderRef.current = null
+          clearCredentials?.()
           navigate('/')
         }
       })
@@ -663,8 +736,8 @@ function MeetingRoomInner() {
             socket.current.disconnect()
             socket.current = null
           }
-          setLivekitToken(null)
-          setLivekitUrl(null)
+          if (sessionProviderRef) sessionProviderRef.current = null
+          clearCredentials?.()
           navigate('/')
         }
       })
@@ -830,7 +903,7 @@ function MeetingRoomInner() {
     }
   }, [meetingData?.room_name])
 
-  // Re-sync room presence and chat history once user.id, socketReady, or livekitToken is ready
+  // Re-sync room presence and chat history once user.id, socketReady, or cloudflareToken is ready
   useEffect(() => {
     if (!socket.current || !meetingData?.room_name || !user?.id) return
     const currentToken = typeof window !== 'undefined' ? sessionStorage.getItem('meetly_auth_token') : null
@@ -861,7 +934,7 @@ function MeetingRoomInner() {
         }
       }
     )
-  }, [meetingData?.room_name, user?.id, livekitToken, socketReady])
+  }, [meetingData?.room_name, user?.id, cloudflareToken, socketReady])
 
   // Error UI — differentiate "meeting ended" from other errors
   if (roomError) {
@@ -993,11 +1066,13 @@ function MeetingRoomInner() {
 
 
 
-  // Loading UI
-  if (isLoading || !livekitToken || !meetingData || isIntentionalLeaveRef.current) {
-    if (isIntentionalLeaveRef.current) {
-      return null
-    }
+  // Intentional leave exits immediately without rendering room
+  if (isIntentionalLeaveRef.current) {
+    return null
+  }
+
+  // Loading UI while meeting metadata is being fetched
+  if (isLoading || !meetingData || isJoinInFlight || isJoiningMeeting) {
     return (
       <div className="fixed inset-0 z-40 bg-[#04050b] flex flex-col items-center justify-center text-xs font-semibold text-gray-500 select-none">
         <div className="flex flex-col items-center gap-3">
@@ -1008,3770 +1083,103 @@ function MeetingRoomInner() {
     )
   }
 
-  return (
-    <LiveKitRoom
-      token={livekitToken}
-      serverUrl={serverUrl}
-      connect={true}
-      video={false}
-      audio={false}
-      onDisconnected={() => {
-        console.log('[LiveKit Connection] Event onDisconnected triggered')
-        if (isIntentionalLeaveRef.current) {
-          console.log('[LiveKit Connection] Intentional disconnect, leave already handled.')
-        } else {
-          console.log('[LiveKit Connection] Temporary/automatic disconnect. Allowing reconnect lifecycle to operate.')
-        }
-      }}
-      onError={(err) => {
-        console.error('[LiveKit Connection] Event onError triggered:', err)
-        if (isIntentionalLeaveRef.current) {
-          console.log('[LiveKit Connection] Bypassing onError toast for intentional disconnect.')
-          return
-        }
-        const errMsg = err?.message || ''
-        if (
-          errMsg.toLowerCase().includes('client initiated disconnect') ||
-          errMsg.toLowerCase().includes('user initiated') ||
-          errMsg.toLowerCase().includes('client initiated')
-        ) {
-          console.log('[LiveKit Connection] Bypassing error toast for expected client disconnect:', errMsg)
-          return
-        }
-        showToast('LiveKit connection error: ' + (errMsg || 'Check your credentials.'), 'error')
-      }}
-      // ── LiveKit Room options for connection resilience ──────────────────
-      // dynacast: automatically disables simulcast layers not being viewed,
-      //   reducing upstream bandwidth when network quality degrades.
-      // adaptiveStream: subscriber-side adapts received video quality
-      //   to actual viewport size and available bandwidth.
-      // publishDefaults.simulcast: publish camera in multiple resolution
-      //   layers so the server can route the appropriate layer per subscriber.
-      // publishDefaults.audioPreset speech: dedicated 24 kbps for audio so
-      //   speech remains stable while video quality adjusts down first.
-      // publishDefaults.stopMicTrackOnMute: keep the mic WebRTC track alive
-      //   during mute for seamless unmute after reconnect.
-      // DefaultReconnectPolicy built into the Room retries up to 10 times
-      //   with back-off (0 ms → 300 ms → 1.2 s … 7 s) — no custom loop needed.
-      options={{
-        dynacast: true,
-        adaptiveStream: true,
-        publishDefaults: {
-          simulcast: true,
-          audioPreset: AudioPresets.speech,
-          stopMicTrackOnMute: false
-        }
-      }}
-    >
-      <MeetingRoomContent
-        meetingData={meetingData}
-        setMeetingData={setMeetingData}
-        isHost={isHost}
-        handleLeave={handleLeave}
-        handleEndMeeting={handleEndMeeting}
-        handleDeleteMeeting={handleDeleteMeeting}
-        handleRename={handleRename}
-        handleCopyCode={handleCopyCode}
-        handleCopyLink={handleCopyLink}
-        lockMeeting={lockMeeting}
-        activateMeeting={activateMeeting}
-        showToast={showToast}
-        user={user}
-        attendanceConsent={attendanceConsent}
-        endMeeting={endMeeting}
-        expireMeeting={expireMeeting}
-        socket={socket}
-        socketReady={socketReady}
-        chatMessages={chatMessages}
-        setChatMessages={setChatMessages}
-        ephemeralChatMessages={ephemeralChatMessages}
-        setEphemeralChatMessages={setEphemeralChatMessages}
-        ephemeralChatPolicy={ephemeralChatPolicy}
-        setEphemeralChatPolicy={setEphemeralChatPolicy}
-        activeChatConvTab={activeChatConvTab}
-        setActiveChatConvTab={setActiveChatConvTab}
-        selectedChatRecipient={selectedChatRecipient}
-        setSelectedChatRecipient={setSelectedChatRecipient}
-        typingUsers={typingUsers}
-        setTypingUsers={setTypingUsers}
-        handleLeaveWithAttendanceRef={handleLeaveWithAttendanceRef}
-        waitingRequests={waitingRequests}
-        fetchWaitingRequests={fetchWaitingRequests}
-        isIntentionalLeaveRef={isIntentionalLeaveRef}
-        dbParticipants={dbParticipants}
-      />
-      <RoomAudioRenderer />
-    </LiveKitRoom>
-  )
-}
-
-// Helper: convert camera/getUserMedia errors into user-friendly messages
-function getCameraErrorMessage(err) {
-  const name = err?.name || ''
-  const message = err?.message || ''
-
-  if (name === 'NotAllowedError' || name === 'PermissionDeniedError') {
-    return 'Camera permission denied. Please allow camera access in your browser settings.'
-  }
-  if (name === 'NotFoundError' || name === 'DevicesNotFoundError') {
-    return 'No camera found. Please connect a camera and try again.'
-  }
-  if (name === 'NotReadableError' || name === 'TrackStartError') {
-    return 'Camera is in use by another application. Please close it and try again.'
-  }
-  if (name === 'OverconstrainedError') {
-    return 'Camera does not support the requested settings. Try a different camera.'
-  }
-  if (name === 'AbortError') {
-    return 'Camera initialization was interrupted. Please try again.'
-  }
-  if (message.toLowerCase().includes('could not start video source')) {
-    return 'Camera is in use by another application. Please close it and try again.'
-  }
-  return `Camera error: ${message || name || 'Unknown error'}`
-}
-
-function MeetingRoomContent({
-  meetingData,
-  setMeetingData,
-  isHost: isHostProp,
-  handleLeave,
-  handleEndMeeting,
-  handleDeleteMeeting,
-  handleRename,
-  handleCopyCode,
-  handleCopyLink,
-  lockMeeting,
-  activateMeeting,
-  showToast,
-  user,
-  attendanceConsent,
-  endMeeting,
-  expireMeeting,
-  socket,
-  socketReady,
-  chatMessages,
-  setChatMessages,
-  ephemeralChatMessages,
-  setEphemeralChatMessages,
-  ephemeralChatPolicy,
-  setEphemeralChatPolicy,
-  activeChatConvTab,
-  setActiveChatConvTab,
-  selectedChatRecipient,
-  setSelectedChatRecipient,
-  typingUsers,
-  setTypingUsers,
-  handleLeaveWithAttendanceRef,
-  waitingRequests,
-  fetchWaitingRequests,
-  isIntentionalLeaveRef,
-  dbParticipants = []
-}) {
-  const navigate = useNavigate()
-  const room = useMaybeRoomContext()
-  const { localParticipant } = useLocalParticipant()
-  const participants = useParticipants()
-  const tracks = useTracks([Track.Source.ScreenShare])
-  const mediaInitRef = useRef(false)
-  const mediaInitDoneRef = useRef(false)
-  const micActionInFlightRef = useRef(false)
-  const camActionInFlightRef = useRef(false)
-  const activatedRef = useRef(false)
-
-  const [micActive, setMicActive] = useState(() => {
-    const resolved = resolveInitialMediaState({
-      userId: user?.id,
-      isHost: isHostProp,
-      muteAllEnabled: Boolean(meetingData?.mute_all_enabled)
-    })
-    return resolved.shouldEnableMic
-  })
-  const [camActive, setCamActive] = useState(() => {
-    const resolved = resolveInitialMediaState({
-      userId: user?.id,
-      isHost: isHostProp,
-      muteAllEnabled: Boolean(meetingData?.mute_all_enabled)
-    })
-    return resolved.shouldEnableCam
-  })
-  const [sharingActive, setSharingActive] = useState(false)
-  const [camError, setCamError] = useState(null)
-  const [camInitializing, setCamInitializing] = useState(false)
-  const [attendanceCamError, setAttendanceCamError] = useState(false)
-  const [isShuttingDown, setIsShuttingDown] = useState(false)
-
-  // ── Reaction / Raise Hand / BRB state ─────────────────────────────────────
-  // Declared here (inside MeetingRoomContent) where they are used in JSX,
-  // handlers, and socket listeners. socket is passed as a prop from MeetingRoomInner.
-  const [activeReactionsMap, setActiveReactionsMap] = useState({})
-  const [raisedHandsMap, setRaisedHandsMap] = useState({})
-  const [participantStatusMap, setParticipantStatusMap] = useState({})
-  const [raisedHand, setRaisedHand] = useState(false)
-  const [beRightBack, setBeRightBack] = useState(false)
-
-  // Timer state — must live here with all other useState calls to avoid hook-order violations
-  const [seconds, setSeconds] = useState(0)
-
-  // Duration & Scheduled Expiration / Extension States
-  const [remainingSeconds, setRemainingSeconds] = useState(null)
-  const [isWarningModalOpen, setIsWarningModalOpen] = useState(false)
-  const [isExtensionModalOpen, setIsExtensionModalOpen] = useState(false)
-  const [selectedExtension, setSelectedExtension] = useState(null)
-  const [isSubmittingExtension, setIsSubmittingExtension] = useState(false)
-
-  // Deduplication refs so 3-minute warning triggers exactly once per scheduled deadline
-  const warningTriggeredDeadlineRef = useRef(null)
-  const warningDismissedDeadlineRef = useRef(null)
-  const expirationTriggeredDeadlineRef = useRef(null)
-
-  // Strict Rule: One-Time Extension Limit (Persisted in DB / meetingData)
-  const isExtensionUsed = Boolean(
-    meetingData?.extension_used ||
-    (meetingData?.extension_count != null && meetingData.extension_count >= 1)
-  )
-
-  // Drawer Panel Toggles
-  const [rightPanelOpen, setRightPanelOpen] = useState(true)
-  const [activeTab, setActiveTab] = useState('chat') // chat | participants | ai
-
-  // Local Chat / AI States
-  const [chatInput, setChatInput] = useState('')
-  const [aiInput, setAiInput] = useState('')
-  const [aiResponses, setAiResponses] = useState([
-    { sender: 'bot', text: 'I am tracking the meeting. You can ask me to summarize the current discussion.' }
-  ])
-
-  const originalHostId = meetingData?.host_id || meetingData?.hostId
-  const assignedHostId = meetingData?.assigned_host_id
-  const activeHostId   = meetingData?.active_host_id
-  const currentUserId  = user?.id
-
-  const isOriginalHost = Boolean(currentUserId) && Boolean(originalHostId) &&
-    String(currentUserId).trim().toLowerCase() === String(originalHostId).trim().toLowerCase()
-
-  const isAssignedHost = Boolean(currentUserId) && Boolean(assignedHostId) &&
-    String(currentUserId).trim().toLowerCase() === String(assignedHostId).trim().toLowerCase()
-
-  const isActiveHost = Boolean(currentUserId) && Boolean(activeHostId) &&
-    String(currentUserId).trim().toLowerCase() === String(activeHostId).trim().toLowerCase()
-
-  // canManageMeeting: Original Host or Active Host can manage meeting
-  const canManageMeeting = isOriginalHost || isActiveHost
-
-  // canManageHostAssignment: Original Host only
-  const canManageHostAssignment = isOriginalHost
-
-  // Legacy alias — all existing isHost references remain valid
-  const isHost = canManageMeeting
-
-  const effectiveMediaUserId = useMemo(
-    () => resolveMediaUserId(user, localParticipant, resolveParticipantUserId, dbParticipants),
-    [user, localParticipant, dbParticipants]
-  )
-
-  // Keep initial UI button states aligned with saved preferences before LiveKit media initializes
-  useEffect(() => {
-    if (mediaInitRef.current) return
-    const resolved = resolveInitialMediaState({
-      userId: effectiveMediaUserId,
-      isHost,
-      muteAllEnabled: Boolean(meetingData?.mute_all_enabled)
-    })
-    setMicActive(resolved.shouldEnableMic)
-    setCamActive(resolved.shouldEnableCam)
-  }, [effectiveMediaUserId, isHost, meetingData?.mute_all_enabled])
-
-  console.log(`[HOST UI STATE]\ncurrentUserId: ${currentUserId}\nhost_id: ${originalHostId}\nassigned_host_id: ${assignedHostId}\nactive_host_id: ${activeHostId}\nisOriginalHost: ${isOriginalHost}\nisAssignedHost: ${isAssignedHost}\nisActiveHost: ${isActiveHost}\ncanManageMeeting: ${canManageMeeting}\ncanManageHostAssignment: ${canManageHostAssignment}`)
-
-  const roomState = room?.state
-  console.log('[MeetingRoomContent Render] roomState:', roomState, 'localParticipant:', !!localParticipant, 'participants count:', participants?.length || 0)
-
-  // ── Connection resilience: reconnect lifecycle ──────────────────────────────
-  // useConnectionState reads from the LiveKitRoom context (no extra room ref needed)
-  // and returns one of: ConnectionState.Connected | Reconnecting | Disconnected | Connecting
-  const connectionState = useConnectionState()
-  const [isReconnecting, setIsReconnecting] = useState(false)
-
-  // ── Screen Recording Engine (Independent from AI Analyzer) ─────────────────
-  const {
-    recordingState,
-    isRecording,
-    isPaused,
-    isRecordingOrPaused,
-    recordingDuration,
-    isRoomRecording,
-    includeTabAudio,
-    setIncludeTabAudio,
-    startRecording,
-    pauseRecording,
-    resumeRecording,
-    stopRecording
-  } = useScreenRecorder({
-    meetingId: meetingData?.meeting_id,
-    room,
-    localParticipant,
-    participants,
-    socket,
-    showToast
+  const { mountCloudflare, hasUsableCredentials } = shouldMountProvider({
+    effectiveProvider,
+    cloudflareToken
   })
 
-  // Popover state for Zoom-style recording popover: 'header' | 'bottom' | null
-  const [recordingPopoverAnchor, setRecordingPopoverAnchor] = useState(null)
-
-  // ── Host Management UI state ─────────────────────────────────────────────────
-  const [showHostPicker, setShowHostPicker] = useState(false)
-  const [hostActionLoading, setHostActionLoading] = useState(false)
-
-  // Listen for LiveKit's built-in reconnect lifecycle events.
-  // RoomEvent.Reconnecting fires when the DefaultReconnectPolicy starts retrying.
-  // RoomEvent.Reconnected fires when the room comes back successfully.
-  // IMPORTANT: isIntentionalLeaveRef guards these — if the user clicked Leave/End,
-  // we do not show the reconnect banner because the disconnect is intentional.
-  useEffect(() => {
-    if (!room) return
-
-    const onReconnecting = () => {
-      if (isIntentionalLeaveRef?.current) {
-        console.log('[LiveKit Reconnect] Intentional leave in progress — suppressing reconnect banner.')
-        return
-      }
-      console.log('[LiveKit Reconnect] Connection lost. LiveKit DefaultReconnectPolicy is retrying...')
-      setIsReconnecting(true)
+  // Recovery state if provider has no valid credentials
+  if (!hasUsableCredentials) {
+    if (joinAttemptedRef.current && !isJoinInFlight && !isJoiningMeeting) {
+      return (
+        <div className="fixed inset-0 z-40 bg-[#04050b] flex flex-col items-center justify-center p-6 text-center select-none">
+          <div className="max-w-md w-full bg-slate-900/90 border border-amber-500/20 rounded-2xl p-6 flex flex-col items-center gap-4 shadow-2xl">
+            <div className="w-12 h-12 rounded-full bg-amber-500/10 border border-amber-500/20 flex items-center justify-center text-amber-400">
+              <AlertTriangle size={24} />
+            </div>
+            <h2 className="text-base font-bold text-white">Missing Meeting Credentials</h2>
+            <p className="text-xs text-gray-400 bg-black/40 border border-white/5 p-3 rounded-xl w-full text-center">
+              Unable to join media room: Cloudflare RealtimeKit credentials not found. Please try rejoining.
+            </p>
+            <div className="flex items-center gap-3 w-full mt-2">
+              <button
+                onClick={() => {
+                  setRoomError(null)
+                  setIsLoading(true)
+                  joinAttemptedRef.current = false
+                  window.location.reload()
+                }}
+                className="flex-1 px-4 py-2.5 bg-slate-800 hover:bg-slate-700 text-white rounded-xl text-xs font-bold transition-all cursor-pointer flex items-center justify-center gap-2"
+              >
+                <RefreshCw size={14} />
+                <span>Retry</span>
+              </button>
+              <button
+                onClick={() => navigate('/')}
+                className="flex-1 px-4 py-2.5 bg-purple-600 hover:bg-purple-500 text-white rounded-xl text-xs font-bold transition-all cursor-pointer"
+              >
+                Back to Home
+              </button>
+            </div>
+          </div>
+        </div>
+      )
     }
 
-    const onReconnected = () => {
-      console.log('[LiveKit Reconnect] Successfully reconnected to room.')
-      setIsReconnecting(false)
-    }
-
-    const onDisconnected = () => {
-      // Only clear the reconnect banner if we're not in an intentional leave
-      // (intentional leaves already navigate away, so this is a safety clear)
-      if (!isIntentionalLeaveRef?.current) {
-        setIsReconnecting(false)
-      }
-    }
-
-    room.on(RoomEvent.Reconnecting, onReconnecting)
-    room.on(RoomEvent.Reconnected, onReconnected)
-    room.on(RoomEvent.Disconnected, onDisconnected)
-
-    return () => {
-      room.off(RoomEvent.Reconnecting, onReconnecting)
-      room.off(RoomEvent.Reconnected, onReconnected)
-      room.off(RoomEvent.Disconnected, onDisconnected)
-    }
-  }, [room, isIntentionalLeaveRef])
-
-  // ─── AI Attendance State Machine (Face-Presence Intervals) ─────────────────
-  //
-  // States:  WAITING_FOR_FACE → PRESENT → GRACE → PAUSED
-  //
-  // Source of truth for presence time: TIMESTAMPS, not tick counters.
-  // presenceSeconds.current is only used for fast UI display; all final
-  // calculations use getFacePresenceSeconds() which derives from intervals.
-
-  const GRACE_PERIOD_SECONDS = 7
-  const detectorRef = useRef(null)
-  const cameraStreamRef = useRef(null)
-  const animationFrameIdRef = useRef(null)
-  const hasUploaded = useRef(false)
-
-  // State machine
-  const attendanceStateRef = useRef('WAITING_FOR_FACE') // 'WAITING_FOR_FACE'|'PRESENT'|'GRACE'|'PAUSED'
-  const graceStartTimeRef = useRef(null)       // Date.now() when GRACE started
-  const currentIntervalStartRef = useRef(null) // Date.now() when current PRESENT interval started
-  const attendanceIntervalsRef = useRef([])    // { start: ms, end: ms, seconds: n }[]
-  const consecutiveDetections = useRef(0)
-  const totalSeconds = useRef(0)
-
-  // presenceSeconds is a fast display counter only — NOT the source of truth.
-  // Use getFacePresenceSeconds() for any final calculations.
-  const presenceSeconds = useRef(0)
-
-  // Flag so the backend knows this is a fresh final submission, not a reconnect accumulation
-  const isFirstSubmitRef = useRef(true)
-
-  const videoRef = useRef(null)
-  const attendanceCameraStreamRef = useRef(null)
-  const transcriptMediaRecorderRef = useRef(null)
-  const transcriptStreamRef = useRef(null)
-  const transcriptIntervalRef = useRef(null)
-  const isTranscriptActiveRef = useRef(false)
-  const activeTranscriptUploadsRef = useRef(0)
-
-  // ─── Unified Physical Camera Architecture ─────────────────────────────────
-  // Exactly ONE physical camera acquisition is shared between AI Attendance and LiveKit.
-  // • AI Attendance captures frames locally via hidden video element.
-  // • LiveKit publishes a cloned track so toggling/muting LiveKit never kills
-  //   the physical camera track needed by Attendance.
-  // • Physical camera is released ONLY when neither Attendance nor LiveKit needs it.
-  const physicalCameraStreamRef = useRef(null)
-  const physicalCameraTrackRef = useRef(null)
-  const acquiringCameraPromiseRef = useRef(null)
-  const attendanceNeedsCameraRef = useRef(false)
-  const meetingCamActiveRef = useRef(false)
-
-  const getOrCreatePhysicalTrack = useCallback(async () => {
-    if (physicalCameraTrackRef.current && physicalCameraTrackRef.current.readyState === 'live') {
-      return physicalCameraTrackRef.current
-    }
-    if (acquiringCameraPromiseRef.current) {
-      return acquiringCameraPromiseRef.current
-    }
-
-    acquiringCameraPromiseRef.current = (async () => {
-      try {
-        console.log('[Camera Architecture] Acquiring single physical camera stream via getUserMedia...')
-        let stream
-        try {
-          stream = await navigator.mediaDevices.getUserMedia({
-            video: { width: { ideal: 1280 }, height: { ideal: 720 }, facingMode: 'user' },
-            audio: false
-          })
-        } catch (firstErr) {
-          const isBusyError = firstErr.name === 'NotReadableError' ||
-                              firstErr.name === 'TrackStartError' ||
-                              (firstErr.message && firstErr.message.toLowerCase().includes('could not start video source'))
-          if (isBusyError) {
-            console.warn('[Camera Architecture] Camera hardware transiently busy, retrying in 400ms...')
-            await new Promise(r => setTimeout(r, 400))
-            stream = await navigator.mediaDevices.getUserMedia({
-              video: { width: { ideal: 1280 }, height: { ideal: 720 }, facingMode: 'user' },
-              audio: false
-            })
-          } else {
-            throw firstErr
-          }
-        }
-
-        physicalCameraStreamRef.current = stream
-        const track = stream.getVideoTracks()[0]
-        physicalCameraTrackRef.current = track
-
-        track.onended = () => {
-          console.warn('[Camera Architecture] Physical camera track ended by hardware/OS')
-          physicalCameraTrackRef.current = null
-          physicalCameraStreamRef.current = null
-        }
-        return track
-      } finally {
-        acquiringCameraPromiseRef.current = null
-      }
-    })()
-
-    return acquiringCameraPromiseRef.current
-  }, [])
-
-  const releasePhysicalCameraIfUnneeded = useCallback(() => {
-    const attendanceNeeds = attendanceNeedsCameraRef.current
-    const meetingNeeds = meetingCamActiveRef.current
-    console.log(`[Camera Architecture] Check release: attendanceNeeds=${attendanceNeeds}, meetingNeeds=${meetingNeeds}`)
-    if (!attendanceNeeds && !meetingNeeds) {
-      if (physicalCameraStreamRef.current) {
-        console.log('[Camera Architecture] Neither Attendance nor LiveKit need camera. Stopping physical tracks.')
-        try {
-          physicalCameraStreamRef.current.getTracks().forEach(track => track.stop())
-        } catch (e) {
-          console.error('[Camera Architecture] Error stopping physical stream tracks:', e)
-        }
-        physicalCameraStreamRef.current = null
-      }
-      if (physicalCameraTrackRef.current) {
-        try {
-          physicalCameraTrackRef.current.stop()
-        } catch (_) {}
-        physicalCameraTrackRef.current = null
-      }
-    }
-  }, [])
-
-  /**
-   * Compute total face-presence seconds from closed intervals + current open interval.
-   * This is the SINGLE SOURCE OF TRUTH for presence duration.
-   * Merges overlapping intervals to prevent double-counting.
-   */
-  const getFacePresenceSeconds = useCallback(() => {
-    const intervals = [...attendanceIntervalsRef.current]
-    const state = attendanceStateRef.current
-    if ((state === 'PRESENT' || state === 'GRACE') && currentIntervalStartRef.current) {
-      const now = Date.now()
-      intervals.push({
-        start: currentIntervalStartRef.current,
-        end: now,
-        seconds: Math.max(0, Math.floor((now - currentIntervalStartRef.current) / 1000))
-      })
-    }
-    const merged = mergeIntervals(intervals)
-    return merged.reduce((sum, iv) => sum + iv.seconds, 0)
-  }, [])
-
-  /**
-   * Close any open interval and set state to PAUSED.
-   * Must be called before every attendance upload.
-   * Merges intervals to ensure reliable accumulation without overlapping spans.
-   */
-  const finalizeAttendanceState = useCallback((reason = 'leave') => {
-    const now = Date.now()
-    if (attendanceStateRef.current === 'PRESENT' || attendanceStateRef.current === 'GRACE') {
-      if (currentIntervalStartRef.current) {
-        const intervalDuration = Math.max(0, Math.floor((now - currentIntervalStartRef.current) / 1000))
-        attendanceIntervalsRef.current.push({
-          start: currentIntervalStartRef.current,
-          end: now,
-          seconds: intervalDuration
-        })
-        console.log(`[AI Attendance] Interval closed (${reason}) | duration: ${intervalDuration}s`)
-        currentIntervalStartRef.current = null
-      }
-    }
-    attendanceStateRef.current = 'PAUSED'
-    graceStartTimeRef.current = null
-    // Merge any overlapping intervals and sync the display counter
-    attendanceIntervalsRef.current = mergeIntervals(attendanceIntervalsRef.current)
-    presenceSeconds.current = attendanceIntervalsRef.current.reduce((sum, iv) => sum + iv.seconds, 0)
-    console.log(`[AI Attendance] Finalized (${reason}) | total face-presence: ${presenceSeconds.current}s | intervals: ${attendanceIntervalsRef.current.length}`)
-  }, [])
-
-  // Get local camera video track from LiveKit
-  const localVideoTrack = localParticipant?.getTrackPublication(Track.Source.Camera)?.videoTrack ||
-                          Array.from(localParticipant?.videoTrackPublications?.values() || []).find(p => p.source === Track.Source.Camera)?.videoTrack
-
-  const isInitializingRef = useRef(false)
-  const sessionStartTimeRef = useRef(null)
-
-  const meetingDataRef = useRef(meetingData)
-  const isHostRef = useRef(isHost)
-  const attendanceConsentRef = useRef(attendanceConsent)
-  const userRef = useRef(user)
-  const handleLeaveRef = useRef(handleLeave)
-
-  useEffect(() => {
-    meetingDataRef.current = meetingData
-  }, [meetingData])
-
-  useEffect(() => {
-    isHostRef.current = isHost
-  }, [isHost])
-
-  // CRITICAL: sync attendanceConsentRef when the user grants/denies consent
-  // Without this, the ref stays null even after the user clicks "Grant"
-  useEffect(() => {
-    attendanceConsentRef.current = attendanceConsent
-  }, [attendanceConsent])
-
-  useEffect(() => {
-    userRef.current = user
-  }, [user])
-
-  // Synchronize localParticipant name with current user profile name in LiveKit
-  useEffect(() => {
-    if (!localParticipant) return
-    const currentName = (user?.name || user?.full_name || '').trim()
-    if (currentName && localParticipant.name !== currentName) {
-      console.log(`[Participant Sync] Updating localParticipant name from "${localParticipant.name}" to "${currentName}"`)
-      localParticipant.setName(currentName).catch((err) => {
-        console.warn('[Participant Sync] Failed to update localParticipant name via LiveKit:', err)
-      })
-    }
-  }, [localParticipant, user?.name, user?.full_name])
-
-  // Guards that prevent the detector and camera loop from being destroyed/recreated
-  // mid-meeting whenever meetingData object identity changes (re-render).
-  // Both effects run exactly once after consent is granted.
-  const detectorInitializedOnceRef = useRef(false)
-  const cameraLoopStartedOnceRef   = useRef(false)
-
-
-  const [activePopup, setActivePopup] = useState(null) // 'react' | 'more' | null
-  const [showEndConfirmModal, setShowEndConfirmModal] = useState(false)
-  const [expandedParticipantId, setExpandedParticipantId] = useState(null)
-
-  const [emojiSearchQuery, setEmojiSearchQuery] = useState('')
-  const [emojiCategory, setEmojiCategory] = useState('all')
-
-  const reactionCooldownRef = useRef(0)
-
-  // Keyboard shortcut listener (Escape closes popups, modals & expanded view)
-  useEffect(() => {
-    const handleKeyDown = (e) => {
-      if (e.key === 'Escape') {
-        setActivePopup(null)
-        setRecordingPopoverAnchor(null)
-        setShowEndConfirmModal(false)
-        setIsWarningModalOpen(false)
-        setIsExtensionModalOpen(false)
-        setExpandedParticipantId(null)
-      }
-    }
-    window.addEventListener('keydown', handleKeyDown)
-    return () => window.removeEventListener('keydown', handleKeyDown)
-  }, [])
-
-  // \u2500\u2500 Socket listeners for reactions, raise hand, Be Right Back \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500
-  // Registered here inside MeetingRoomContent, where the state setters live.
-  // The socket ref is passed as a prop from MeetingRoomInner and is already
-  // connected by the time meetingData?.room_name is truthy.
-  useEffect(() => {
-    const currentSocket = socket?.current
-    if (!currentSocket) return
-
-    const onReaction = ({ identity, reaction }) => {
-      console.log('[Reaction RECEIVE]', identity, reaction)
-      if (!identity || !reaction) return
-      setActiveReactionsMap((prev) => ({ ...prev, [identity]: reaction }))
-      setTimeout(() => {
-        setActiveReactionsMap((prev) => {
-          const next = { ...prev }
-          delete next[identity]
-          return next
-        })
-      }, 3500)
-    }
-
-    const onRaiseHand = ({ identity, raised }) => {
-      console.log('[RaiseHand RECEIVE]', identity, raised)
-      if (!identity) return
-      setRaisedHandsMap((prev) => ({ ...prev, [identity]: !!raised }))
-    }
-
-    const onStatusChange = ({ identity, status }) => {
-      console.log('[Status RECEIVE]', identity, status)
-      if (!identity) return
-      setParticipantStatusMap((prev) => ({ ...prev, [identity]: status }))
-    }
-
-    currentSocket.on('participant_reaction', onReaction)
-    currentSocket.on('participant_raise_hand', onRaiseHand)
-    currentSocket.on('participant_status_change', onStatusChange)
-
-    return () => {
-      currentSocket.off('participant_reaction', onReaction)
-      currentSocket.off('participant_raise_hand', onRaiseHand)
-      currentSocket.off('participant_status_change', onStatusChange)
-    }
-  // meetingData?.room_name is the proxy signal that socket is ready
-  // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [meetingData?.room_name])
-
-
-  const handleSendReaction = (emoji) => {
-    const now = Date.now()
-    if (now - reactionCooldownRef.current < 400) return
-    reactionCooldownRef.current = now
-
-    const currentSocket = socket?.current
-    // BUG FIX #1: use room_name (what join_room emits) NOT meeting_code
-    const roomName = meetingData?.room_name
-    const identity = localParticipant?.identity
-
-    console.log('[Reaction SEND] roomName:', roomName, 'identity:', identity, 'emoji:', emoji)
-
-    // BUG FIX #3: Show reaction locally immediately (don't wait for server echo)
-    if (identity) {
-      setActiveReactionsMap((prev) => ({ ...prev, [identity]: emoji }))
-      setTimeout(() => {
-        setActiveReactionsMap((prev) => {
-          const next = { ...prev }
-          delete next[identity]
-          return next
-        })
-      }, 3500)
-    }
-
-    if (currentSocket && identity && roomName) {
-      currentSocket.emit('send_reaction', {
-        roomName,
-        identity,
-        senderName: user?.full_name || 'Participant',
-        reaction: emoji
-      })
-    } else {
-      console.warn('[Reaction SEND] Missing socket/identity/roomName. socket:', !!currentSocket, 'identity:', identity, 'roomName:', roomName)
-    }
-  }
-
-  const handleToggleRaiseHand = () => {
-    const newRaised = !raisedHand
-    setRaisedHand(newRaised)
-    // BUG FIX #1: use room_name not meeting_code
-    const roomName = meetingData?.room_name
-    const currentSocket = socket?.current
-    const identity = localParticipant?.identity
-
-    console.log('[RaiseHand SEND] roomName:', roomName, 'identity:', identity, 'raised:', newRaised)
-
-    // Show locally immediately
-    if (identity) {
-      setRaisedHandsMap((prev) => ({ ...prev, [identity]: newRaised }))
-    }
-
-    if (currentSocket && identity && roomName) {
-      currentSocket.emit('toggle_raise_hand', {
-        roomName,
-        identity,
-        senderName: user?.full_name || 'Participant',
-        raised: newRaised
-      })
-    } else {
-      console.warn('[RaiseHand SEND] Missing socket/identity/roomName.')
-    }
-  }
-
-  const handleToggleBeRightBack = () => {
-    const newBRB = !beRightBack
-    setBeRightBack(newBRB)
-    const newStatus = newBRB ? 'be_right_back' : 'active'
-    // BUG FIX #1: use room_name not meeting_code
-    const roomName = meetingData?.room_name
-    const currentSocket = socket?.current
-    const identity = localParticipant?.identity
-
-    console.log('[BRB SEND] roomName:', roomName, 'identity:', identity, 'status:', newStatus)
-
-    // Show locally immediately
-    if (identity) {
-      setParticipantStatusMap((prev) => ({ ...prev, [identity]: newStatus }))
-    }
-
-    if (currentSocket && identity && roomName) {
-      currentSocket.emit('toggle_status', {
-        roomName,
-        identity,
-        senderName: user?.full_name || 'Participant',
-        status: newStatus
-      })
-    } else {
-      console.warn('[BRB SEND] Missing socket/identity/roomName.')
-    }
-  }
-
-  useEffect(() => {
-    userRef.current = user
-  }, [user])
-
-  useEffect(() => {
-    handleLeaveRef.current = handleLeave
-  }, [handleLeave])
-
-
-
-  // Track when the participant successfully joins the LiveKit room
-  useEffect(() => {
-    if (meetingData?.enable_ai_attendance && !isHost && roomState === 'connected') {
-      if (!sessionStartTimeRef.current) {
-        sessionStartTimeRef.current = Date.now()
-        console.log('[Attendance Debug] Participant joined. Session timer started:', new Date(sessionStartTimeRef.current).toISOString())
-      }
-    }
-  }, [meetingData, isHost, roomState])
-
-  // LiveKit Identity & Remote Participant Debugging
-  useEffect(() => {
-    if (!room || roomState !== 'connected') return
-
-    if (localParticipant) {
-      console.log(`[LIVEKIT IDENTITY DEBUG]\nlocal participant identity: ${localParticipant.identity || 'N/A'}\nlocal participant sid: ${localParticipant.sid || 'N/A'}\nroom name: ${room.name || 'N/A'}`)
-    }
-
-    const onParticipantConnected = (p) => {
-      console.log(`[REMOTE PARTICIPANT DEBUG]\nparticipant connected: ${p.identity}\nidentity: ${p.identity}\nsid: ${p.sid}\nisLocal: ${p.isLocal}`)
-    }
-
-    const onTrackPublished = (pub, p) => {
-      console.log(`[REMOTE TRACK DEBUG]\ntrack published: ${pub.trackSid || pub.sid}\nparticipant identity: ${p?.identity || 'N/A'}\ntrack kind: ${pub.kind}\ntrack source: ${pub.source}`)
-    }
-
-    const onTrackSubscribed = (track, pub, p) => {
-      console.log(`[TRACK SUBSCRIBED DEBUG]\nparticipant identity: ${p?.identity || 'N/A'}\ntrack kind: ${track.kind}\ntrack source: ${pub?.source || 'N/A'}`)
-    }
-
-    room.on(RoomEvent.ParticipantConnected, onParticipantConnected)
-    room.on(RoomEvent.TrackPublished, onTrackPublished)
-    room.on(RoomEvent.TrackSubscribed, onTrackSubscribed)
-
-    // Log existing remote participants
-    room.remoteParticipants.forEach((p) => {
-      console.log(`[REMOTE PARTICIPANT DEBUG]\nparticipant connected: ${p.identity}\nidentity: ${p.identity}\nsid: ${p.sid}\nisLocal: false`)
-    })
-
-    return () => {
-      room.off(RoomEvent.ParticipantConnected, onParticipantConnected)
-      room.off(RoomEvent.TrackPublished, onTrackPublished)
-      room.off(RoomEvent.TrackSubscribed, onTrackSubscribed)
-    }
-  }, [room, roomState, localParticipant])
-
-  // Track whether local microphone was muted by host
-  const wasMutedByHostRef = useRef(false)
-
-  // Track state change listener to force re-render when remote participants mute/unmute
-  const [, setTrackTick] = useState(0)
-  const forceTrackUpdate = useCallback(() => setTrackTick((t) => t + 1), [])
-
-  useEffect(() => {
-    if (!room) return
-
-    const syncLocalTracks = async (enforceOff = false) => {
-      forceTrackUpdate()
-      if (!localParticipant || !mediaInitDoneRef.current) return
-      if (!enforceOff && (micActionInFlightRef.current || camActionInFlightRef.current)) return
-      await syncAndEnforceMediaState({
-        localParticipant,
-        userId: effectiveMediaUserId,
-        isHost,
-        muteAllEnabled: Boolean(meetingData?.mute_all_enabled),
-        enforceSavedOffState: enforceOff,
-        releasePhysicalCameraIfUnneeded,
-        setMeetingCamActive: (val) => {
-          meetingCamActiveRef.current = Boolean(val)
-        },
-        setMicActive: (val) => {
-          if (!micActionInFlightRef.current) setMicActive(val)
-        },
-        setCamActive: (val) => {
-          if (!camActionInFlightRef.current) setCamActive(val)
-        },
-        cameraSource: Track.Source.Camera,
-        micSource: Track.Source.Microphone
-      })
-      forceTrackUpdate()
-    }
-
-    const handleTrackChange = () => {
-      syncLocalTracks(false)
-    }
-
-    const handleReconnectedSync = () => {
-      syncLocalTracks(true)
-    }
-
-    room.on(RoomEvent.TrackMuted, handleTrackChange)
-    room.on(RoomEvent.TrackUnmuted, handleTrackChange)
-    room.on(RoomEvent.TrackPublished, forceTrackUpdate)
-    room.on(RoomEvent.TrackUnpublished, forceTrackUpdate)
-    room.on(RoomEvent.LocalTrackPublished, handleTrackChange)
-    room.on(RoomEvent.LocalTrackUnpublished, handleTrackChange)
-    room.on(RoomEvent.ParticipantAttributesChanged, forceTrackUpdate)
-    room.on(RoomEvent.Reconnected, handleReconnectedSync)
-
-    return () => {
-      room.off(RoomEvent.TrackMuted, handleTrackChange)
-      room.off(RoomEvent.TrackUnmuted, handleTrackChange)
-      room.off(RoomEvent.TrackPublished, forceTrackUpdate)
-      room.off(RoomEvent.TrackUnpublished, forceTrackUpdate)
-      room.off(RoomEvent.LocalTrackPublished, handleTrackChange)
-      room.off(RoomEvent.LocalTrackUnpublished, handleTrackChange)
-      room.off(RoomEvent.ParticipantAttributesChanged, forceTrackUpdate)
-      room.off(RoomEvent.Reconnected, handleReconnectedSync)
-    }
-  }, [
-    room,
-    localParticipant,
-    effectiveMediaUserId,
-    isHost,
-    meetingData?.mute_all_enabled,
-    releasePhysicalCameraIfUnneeded,
-    forceTrackUpdate
-  ])
-
-  // Socket.IO listener for host_mute_toggle to synchronize local LiveKit microphone state
-  useEffect(() => {
-    const currentSocket = socket?.current
-    if (!currentSocket) return
-
-    const handleHostMuteToggle = async ({ userId, participantIdentity, mute }) => {
-      const currentUserId = user?.id
-      const localIdentity = localParticipant?.identity
-      const isMe = (currentUserId && userId === currentUserId) ||
-                   (localIdentity && participantIdentity === localIdentity) ||
-                   (currentUserId && participantIdentity === currentUserId)
-
-      console.log(`[Host Mute Event] Received host_mute_toggle for isMe=${isMe}, mute=${mute}, localIdentity=${localIdentity}, participantIdentity=${participantIdentity}`)
-
-      if (isMe && localParticipant) {
-        if (mute) {
-          try {
-            wasMutedByHostRef.current = true
-            console.log('[Host Remote Mute] Disabling local microphone via setMicrophoneEnabled(false)...')
-            await localParticipant.setMicrophoneEnabled(false)
-            setMicActive(false)
-            showToast('The host muted your microphone.', 'info')
-          } catch (err) {
-            console.error('[Host Remote Mute Error] Failed to disable microphone:', err)
-          }
-        } else {
-          if (wasMutedByHostRef.current) {
-            try {
-              wasMutedByHostRef.current = false
-              console.log('[Host Remote Unmute] Restoring local microphone via setMicrophoneEnabled(true)...')
-              await localParticipant.setMicrophoneEnabled(true)
-              setMicActive(true)
-              showToast('Microphone unmuted.', 'success')
-            } catch (err) {
-              console.error('[Host Remote Unmute Error] Failed to enable microphone:', err)
-            }
-          } else {
-            console.log('[Host Remote Unmute] Ignoring host unmute because microphone was not muted by host.')
-          }
-        }
-      }
-    }
-
-    currentSocket.on('host_mute_toggle', handleHostMuteToggle)
-
-    return () => {
-      currentSocket.off('host_mute_toggle', handleHostMuteToggle)
-    }
-  }, [socket, user, localParticipant, showToast])
-
-  // Socket.IO listener for meeting_mute_all_changed to lock/unlock participant microphones
-  useEffect(() => {
-    const currentSocket = socket?.current
-    if (!currentSocket) return
-
-    const handleMuteAllChanged = async ({ muteAllEnabled }) => {
-      console.log('[Security Socket] meeting_mute_all_changed received:', muteAllEnabled)
-      setMeetingData((prev) => (prev ? { ...prev, mute_all_enabled: !!muteAllEnabled } : null))
-
-      if (muteAllEnabled && !isHost && localParticipant) {
-        try {
-          wasMutedByHostRef.current = true
-          console.log('[Mute All Socket] Host enabled Mute All. Disabling local microphone...')
-          await localParticipant.setMicrophoneEnabled(false)
-          setMicActive(false)
-          showToast('The host has locked all participant microphones.', 'info')
-        } catch (err) {
-          console.error('[Mute All Socket Error] Failed to disable microphone:', err)
-        }
-      } else if (!muteAllEnabled && !isHost) {
-        showToast('Microphones are no longer locked by the host.', 'info')
-      }
-    }
-
-    currentSocket.on('meeting_mute_all_changed', handleMuteAllChanged)
-
-    return () => {
-      currentSocket.off('meeting_mute_all_changed', handleMuteAllChanged)
-    }
-  }, [socket, isHost, localParticipant, setMeetingData, showToast])
-
-  const uploadAttendance = async () => {
-    // ── Diagnostic: entry ──────────────────────────────────────────────────
-    const safeMeetingData = meetingDataRef.current
-    const safeMeetingId   = safeMeetingData?.meeting_id  ?? null
-    const safeUserId      = userRef.current?.id          ?? 'unknown'
-
-    console.log('[Attendance Finalize]')
-    console.log(`  meetingId=${safeMeetingId}`)
-    console.log(`  userId=${safeUserId}`)
-    console.log(`  isHost=${isHost}`)
-    console.log(`  enable_ai_attendance=${safeMeetingData?.enable_ai_attendance}`)
-    console.log(`  attendanceConsent=${attendanceConsentRef.current}`)
-    console.log(`  hasUploaded=${hasUploaded.current}`)
-    console.log(`  attendanceState=${attendanceStateRef.current}`)
-    console.log(`  intervalCount=${attendanceIntervalsRef.current.length}`)
-
-    if (isHost) {
-      console.log('[Attendance Finalize] SKIP — user is the meeting host')
-      return true
-    }
-
-    if (!safeMeetingId) {
-      console.error('[Attendance Finalize] ABORT — meetingId is null/undefined. Cannot upload.')
-      return false
-    }
-
-    // Close any open interval and sync presenceSeconds
-    finalizeAttendanceState('uploadAttendance')
-
-    // Source of truth: sum of timestamp-based intervals
-    const effectivePresence = getFacePresenceSeconds()
-    const duration = sessionStartTimeRef.current
-      ? Math.max(0, Math.floor((Date.now() - sessionStartTimeRef.current) / 1000))
-      : 0
-
-    console.log('[Attendance Finalize]')
-    console.log(`  presenceSeconds=${effectivePresence}`)
-    console.log(`  meetingDurationSeconds=${duration}`)
-    console.log(`  isFinalSubmit=${isFirstSubmitRef.current}`)
-
-    // Prevent double-upload (guard is set before fetch, reset if all retries fail)
-    if (hasUploaded.current) {
-      console.log('[Attendance Finalize] SKIP — already uploaded (hasUploaded=true)')
-      return true
-    }
-    hasUploaded.current = true
-
-    const percentage = duration > 0
-      ? Math.min(100, Math.max(0, (effectivePresence / duration) * 100))
-      : 0
-    const status = percentage >= 75 ? 'Present' : 'Absent'
-    const camPermission = attendanceConsentRef.current === 'Granted'
-    const isFinalSubmit = isFirstSubmitRef.current
-    isFirstSubmitRef.current = false
-
-    const payload = {
-      meetingId: safeMeetingId,
-      presenceSeconds: effectivePresence,
-      meetingDurationSeconds: duration,
-      attendancePercentage: Number(percentage.toFixed(2)),
-      status,
-      cameraPermission: camPermission,
-      isFinalSubmit
-    }
-
-    const maxRetries = 3
-    let attempt = 0
-    const delay = (ms) => new Promise(res => setTimeout(res, ms))
-
-    while (attempt < maxRetries) {
-      try {
-        const token = typeof window !== 'undefined' ? sessionStorage.getItem('meetly_auth_token') : null
-        const headers = { 'Content-Type': 'application/json' }
-        if (token) headers['Authorization'] = `Bearer ${token}`
-
-        const apiUrl = import.meta.env.VITE_API_URL || 'http://localhost:5000'
-        const res = await fetch(`${apiUrl}/api/meetings/attendance`, {
-          method: 'POST',
-          headers,
-          body: JSON.stringify(payload),
-          credentials: 'include'
-        })
-
-        const httpStatus = res.status
-        let responseText = ''
-        try { responseText = await res.text() } catch (_) {}
-
-        console.log('[Attendance Upload]')
-        console.log(`  attempt=${attempt + 1}`)
-        console.log(`  HTTP status=${httpStatus}`)
-        console.log(`  response=${responseText}`)
-
-        if (res.ok) {
-          console.log('[Attendance Upload] SUCCESS — record written to database')
-          return true
-        } else {
-          console.error(`[Attendance Upload] Non-OK response on attempt ${attempt + 1}: status=${httpStatus} body=${responseText}`)
-        }
-      } catch (err) {
-        console.error(`[Attendance Upload] Network error on attempt ${attempt + 1}:`, err)
-      }
-      attempt++
-      if (attempt < maxRetries) {
-        await delay(Math.pow(2, attempt) * 500)
-      }
-    }
-
-    console.error('[Attendance Upload] ALL RETRIES FAILED — attendance record NOT saved')
-    hasUploaded.current = false
-    return false
-  }
-
-  const stopTranscriptCapture = () => {
-    if (!isTranscriptActiveRef.current) return
-    isTranscriptActiveRef.current = false
-    console.log('[AI Analyzer] Stopping transcript capture (clean shutdown)...')
-
-    // 1. Stop MediaRecorder immediately
-    if (transcriptMediaRecorderRef.current && transcriptMediaRecorderRef.current.state !== 'inactive') {
-      try {
-        transcriptMediaRecorderRef.current.stop()
-      } catch (e) {
-        console.error('[AI Analyzer] Error stopping MediaRecorder:', e)
-      }
-      transcriptMediaRecorderRef.current = null
-    }
-
-    // 2. Stop microphone capture
-    if (transcriptStreamRef.current) {
-      try {
-        transcriptStreamRef.current.getTracks().forEach(track => track.stop())
-      } catch (e) {
-        console.error('[AI Analyzer] Error stopping mic stream tracks:', e)
-      }
-      transcriptStreamRef.current = null
-    }
-
-    // 3. Clear transcript intervals
-    if (transcriptIntervalRef.current) {
-      clearInterval(transcriptIntervalRef.current)
-      transcriptIntervalRef.current = null
-    }
-  }
-
-  const waitPendingTranscriptUploads = () => {
-    return new Promise((resolve) => {
-      if (activeTranscriptUploadsRef.current === 0) {
-        console.log('[Transcript Queue] All uploads finished.')
-        resolve()
-        return
-      }
-
-      console.log('[Transcript Queue] Waiting for uploads...')
-      let checks = 0
-      const checkInterval = setInterval(() => {
-        checks++
-        console.log(`[Transcript Queue] Active uploads: ${activeTranscriptUploadsRef.current}`)
-        if (activeTranscriptUploadsRef.current === 0) {
-          clearInterval(checkInterval)
-          console.log('[Transcript Queue] All uploads finished.')
-          resolve()
-        } else if (checks >= 600) { // 60 seconds safety timeout
-          clearInterval(checkInterval)
-          console.warn('[Transcript Queue Warning] Timeout reached while waiting for transcript uploads. Continuing shutdown safely.')
-          resolve()
-        }
-      }, 100)
-    })
-  }
-
-  const cleanupResources = () => {
-    console.log('[Attendance] Cleaning up attendance resources...')
-    stopTranscriptCapture()
-    attendanceNeedsCameraRef.current = false
-    meetingCamActiveRef.current = false
-    if (socket.current) {
-      console.log('[Cleanup] Disconnecting Socket.IO immediately...')
-      try {
-        socket.current.disconnect()
-      } catch (e) {
-        console.error('[Cleanup Error] Error disconnecting socket:', e)
-      }
-      socket.current = null
-    }
-    if (animationFrameIdRef.current) {
-      cancelAnimationFrame(animationFrameIdRef.current)
-      animationFrameIdRef.current = null
-    }
-    if (detectorRef.current) {
-      try {
-        detectorRef.current.close()
-      } catch (e) {
-        console.error('[Attendance Error] Error closing detector:', e)
-      }
-      detectorRef.current = null
-    }
-    if (physicalCameraStreamRef.current) {
-      try {
-        physicalCameraStreamRef.current.getTracks().forEach(track => track.stop())
-      } catch (e) {
-        console.error('[Camera Architecture] Error stopping physical tracks on cleanup:', e)
-      }
-      physicalCameraStreamRef.current = null
-    }
-    if (physicalCameraTrackRef.current) {
-      try {
-        physicalCameraTrackRef.current.stop()
-      } catch (_) {}
-      physicalCameraTrackRef.current = null
-    }
-    if (cameraStreamRef.current) {
-      try {
-        cameraStreamRef.current.getTracks().forEach(track => track.stop())
-      } catch (e) {
-        console.error('[Attendance Error] Error stopping camera tracks:', e)
-      }
-      cameraStreamRef.current = null
-    }
-    if (attendanceCameraStreamRef.current) {
-      try {
-        attendanceCameraStreamRef.current.getTracks().forEach(track => track.stop())
-      } catch (e) {
-        console.error('[Attendance Error] Error stopping attendance camera tracks:', e)
-      }
-      attendanceCameraStreamRef.current = null
-    }
-  }
-
-  const handleMuteParticipant = async (p) => {
-    console.log(`[Participant Controls]\nuserId: ${user?.id}\nhostId: ${meetingData?.host_id || meetingData?.hostId}\nisHost: ${isHost}`)
-    if (!isHost) {
-      showToast('Only the meeting host can control participant microphones.', 'error')
-      return
-    }
-
-    const micPub = p.getTrackPublication ? p.getTrackPublication(Track.Source.Microphone) : null
-    const trackSid = micPub?.trackSid || micPub?.sid
-
-    if (!trackSid) {
-      console.warn('[Host Mic Toggle] Participant has no active microphone track SID:', p.name || p.identity)
-      showToast(`${p.name || 'Participant'} has no active microphone track.`, 'warning')
-      return
-    }
-
-    const isCurrentlyMuted = p.isMicrophoneEnabled === false || (micPub && micPub.isMuted === true)
-    const shouldMute = !isCurrentlyMuted
-
-    console.log(`[Host Mic Toggle]\ntargetParticipant: ${p.name || p.identity}\ntrackSid: ${trackSid}\nisCurrentlyMuted: ${isCurrentlyMuted}\nshouldMute: ${shouldMute}`)
-
-    try {
-      const token = typeof window !== 'undefined' ? sessionStorage.getItem('meetly_auth_token') : null
-      const headers = { 'Content-Type': 'application/json' }
-      if (token) headers['Authorization'] = `Bearer ${token}`
-
-      const res = await fetch(`${import.meta.env.VITE_API_URL || 'http://localhost:5000'}/api/meetings/security/mute-participant`, {
-        method: 'POST',
-        headers,
-        body: JSON.stringify({
-          meetingCode: meetingData.meeting_code,
-          participantIdentity: p.identity,
-          trackSid: trackSid,
-          mute: shouldMute
-        }),
-        credentials: 'include'
-      })
-
-      if (!res.ok) {
-        const data = await res.json()
-        showToast(data.message || 'Failed to toggle participant microphone.', 'error')
-      }
-    } catch (err) {
-      console.error('[Host Mic Toggle Error]', err)
-      showToast('Error changing participant microphone state.', 'error')
-    }
-  }
-
-  const handleRemoveParticipant = async (pName, pUserId) => {
-    console.log(`[HOST ACTION DEBUG]\naction: remove_participant\nmeetingId: ${meetingData?.meeting_id}\ncurrentUserId: ${user?.id}\nisHost: ${isHost}\ntargetParticipantId: ${pUserId}`)
-    console.log(`[Participant Controls]\nuserId: ${user?.id}\nhostId: ${meetingData?.host_id || meetingData?.hostId}\nisHost: ${isHost}`)
-    if (!isHost) {
-      showToast('Only the meeting host can remove participants.', 'error')
-      return
-    }
-
-    const confirmRemove = window.confirm(`Are you sure you want to remove ${pName} from the meeting?`)
-    if (!confirmRemove) return
-
-    try {
-      console.log('[Security] Requesting backend to remove participant:', pUserId)
-      const token = typeof window !== 'undefined' ? sessionStorage.getItem('meetly_auth_token') : null
-      const headers = { 'Content-Type': 'application/json' }
-      if (token) headers['Authorization'] = `Bearer ${token}`
-
-      const res = await fetch(`${import.meta.env.VITE_API_URL || 'http://localhost:5000'}/api/meetings/security/remove`, {
-        method: 'POST',
-        headers,
-        body: JSON.stringify({ meetingCode: meetingData.meeting_code, userId: pUserId }),
-        credentials: 'include'
-      })
-      if (res.ok) {
-        showToast(`Participant ${pName} has been removed.`, 'success')
-      } else {
-        const data = await res.json()
-        showToast(data.message || 'Failed to remove participant.', 'error')
-      }
-    } catch (err) {
-      console.error(err)
-      showToast('Error removing participant.', 'error')
-    }
-  }
-
-  const handleBanDevice = async (pName, pUserId) => {
-    if (!meetingData) return
-    console.log(`[HOST ACTION DEBUG]\naction: ban_device\nmeetingId: ${meetingData?.meeting_id}\ncurrentUserId: ${user?.id}\nisHost: ${isHost}\ntargetParticipantId: ${pUserId}`)
-    console.log(`[Participant Controls]\nuserId: ${user?.id}\nhostId: ${meetingData?.host_id || meetingData?.hostId}\nisHost: ${isHost}`)
-    if (!isHost) {
-      showToast('Only the meeting host can ban devices.', 'error')
-      return
-    }
-
-    const confirmBan = window.confirm(
-      `This participant (${pName}) will be removed immediately.\nThis browser/device will not be able to rejoin this meeting.\n\nContinue?`
+    return (
+      <div className="fixed inset-0 z-40 bg-[#04050b] flex flex-col items-center justify-center text-xs font-semibold text-gray-500 select-none">
+        <div className="flex flex-col items-center gap-3">
+          <div className="w-8 h-8 rounded-full border border-white/10 border-t-purple-500 animate-spin" />
+          <span className="uppercase tracking-widest text-[9px] font-bold text-gray-400">Connecting to Room...</span>
+        </div>
+      </div>
     )
-    if (!confirmBan) return
-
-    try {
-      console.log('[Security] Sending ban device request for userId:', pUserId)
-      const token = typeof window !== 'undefined' ? sessionStorage.getItem('meetly_auth_token') : null
-      const headers = { 'Content-Type': 'application/json' }
-      if (token) headers['Authorization'] = `Bearer ${token}`
-
-      const res = await fetch(`${import.meta.env.VITE_API_URL || 'http://localhost:5000'}/api/meetings/security/ban-device`, {
-        method: 'POST',
-        headers,
-        body: JSON.stringify({ meetingCode: meetingData.meeting_code, userId: pUserId }),
-        credentials: 'include'
-      })
-      if (res.ok) {
-        showToast(`Participant ${pName} has been banned successfully.`, 'success')
-      } else {
-        const data = await res.json()
-        showToast(data.message || 'Failed to ban participant.', 'error')
-      }
-    } catch (err) {
-      console.error(err)
-      showToast('Error banning participant.', 'error')
-    }
   }
 
-  const handleLeaveWithAttendance = async () => {
-    console.log('[Attendance Finalize Trigger] handleLeaveWithAttendance called')
-    console.log(`  meetingId=${meetingDataRef.current?.meeting_id}`)
-    console.log(`  enable_ai_attendance=${meetingDataRef.current?.enable_ai_attendance}`)
-    console.log(`  isHost=${isHost}`)
-    console.log(`  attendanceConsent=${attendanceConsentRef.current}`)
-    console.log(`  hasUploaded=${hasUploaded.current}`)
-    console.log(`  attendanceState=${attendanceStateRef.current}`)
-    console.log(`  intervalCount=${attendanceIntervalsRef.current.length}`)
-    if (isIntentionalLeaveRef) {
-      isIntentionalLeaveRef.current = true
-    }
-    setIsShuttingDown(true)
-    stopTranscriptCapture()
-    await waitPendingTranscriptUploads()
-    if (meetingData?.enable_ai_attendance) {
-      try {
-        await uploadAttendance()
-      } catch (err) {
-        console.error('[Attendance] Final upload error:', err)
-      } finally {
-        cleanupResources()
-      }
-    } else {
-      console.warn('[Attendance Finalize Trigger] SKIP uploadAttendance — enable_ai_attendance is falsy:', meetingData?.enable_ai_attendance)
-      cleanupResources()
-    }
-    setIsShuttingDown(false)
-    await handleLeave()
-  }
-  handleLeaveWithAttendanceRef.current = handleLeaveWithAttendance
-
-  const handleEndWithAttendance = async () => {
-    if (!meetingData) return
-    if (!isHostRef.current) {
-      console.error('[Security Guard] Non-host attempted to call handleEndWithAttendance. Bypassing host end.')
-      return handleLeaveWithAttendance()
-    }
-    const confirmEnd = window.confirm('Are you sure you want to end this meeting for all participants?')
-    if (!confirmEnd) return
-
-    console.log('[Attendance Finalize Trigger] host-ended-meeting')
-    if (isIntentionalLeaveRef) {
-      isIntentionalLeaveRef.current = true
-    }
-    setIsShuttingDown(true)
-    stopTranscriptCapture()
-    await waitPendingTranscriptUploads()
-    if (meetingData?.enable_ai_attendance) {
-      try {
-        await uploadAttendance()
-      } catch (err) {
-        console.error('[Attendance] Final upload error:', err)
-      } finally {
-        cleanupResources()
-      }
-    } else {
-      cleanupResources()
-    }
-    setIsShuttingDown(false)
-
-    try {
-      console.log('[Frontend] Calling endMeeting API...')
-      await endMeeting(meetingData.meeting_id)
-      // The server already emits meeting_ended to all room members via the REST handler.
-      // Also emit from host socket as a secondary safety net.
-      if (socket?.current && meetingData.room_name) {
-        socket.current.emit('end_meeting', meetingData.room_name)
-      }
-      showToast('Meeting ended successfully.', 'success')
-      navigate('/')
-    } catch (err) {
-      showToast(err.message || 'Failed to end meeting', 'error')
-    }
-  }
-
-  // ─────────────────────────────────────────────────────────────────────────
-  // 1. MediaPipe Detector Initialization Effect
-  //
-  // IMPORTANT: deps = [attendanceConsent] ONLY (not meetingData).
-  //   • meetingData was previously in deps — any re-render that created a new
-  //     meetingData object identity caused cleanup (detector.close()) then
-  //     re-init, producing the "Cleaning up detector → Starting AI Attendance"
-  //     cycle observed in production.
-  //   • detectorInitializedOnceRef prevents this effect from running more than
-  //     once per component lifetime even if attendanceConsent flickers.
-  //   • Cleanup only closes the detector on TRUE component unmount (not on
-  //     re-run caused by dependency changes).
-  // ─────────────────────────────────────────────────────────────────────────
-  useEffect(() => {
-    // Read conditions from refs — never from closure — so stale values don't block init
-    const md = meetingDataRef.current
-    if (!md || !md.enable_ai_attendance || isHostRef.current) return
-    if (attendanceConsent !== 'Granted') return
-
-    // One-shot guard: never re-initialize after first successful init
-    if (detectorInitializedOnceRef.current) return
-    if (detectorRef.current || isInitializingRef.current) return
-
-    detectorInitializedOnceRef.current = true
-    isInitializingRef.current = true
-    console.log('[Attendance] Starting AI Attendance')
-
-    const loadDetector = async () => {
-      try {
-        console.log('[Attendance] Loading MediaPipe')
-        const { FilesetResolver, FaceDetector } = await import('@mediapipe/tasks-vision')
-
-        console.log('[Attendance] Loading WASM')
-        const vision = await FilesetResolver.forVisionTasks(
-          'https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.8/wasm'
-        )
-
-        console.log('[Attendance] Loading Face Detector model')
-        const modelUrl = 'https://storage.googleapis.com/mediapipe-models/face_detector/blaze_face_short_range/float16/1/blaze_face_short_range.tflite'
-
-        console.log(`[Attendance] Verifying model access: ${modelUrl}`)
-        try {
-          const checkRes = await fetch(modelUrl, { method: 'HEAD' })
-          if (!checkRes.ok) throw new Error(`Model HTTP ${checkRes.status}`)
-          console.log('[Attendance] Model URL accessibility verified (HTTP 200)')
-        } catch (fetchErr) {
-          console.warn('[Attendance] Model pre-check failed (may still work):', fetchErr.message)
-        }
-
-        console.log('[Attendance] Creating detector')
-        const detector = await FaceDetector.createFromOptions(vision, {
-          baseOptions: {
-            modelAssetPath: modelUrl,
-            delegate: 'GPU'
-          },
-          runningMode: 'VIDEO'
-        })
-
-        detectorRef.current = detector
-        isInitializingRef.current = false
-        console.log('[Attendance] Model loaded successfully')
-        console.log('[Attendance] Initialization completed')
-      } catch (err) {
-        isInitializingRef.current = false
-        detectorInitializedOnceRef.current = false // allow retry on error
-        console.error('[Attendance Error] MediaPipe FaceDetector initialization failed:', err.message)
-        showToast('AI Attendance initialization failed: ' + (err.message || err), 'error')
-      }
-    }
-
-    loadDetector()
-
-    // Cleanup: only destroy the detector on TRUE component unmount
-    return () => {
-      console.log('[Attendance] Detector cleanup on component unmount')
-      if (detectorRef.current) {
-        try { detectorRef.current.close() } catch (_) {}
-        detectorRef.current = null
-      }
-      isInitializingRef.current = false
-    }
-  }, [attendanceConsent, showToast]) // ← meetingData intentionally REMOVED
-
-  // ─────────────────────────────────────────────────────────────────────────
-  // 2. Local Camera Stream + Detection Loop Effect
-  //
-  // IMPORTANT: deps = [attendanceConsent] ONLY (not meetingData, not showToast).
-  //   • Same reason as above: meetingData in deps caused stream teardown and
-  //     restart on every re-render, killing active face detection.
-  //   • cameraLoopStartedOnceRef ensures we only call getUserMedia once.
-  //   • Instead of early-returning when detectorRef.current is null, we poll
-  //     for up to 15 seconds so the camera stream and rAF loop start as soon
-  //     as the async detector init completes — regardless of render timing.
-  // ─────────────────────────────────────────────────────────────────────────
-  useEffect(() => {
-    const md = meetingDataRef.current
-    if (!md || !md.enable_ai_attendance || isHostRef.current) return
-    if (attendanceConsent !== 'Granted') return
-    if (cameraLoopStartedOnceRef.current) return
-
-    cameraLoopStartedOnceRef.current = true
-    console.log('[Attendance] Initializing separate local camera stream for AI Attendance...')
-
-    // Create a single hidden video element — reused for the lifetime of the component
-    const video = document.createElement('video')
-    video.autoplay = true
-    video.playsInline = true
-    video.muted = true
-    video.style.position = 'fixed'
-    video.style.top = '0'
-    video.style.left = '0'
-    video.style.width = '1px'
-    video.style.height = '1px'
-    video.style.opacity = '0.001'
-    video.style.pointerEvents = 'none'
-    video.style.zIndex = '-9999'
-    document.body.appendChild(video)
-    videoRef.current = video
-
-    let activeStream = null
-    let clockInterval = null
-    let rafId = null
-    let destroyed = false // flag set by cleanup to stop any async work after unmount
-
-    const startCamera = async () => {
-      try {
-        setAttendanceCamError(false)
-        attendanceNeedsCameraRef.current = true
-        console.log('[Attendance] Acquiring physical camera via shared camera architecture...')
-        const physicalTrack = await getOrCreatePhysicalTrack()
-        if (destroyed) {
-          attendanceNeedsCameraRef.current = false
-          releasePhysicalCameraIfUnneeded()
-          return
-        }
-        const attendanceStream = new MediaStream([physicalTrack])
-        activeStream = attendanceStream
-        attendanceCameraStreamRef.current = attendanceStream
-
-        // Attach stream to hidden video element
-        video.srcObject = attendanceStream
-        videoRef.current = video
-        try {
-          await video.play()
-        } catch (playErr) {
-          console.warn('[Attendance] video.play() warning:', playErr)
-        }
-        console.log('[Attendance] Shared physical camera stream attached to hidden video element.')
-
-        // Poll for detector ready (up to 15 s, checking every 200 ms)
-        // This handles the race where getUserMedia resolves before the async
-        // model download completes.
-        let waitMs = 0
-        while (!detectorRef.current && waitMs < 15000 && !destroyed) {
-          await new Promise(r => setTimeout(r, 200))
-          waitMs += 200
-        }
-        if (destroyed) return
-        if (!detectorRef.current) {
-          console.error('[Attendance Error] Detector never became ready after 15s — stopping camera')
-          setAttendanceCamError(true)
-          return
-        }
-
-        console.log('[Attendance Detection Loop] started=true')
-
-        // ── rAF: Face Detection Loop (~400 ms cadence) ───────────────────
-        let lastRafTime = 0
-        let framesProcessed = 0
-        let lastDiagnosticLog = 0
-        let lastFaceLog = 0
-
-        const runDetection = (timestamp) => {
-          if (destroyed || !detectorRef.current || !videoRef.current) return
-
-          if (timestamp - lastRafTime >= 400) {
-            lastRafTime = timestamp
-
-            // ── Video readiness diagnostics (every 2s) ───────────────────
-            const nowMs = Date.now()
-            if (nowMs - lastDiagnosticLog >= 2000) {
-              lastDiagnosticLog = nowMs
-              const vt = videoRef.current
-              const track = activeStream?.getVideoTracks?.()[0] ?? null
-              console.log('[Attendance Detection Input]')
-              console.log(`  videoExists=${!!vt}`)
-              console.log(`  videoReadyState=${vt?.readyState ?? 'n/a'}`)
-              console.log(`  videoWidth=${vt?.videoWidth ?? 0}`)
-              console.log(`  videoHeight=${vt?.videoHeight ?? 0}`)
-              console.log(`  videoPaused=${vt?.paused ?? 'n/a'}`)
-              console.log(`  videoCurrentTime=${vt?.currentTime ?? 0}`)
-              console.log(`  srcObjectExists=${!!(vt?.srcObject)}`)
-              console.log(`  cameraTrackExists=${!!track}`)
-              console.log(`  trackReadyState=${track?.readyState ?? 'n/a'}`)
-              console.log(`  trackEnabled=${track?.enabled ?? 'n/a'}`)
-              console.log('[Attendance Detection Loop]')
-              console.log(`  framesProcessed=${framesProcessed}`)
-              console.log(`  lastFrameTimestamp=${lastRafTime.toFixed(0)}`)
-            }
-
-            try {
-              const vt = videoRef.current
-              if (vt && vt.readyState >= 2 && vt.videoWidth > 0 && vt.videoHeight > 0) {
-                framesProcessed++
-                const results = detectorRef.current.detectForVideo(vt, timestamp)
-                const faceDetected = results?.detections?.length > 0
-                const prevState = attendanceStateRef.current
-
-                // ── Face result log (throttled) ──────────────────────────
-                if (nowMs - lastFaceLog >= 1000) {
-                  lastFaceLog = nowMs
-                  console.log('[Attendance Face Detection]')
-                  console.log(`  faceDetected=${faceDetected}`)
-                  console.log(`  detectionsCount=${results?.detections?.length ?? 0}`)
-                  console.log(`  timestamp=${timestamp.toFixed(0)}`)
-                  console.log(`  state=${prevState}`)
-                }
-
-                if (faceDetected) {
-                  consecutiveDetections.current++
-
-                  if (prevState === 'WAITING_FOR_FACE' || prevState === 'PAUSED') {
-                    if (consecutiveDetections.current >= 2) {
-                      attendanceStateRef.current = 'PRESENT'
-                      graceStartTimeRef.current = null
-                      currentIntervalStartRef.current = Date.now()
-                      console.log(`[Attendance State] ${prevState} → PRESENT`)
-                      console.log('[Attendance Interval] started')
-                    }
-                  } else if (prevState === 'GRACE') {
-                    attendanceStateRef.current = 'PRESENT'
-                    graceStartTimeRef.current = null
-                    console.log('[Attendance State] GRACE → PRESENT (face returned within grace)')
-                  }
-                } else {
-                  if (consecutiveDetections.current > 0) {
-                    consecutiveDetections.current = 0
-                  }
-                  if (prevState === 'PRESENT') {
-                    attendanceStateRef.current = 'GRACE'
-                    graceStartTimeRef.current = Date.now()
-                    console.log('[Attendance State] PRESENT → GRACE')
-                  }
-                }
-              } else {
-                // Throttled: only log once every 2s when not ready
-                if (nowMs - lastDiagnosticLog <= 100) {
-                  console.log('[Attendance Detection Input] video not ready — readyState:', videoRef.current?.readyState, 'w:', videoRef.current?.videoWidth, 'h:', videoRef.current?.videoHeight)
-                }
-              }
-            } catch (err) {
-              console.error('[Attendance Error] Face detection frame error:', err.message)
-            }
-          }
-
-          rafId = requestAnimationFrame(runDetection)
-          animationFrameIdRef.current = rafId
-        }
-
-        rafId = requestAnimationFrame(runDetection)
-        animationFrameIdRef.current = rafId
-
-        // ── Clock: Grace Expiry + Display Sync (every 1 second) ──────────
-        let lastDebugLog = 0
-        clockInterval = setInterval(() => {
-          if (destroyed) return
-          totalSeconds.current++
-
-          if (attendanceStateRef.current === 'GRACE' && graceStartTimeRef.current) {
-            const elapsedGraceSec = Math.floor((Date.now() - graceStartTimeRef.current) / 1000)
-            if (elapsedGraceSec >= GRACE_PERIOD_SECONDS) {
-              console.log(`[Attendance State] GRACE → PAUSED (grace expired after ${elapsedGraceSec}s)`)
-              attendanceStateRef.current = 'PAUSED'
-              graceStartTimeRef.current = null
-
-              if (currentIntervalStartRef.current) {
-                const intervalEnd = Date.now()
-                const intervalDuration = Math.max(0, Math.floor((intervalEnd - currentIntervalStartRef.current) / 1000))
-                attendanceIntervalsRef.current.push({
-                  start: currentIntervalStartRef.current,
-                  end: intervalEnd,
-                  seconds: intervalDuration
-                })
-                console.log(`[Attendance Interval] closed | duration: ${intervalDuration}s | total intervals: ${attendanceIntervalsRef.current.length}`)
-                currentIntervalStartRef.current = null
-              }
-            }
-          }
-
-          // Sync display counter from timestamps (not tick-based)
-          presenceSeconds.current = attendanceIntervalsRef.current.reduce((sum, iv) => sum + iv.seconds, 0)
-          if ((attendanceStateRef.current === 'PRESENT' || attendanceStateRef.current === 'GRACE') && currentIntervalStartRef.current) {
-            presenceSeconds.current += Math.max(0, Math.floor((Date.now() - currentIntervalStartRef.current) / 1000))
-          }
-
-          // Debug log every 5 seconds
-          const now = Date.now()
-          if (now - lastDebugLog >= 5000) {
-            lastDebugLog = now
-            const elapsedSessionSec = sessionStartTimeRef.current
-              ? Math.floor((Date.now() - sessionStartTimeRef.current) / 1000)
-              : 0
-            console.log('[Attendance Debug]')
-            console.log(`  state=${attendanceStateRef.current}`)
-            console.log(`  session=${elapsedSessionSec}s`)
-            console.log(`  facePresence=${presenceSeconds.current}s`)
-            console.log(`  intervalCount=${attendanceIntervalsRef.current.length}`)
-          }
-        }, 1000)
-
-      } catch (err) {
-        if (!destroyed) {
-          console.error('[Attendance Error] Failed to obtain camera stream:', err)
-          setAttendanceCamError(true)
-          showToast('AI Attendance: Camera access failed or hardware busy.', 'warning')
-        }
-      }
-    }
-
-    startCamera()
-
-    return () => {
-      destroyed = true
-      console.log('[Attendance] Cleaning up tracking loop and releasing attendance camera hold')
-      attendanceNeedsCameraRef.current = false
-      if (clockInterval) clearInterval(clockInterval)
-      if (rafId) cancelAnimationFrame(rafId)
-      attendanceCameraStreamRef.current = null
-      if (video && video.parentNode) video.parentNode.removeChild(video)
-      videoRef.current = null
-      releasePhysicalCameraIfUnneeded()
-    }
-  }, [attendanceConsent, showToast, getOrCreatePhysicalTrack, releasePhysicalCameraIfUnneeded]) // ← meetingData intentionally REMOVED
-
-  // beforeunload listener for browser closing / refresh events
-  useEffect(() => {
-    const handleBeforeUnloadAttendance = () => {
-      const currentMeetingData = meetingDataRef.current
-      const currentIsHost = isHostRef.current
-      const currentConsent = attendanceConsentRef.current
-
-      if (currentMeetingData?.enable_ai_attendance && !currentIsHost && !hasUploaded.current) {
-        finalizeAttendanceState('beforeunload')
-
-        const duration = sessionStartTimeRef.current 
-          ? Math.max(0, Math.floor((Date.now() - sessionStartTimeRef.current) / 1000))
-          : 0
-
-        // Send even if presence=0 so backend can overwrite stale records
-        hasUploaded.current = true
-
-        const effectivePresence = attendanceIntervalsRef.current.reduce((sum, iv) => sum + iv.seconds, 0)
-        const percentage = duration > 0
-          ? Math.min(100, Math.max(0, (effectivePresence / duration) * 100))
-          : 0
-        const status = percentage >= 75 ? 'Present' : 'Absent'
-        const camPermission = currentConsent === 'Granted'
-        const isFinalSubmit = isFirstSubmitRef.current
-        isFirstSubmitRef.current = false
-
-        const payload = {
-          meetingId: currentMeetingData.meeting_id,
-          presenceSeconds: effectivePresence,
-          meetingDurationSeconds: duration,
-          attendancePercentage: Number(percentage.toFixed(2)),
-          status,
-          cameraPermission: camPermission,
-          isFinalSubmit
-        }
-
-        console.log('[AI Attendance] beforeunload | facePresence:', effectivePresence, 's | duration:', duration, 's | %:', percentage.toFixed(2))
-
-        const apiUrl = `${import.meta.env.VITE_API_URL || 'http://localhost:5000'}/api/meetings/attendance`
-        const blob = new Blob([JSON.stringify(payload)], { type: 'application/json' })
-        navigator.sendBeacon(apiUrl, blob)
-      }
-    }
-
-    window.addEventListener('beforeunload', handleBeforeUnloadAttendance)
-    return () => {
-      window.removeEventListener('beforeunload', handleBeforeUnloadAttendance)
-    }
-  }, [finalizeAttendanceState])
-
-  // Dedicated mount/unmount effect for AI Attendance finalization fallback
-  useEffect(() => {
-    return () => {
-      // On unmount, stop transcript capture immediately
-      stopTranscriptCapture()
-      const currentMeetingData = meetingDataRef.current
-      const currentIsHost = isHostRef.current
-      const currentConsent = attendanceConsentRef.current
-
-      if (currentMeetingData?.enable_ai_attendance && !currentIsHost && !hasUploaded.current) {
-        finalizeAttendanceState('component-unmount')
-
-        const duration = sessionStartTimeRef.current 
-          ? Math.max(0, Math.floor((Date.now() - sessionStartTimeRef.current) / 1000))
-          : 0
-
-        // Send even if presence=0 so backend can overwrite stale records
-        hasUploaded.current = true
-
-        const effectivePresence = attendanceIntervalsRef.current.reduce((sum, iv) => sum + iv.seconds, 0)
-        const percentage = duration > 0
-          ? Math.min(100, Math.max(0, (effectivePresence / duration) * 100))
-          : 0
-        const status = percentage >= 75 ? 'Present' : 'Absent'
-        const camPermission = currentConsent === 'Granted'
-        const isFinalSubmit = isFirstSubmitRef.current
-        isFirstSubmitRef.current = false
-
-        const payload = {
-          meetingId: currentMeetingData.meeting_id,
-          presenceSeconds: effectivePresence,
-          meetingDurationSeconds: duration,
-          attendancePercentage: Number(percentage.toFixed(2)),
-          status,
-          cameraPermission: camPermission,
-          isFinalSubmit
-        }
-
-        console.log('[AI Attendance] unmount | facePresence:', effectivePresence, 's | duration:', duration, 's | %:', percentage.toFixed(2))
-
-        const apiUrl = `${import.meta.env.VITE_API_URL || 'http://localhost:5000'}/api/meetings/attendance`
-        if (navigator.sendBeacon) {
-          const blob = new Blob([JSON.stringify(payload)], { type: 'application/json' })
-          navigator.sendBeacon(apiUrl, blob)
-        } else {
-          const token = typeof window !== 'undefined' ? sessionStorage.getItem('meetly_auth_token') : null
-          const headers = { 'Content-Type': 'application/json' }
-          if (token) headers['Authorization'] = `Bearer ${token}`
-
-          fetch(apiUrl, {
-            method: 'POST',
-            headers,
-            body: JSON.stringify(payload),
-            keepalive: true,
-            credentials: 'include'
-          }).catch(err => {
-            console.error('[AI Attendance] Unmount background upload failed:', err)
-          })
-        }
-      }
-    }
-  }, [finalizeAttendanceState])
-
-  // Transcript chunk collection
-  useEffect(() => {
-    console.log('[AI Analyzer Debug] useEffect triggered. conditions check:', {
-      hasMeetingData: !!meetingData,
-      enable_ai_analyzer: meetingData?.enable_ai_analyzer,
-      roomState
-    })
-
-    if (!meetingData || !meetingData.enable_ai_analyzer || roomState !== 'connected') {
-      return
-    }
-
-    console.log('[AI Analyzer] AI Analyzer started')
-    isTranscriptActiveRef.current = true
-
-    const startRecording = async () => {
-      try {
-        console.log('[AI Analyzer] Requesting microphone access stream...')
-        // Request dedicated mic stream specifically for recording to prevent interfering with LiveKit
-        const stream = await navigator.mediaDevices.getUserMedia({ audio: true })
-        if (!isTranscriptActiveRef.current) {
-          stream.getTracks().forEach(track => track.stop())
-          return
-        }
-        transcriptStreamRef.current = stream
-        console.log('[AI Analyzer] Microphone access granted successfully.')
-        
-        // Choose supported mimeType
-        let mimeType = 'audio/webm'
-        if (!MediaRecorder.isTypeSupported(mimeType)) {
-          if (MediaRecorder.isTypeSupported('audio/mp4')) {
-            mimeType = 'audio/mp4'
-          } else if (MediaRecorder.isTypeSupported('audio/ogg')) {
-            mimeType = 'audio/ogg'
-          } else {
-            mimeType = '' // Default
-          }
-        }
-        console.log('[AI Analyzer] Using MediaRecorder mimeType:', mimeType)
-
-        // Setup MediaRecorder
-        const mediaRecorder = new MediaRecorder(stream, mimeType ? { mimeType } : undefined)
-        transcriptMediaRecorderRef.current = mediaRecorder
-        let chunks = []
-
-        mediaRecorder.ondataavailable = (e) => {
-          if (!isTranscriptActiveRef.current) return
-          if (e.data && e.data.size > 0) {
-            chunks.push(e.data)
-            console.log('[AI Analyzer] Audio data available:', e.data.size, 'bytes')
-          }
-        }
-
-        mediaRecorder.onstop = async () => {
-          console.log('[AI Analyzer] MediaRecorder stopped. Processing chunks...')
-          const audioBlob = new Blob(chunks, { type: mimeType || 'audio/webm' })
-          chunks = [] // Reset chunks
-
-          console.log('[AI Analyzer] Audio chunk created:', audioBlob.size, 'bytes')
-
-          // Issue 2: Validate audio chunk size (filter out small invalid header-only audio files)
-          if (!audioBlob || audioBlob.size < 1000) {
-            console.log(`[AI Analyzer] Audio chunk too small or invalid (${audioBlob?.size || 0} bytes). Discarding chunk.`)
-            return
-          }
-
-          // Analyze simple volume/silence using Web Audio API to prevent empty API calls
-          let isSilent = false
-          try {
-            const arrayBuffer = await audioBlob.arrayBuffer()
-            const audioCtx = new (window.AudioContext || window.webkitAudioContext)()
-            const audioBuffer = await audioCtx.decodeAudioData(arrayBuffer)
-            const channelData = audioBuffer.getChannelData(0)
-            
-            // Calculate Root Mean Square (RMS) volume
-            let sum = 0
-            for (let i = 0; i < channelData.length; i++) {
-              sum += channelData[i] * channelData[i]
-            }
-            const rms = Math.sqrt(sum / channelData.length)
-            console.log('[AI Analyzer] Audio chunk RMS volume:', rms)
-            if (rms < 0.005) {
-              isSilent = true
-            }
-            await audioCtx.close()
-          } catch (volErr) {
-            console.warn('[AI Analyzer Warning] Web Audio API volume analysis failed or skipped (continuing upload):', volErr)
-          }
-
-          if (isSilent) {
-            console.log('[AI Analyzer] Audio chunk is silent, skipping upload.')
-            return
-          }
-
-          // Prevents new requests if transcript has deactivated
-          if (!isTranscriptActiveRef.current) {
-            console.log('[AI Analyzer] Transcript is deactivated. Skipping chunk upload.')
-            return
-          }
-
-          // Send to backend via multipart/form-data
-          const formData = new FormData()
-          formData.append('file', audioBlob, 'audio.webm')
-          formData.append('meetingId', meetingData.meeting_id)
-          formData.append('speakerName', user?.full_name || user?.name || 'Anonymous')
-
-          try {
-            console.log('[AI Analyzer] Uploading transcript chunk...')
-            activeTranscriptUploadsRef.current++
-            console.log(`[Transcript Queue] Active uploads: ${activeTranscriptUploadsRef.current}`)
-            const token = typeof window !== 'undefined' ? sessionStorage.getItem('meetly_auth_token') : null
-            const headers = {}
-            if (token) headers['Authorization'] = `Bearer ${token}`
-
-            const apiUrl = import.meta.env.VITE_API_URL || 'http://localhost:5000'
-            const res = await fetch(`${apiUrl}/api/meetings/transcript`, {
-              method: 'POST',
-              headers,
-              body: formData,
-              credentials: 'include' // Sent with session auth cookies
-            })
-            if (!res.ok) {
-              console.error('[AI Analyzer] Upload failed. Server returned status:', res.status, await res.text())
-            } else {
-              console.log('[AI Analyzer] Upload successful')
-            }
-          } catch (uploadErr) {
-            console.error('[AI Analyzer] Upload failed. Network error:', uploadErr)
-          } finally {
-            activeTranscriptUploadsRef.current = Math.max(0, activeTranscriptUploadsRef.current - 1)
-            console.log('[Transcript Queue] Upload completed.')
-            console.log(`[Transcript Queue] Active uploads: ${activeTranscriptUploadsRef.current}`)
-          }
-        }
-
-        // Start recording
-        mediaRecorder.start()
-        console.log('[AI Analyzer] MediaRecorder started')
-
-        // Trigger recording slice every 30 seconds
-        const intervalId = setInterval(() => {
-          if (isTranscriptActiveRef.current && mediaRecorder && mediaRecorder.state === 'recording') {
-            console.log('[AI Analyzer] Slicing recorder chunk (30s interval)...')
-            mediaRecorder.stop()
-            mediaRecorder.start()
-          }
-        }, 30000) // 30 seconds chunks
-        transcriptIntervalRef.current = intervalId
-
-      } catch (err) {
-        console.error('[AI Analyzer Error] Failed to initialize mic recording:', err)
-        showToast('AI Analyzer failed to start recording: ' + (err.message || err), 'error')
-      }
-    }
-
-    startRecording()
-
-    return () => {
-      stopTranscriptCapture()
-    }
-  }, [meetingData, roomState, user, showToast])
-
-  // Timer simulation — effect only; state is declared at the top of this component
-  useEffect(() => {
-    console.log('[MeetingRoomContent useEffect timer] Starting timer...')
-    const timer = setInterval(() => {
-      setSeconds((prev) => prev + 1)
-    }, 1000)
-    return () => {
-      console.log('[MeetingRoomContent useEffect timer] Clearing timer...')
-      clearInterval(timer)
-    }
-  }, [])
-
-  // Authoritative scheduled end countdown & 3-minute warning trigger
-  useEffect(() => {
-    const scheduledEndTime = meetingData?.scheduled_end_time
-    if (!scheduledEndTime) {
-      setRemainingSeconds(null)
-      return
-    }
-
-    const calculateRemaining = () => {
-      const end = new Date(scheduledEndTime).getTime()
-      const now = Date.now()
-      const diffSec = Math.max(0, Math.floor((end - now) / 1000))
-      setRemainingSeconds(diffSec)
-
-      // When countdown reaches 00:00 and meeting is Active, trigger backend expiration check
-      if (diffSec <= 0 && meetingData?.meeting_status === 'Active') {
-        if (expirationTriggeredDeadlineRef.current !== scheduledEndTime) {
-          expirationTriggeredDeadlineRef.current = scheduledEndTime
-          console.log('[Frontend] Countdown reached 00:00. Requesting authoritative meeting expiration check from backend...')
-          if (typeof expireMeeting === 'function' && meetingData?.meeting_id) {
-            expireMeeting(meetingData.meeting_id).then((res) => {
-              console.log('[Frontend] Expire meeting response:', res)
-            }).catch((err) => {
-              console.warn('[Frontend] Error requesting meeting expiration:', err)
-            })
-          }
-        }
-      }
-
-      // Host 3-minute warning: trigger when remaining time <= 180s and > 0s
-      // Strict Rule: Display ONLY ONCE, for the original deadline, and NEVER if extension is already used!
-      if (diffSec <= 180 && diffSec > 0 && canManageMeeting && !isExtensionUsed) {
-        if (
-          warningTriggeredDeadlineRef.current !== scheduledEndTime &&
-          warningDismissedDeadlineRef.current !== scheduledEndTime
-        ) {
-          warningTriggeredDeadlineRef.current = scheduledEndTime
-          setIsWarningModalOpen(true)
-        }
-      }
-    }
-
-    calculateRemaining()
-    const timer = setInterval(calculateRemaining, 1000)
-    return () => clearInterval(timer)
-  }, [meetingData?.scheduled_end_time, meetingData?.meeting_id, meetingData?.meeting_status, canManageMeeting, isExtensionUsed, expireMeeting])
-
-  // Transition meeting to ACTIVE and initialize media ONLY when room is connected
-  useEffect(() => {
-    console.log('[MeetingRoomContent useEffect initMedia] Checking room connection. roomState:', roomState, 'localParticipant:', !!localParticipant, 'alreadyInit:', mediaInitRef.current)
-
-    const initRoomSession = async () => {
-      try {
-        if (!room || roomState !== 'connected') {
-          console.log('[Media Init] Waiting for room connection. Current state:', roomState)
-          return
-        }
-
-        // Notify backend to activate meeting (transition Waiting -> Active)
-        if (!activatedRef.current && meetingData?.meeting_id) {
-          activatedRef.current = true
-          console.log('[Activate] LiveKit connected! Activating meeting:', meetingData.meeting_id)
-          activateMeeting(meetingData.meeting_id).then((res) => {
-            if (res?.scheduledEndTime) {
-              setMeetingData((prev) => (prev ? {
-                ...prev,
-                scheduled_end_time: res.scheduledEndTime,
-                meeting_status: 'Active'
-              } : null))
-            }
-          }).catch(console.error)
-        }
-
-        if (!localParticipant || !effectiveMediaUserId || mediaInitRef.current) return
-        mediaInitRef.current = true
-        micActionInFlightRef.current = true
-        camActionInFlightRef.current = true
-
-        console.log('[Media Init] Room connected! Restoring saved camera and microphone preferences for user:', effectiveMediaUserId)
-
-        try {
-          await applyInitialMediaState({
-            localParticipant,
-            userId: effectiveMediaUserId,
-            isHost,
-            muteAllEnabled: Boolean(meetingData?.mute_all_enabled),
-            getOrCreatePhysicalTrack,
-            releasePhysicalCameraIfUnneeded,
-            setMeetingCamActive: (val) => {
-              meetingCamActiveRef.current = Boolean(val)
-            },
-            setCamInitializing,
-            setCamActive,
-            setMicActive,
-            setCamError,
-            getCameraErrorMessage,
-            showToast,
-            wasMutedByHostRef,
-            cameraSource: Track.Source.Camera,
-            micSource: Track.Source.Microphone
-          })
-        } finally {
-          mediaInitDoneRef.current = true
-          micActionInFlightRef.current = false
-          camActionInFlightRef.current = false
-          forceTrackUpdate()
-        }
-      } catch (globalErr) {
-        mediaInitDoneRef.current = true
-        micActionInFlightRef.current = false
-        camActionInFlightRef.current = false
-        console.error('[Media Init] Unhandled error during media initialization:', globalErr)
-      }
-    }
-
-    initRoomSession()
-  }, [
-    room,
-    roomState,
-    localParticipant,
-    effectiveMediaUserId,
+  const sharedAdapterProps = {
+    meetingData,
+    setMeetingData,
     isHost,
-    meetingData?.meeting_id,
-    meetingData?.mute_all_enabled,
+    handleLeave,
+    handleEndMeeting,
+    handleDeleteMeeting,
+    handleRename,
+    handleCopyCode,
+    handleCopyLink,
+    lockMeeting,
     activateMeeting,
     showToast,
-    getOrCreatePhysicalTrack,
-    releasePhysicalCameraIfUnneeded,
-    forceTrackUpdate,
-    setMeetingData
-  ])
-
-
-
-  const formatTimer = (sec) => {
-    const m = Math.floor(sec / 60).toString().padStart(2, '0')
-    const s = (sec % 60).toString().padStart(2, '0')
-    return `${m}:${s}`
+    user,
+    attendanceConsent,
+    endMeeting,
+    expireMeeting,
+    socket,
+    socketReady,
+    chatMessages,
+    setChatMessages,
+    ephemeralChatMessages,
+    setEphemeralChatMessages,
+    ephemeralChatPolicy,
+    setEphemeralChatPolicy,
+    activeChatConvTab,
+    setActiveChatConvTab,
+    selectedChatRecipient,
+    setSelectedChatRecipient,
+    typingUsers,
+    setTypingUsers,
+    handleLeaveWithAttendanceRef,
+    waitingRequests,
+    fetchWaitingRequests,
+    isIntentionalLeaveRef,
+    dbParticipants
   }
 
-  const formatCountdown = (sec) => {
-    if (sec == null || isNaN(sec)) return '00:00'
-    const totalSec = Math.max(0, Math.floor(sec))
-    const h = Math.floor(totalSec / 3600)
-    const m = Math.floor((totalSec % 3600) / 60)
-    const s = totalSec % 60
-    if (h > 0) {
-      return `${h}:${m.toString().padStart(2, '0')}:${s.toString().padStart(2, '0')}`
-    }
-    return `${m.toString().padStart(2, '0')}:${s.toString().padStart(2, '0')}`
-  }
-
-  // Handle Host 3-minute warning response: Decline extension
-  const handleDeclineExtension = () => {
-    if (meetingData?.scheduled_end_time) {
-      warningDismissedDeadlineRef.current = meetingData.scheduled_end_time
-    }
-    setIsWarningModalOpen(false)
-    showToast('Extension declined. The meeting will continue until the scheduled deadline.', 'info')
-  }
-
-  // Handle Host 3-minute warning response: Proceed to extension selector
-  const handleOpenExtensionModal = () => {
-    setIsWarningModalOpen(false)
-    setSelectedExtension(null)
-    setIsExtensionModalOpen(true)
-  }
-
-  // Handle Cancel Extension
-  const handleCancelExtension = () => {
-    setIsExtensionModalOpen(false)
-  }
-
-  // Handle Confirm Extension
-  const handleConfirmExtension = async () => {
-    if (!selectedExtension || ![5, 10, 15].includes(selectedExtension)) {
-      showToast('Please select an extension duration (+5, +10, or +15 minutes)', 'error')
-      return
-    }
-    if (isSubmittingExtension) return
-    setIsSubmittingExtension(true)
-
-    try {
-      const token = typeof window !== 'undefined' ? sessionStorage.getItem('meetly_auth_token') : null
-      const headers = { 'Content-Type': 'application/json' }
-      if (token) headers['Authorization'] = `Bearer ${token}`
-
-      const res = await fetch(`${import.meta.env.VITE_API_URL || 'http://localhost:5000'}/api/meetings/extend`, {
-        method: 'POST',
-        headers,
-        body: JSON.stringify({
-          meetingId: meetingData.meeting_id,
-          extensionMinutes: selectedExtension
-        }),
-        credentials: 'include'
-      })
-
-      const data = await res.json()
-      if (!res.ok) {
-        throw new Error(data.message || 'Failed to extend meeting')
-      }
-
-      setMeetingData((prev) => (prev ? {
-        ...prev,
-        scheduled_end_time: data.scheduledEndTime,
-        extension_used: true,
-        extension_count: 1
-      } : null))
-      setIsWarningModalOpen(false)
-      setIsExtensionModalOpen(false)
-      showToast(`Meeting time successfully extended by ${selectedExtension} minutes!`, 'success')
-    } catch (err) {
-      console.error('[MeetingRoom] Extension failed:', err)
-      showToast(err.message || 'Failed to extend meeting', 'error')
-    } finally {
-      setIsSubmittingExtension(false)
-    }
-  }
-
-  // Handle Mute All / Microphone Lock Toggle (Host Only)
-  const handleToggleMuteAll = async () => {
-    if (!isHost || !meetingData) return
-    const nextState = !meetingData.mute_all_enabled
-
-    try {
-      const token = typeof window !== 'undefined' ? sessionStorage.getItem('meetly_auth_token') : null
-      const headers = { 'Content-Type': 'application/json' }
-      if (token) headers['Authorization'] = `Bearer ${token}`
-
-      const res = await fetch(`${import.meta.env.VITE_API_URL || 'http://localhost:5000'}/api/meetings/security/toggle-mute-all`, {
-        method: 'POST',
-        headers,
-        body: JSON.stringify({
-          meetingCode: meetingData.meeting_code,
-          muteAllEnabled: nextState
-        }),
-        credentials: 'include'
-      })
-
-      if (res.ok) {
-        setMeetingData((prev) => (prev ? { ...prev, mute_all_enabled: nextState } : null))
-        showToast(nextState ? 'Mute All / Microphone Lock enabled.' : 'Mute All / Microphone Lock disabled.', 'success')
-      } else {
-        const data = await res.json()
-        showToast(data.message || 'Failed to toggle Mute All state.', 'error')
-      }
-    } catch (err) {
-      console.error('[Toggle Mute All Error]', err)
-      showToast('Error toggling Mute All status.', 'error')
-    }
-  }
-
-  // Handle control actions
-  const handleToggleMic = async () => {
-    if (!localParticipant || micActionInFlightRef.current) return
-    micActionInFlightRef.current = true
-    try {
-      await toggleMicrophoneState({
-        localParticipant,
-        userId: effectiveMediaUserId,
-        isHost,
-        muteAllEnabled: Boolean(meetingData?.mute_all_enabled),
-        currentMicActive: micActive,
-        setMicActive,
-        showToast,
-        wasMutedByHostRef
-      })
-    } catch (err) {
-      console.error('[Microphone Toggle] Failed:', err)
-    } finally {
-      micActionInFlightRef.current = false
-      forceTrackUpdate()
-    }
-  }
-
-  const handleToggleCam = async () => {
-    if (!localParticipant || camActionInFlightRef.current) return
-    camActionInFlightRef.current = true
-    try {
-      await toggleCameraState({
-        localParticipant,
-        userId: effectiveMediaUserId,
-        currentCamActive: camActive,
-        getOrCreatePhysicalTrack,
-        releasePhysicalCameraIfUnneeded,
-        setMeetingCamActive: (val) => {
-          meetingCamActiveRef.current = Boolean(val)
-        },
-        setCamInitializing,
-        setCamActive,
-        setCamError,
-        getCameraErrorMessage,
-        showToast,
-        cameraSource: Track.Source.Camera
-      })
-    } catch (err) {
-      console.error('[Camera Toggle] Failed:', err)
-    } finally {
-      camActionInFlightRef.current = false
-      forceTrackUpdate()
-    }
-  }
-
-  const handleToggleShare = async () => {
-    if (!localParticipant) return
-    try {
-      const nextState = !sharingActive
-      console.log(`[ScreenShare Toggle] Setting screen share to ${nextState ? 'ON' : 'OFF'}...`)
-      await localParticipant.setScreenShareEnabled(nextState)
-      setSharingActive(nextState)
-      showToast(nextState ? 'Screen sharing started' : 'Screen sharing stopped', 'info')
-    } catch (err) {
-      console.error('[ScreenShare Toggle] Failed:', err)
-      showToast('Failed to toggle screen sharing.', 'error')
-    }
-  }
-
-  const handleToggleLock = async () => {
-    if (!meetingData) return
-    const isCurrentlyLocked = meetingData.meeting_status === 'Locked'
-    try {
-      const nextStatus = await lockMeeting(meetingData.meeting_id, !isCurrentlyLocked)
-      setMeetingData((prev) => (prev ? { ...prev, meeting_status: nextStatus } : null))
-      if (socket.current) {
-        socket.current.emit('lock_meeting', { roomName: meetingData.room_name, isLocked: !isCurrentlyLocked })
-      }
-      showToast(isCurrentlyLocked ? 'Meeting unlocked successfully.' : 'Meeting locked successfully.', 'success')
-    } catch (err) {
-      showToast(err.message || 'Failed to update lock status.', 'error')
-    }
-  }
-
-  const handleSendChat = (e) => {
-    e.preventDefault()
-    if (!chatInput.trim()) return
-
-    if (socket.current) {
-      socket.current.emit('send_message', {
-        roomName: meetingData.room_name,
-        name: user?.full_name || user?.name || 'Anonymous',
-        text: chatInput.trim()
-      })
-      // Clear typing indicator
-      socket.current.emit('typing', {
-        roomName: meetingData.room_name,
-        name: user?.full_name || user?.name || 'Anonymous',
-        isTyping: false
-      })
-    }
-    setChatInput('')
-  }
-
-  const handleChatInputChange = (e) => {
-    setChatInput(e.target.value)
-    if (socket.current) {
-      socket.current.emit('typing', {
-        roomName: meetingData.room_name,
-        name: user?.full_name || user?.name || 'Anonymous',
-        isTyping: e.target.value.trim().length > 0
-      })
-    }
-  }
-
-  const handleAskAI = (e) => {
-    e.preventDefault()
-    if (!aiInput.trim()) return
-    const query = aiInput
-    setAiResponses((prev) => [...prev, { sender: 'user', text: query }])
-    setAiInput('')
-
-    setTimeout(() => {
-      let botAnswer = 'I am currently collecting raw meeting transcripts. Whisper summaries are not enabled in this phase.'
-      if (query.toLowerCase().includes('summary') || query.toLowerCase().includes('summarize')) {
-        botAnswer = `Active meeting session summary: The room title is "${meetingData?.meeting_title || 'Meeting'}". No AI focus metrics are enabled yet.`
-      }
-      setAiResponses((prev) => [...prev, { sender: 'bot', text: botAnswer }])
-    }, 600)
-  }
-
-  // Handle Auto Admit Toggle (Host Only)
-  const handleToggleAutoAdmit = async () => {
-    if (!isHost || !meetingData) return
-    const nextState = meetingData.auto_admit === false ? true : false
-
-    try {
-      const token = typeof window !== 'undefined' ? sessionStorage.getItem('meetly_auth_token') : null
-      const headers = { 'Content-Type': 'application/json' }
-      if (token) headers['Authorization'] = `Bearer ${token}`
-
-      const res = await fetch(`${import.meta.env.VITE_API_URL || 'http://localhost:5000'}/api/meetings/security/toggle-auto-admit`, {
-        method: 'POST',
-        headers,
-        body: JSON.stringify({ meetingId: meetingData.meeting_id, autoAdmit: nextState }),
-        credentials: 'include'
-      })
-
-      if (res.ok) {
-        setMeetingData((prev) => (prev ? { ...prev, auto_admit: nextState } : null))
-        showToast(`Auto Admit toggled ${nextState ? 'ON' : 'OFF'}`, 'success')
-      } else {
-        let errMsg = 'Failed to toggle Auto Admit'
-        try {
-          const data = await res.json()
-          errMsg = data.message || errMsg
-        } catch (e) {}
-        showToast(errMsg, 'error')
-      }
-    } catch (err) {
-      console.error('[Toggle Auto Admit Error]', err)
-      showToast('Error toggling Auto Admit status.', 'error')
-    }
-  }
-
-  // Deduplicate participants list by identity or sid to prevent duplicate cards
-  const rawParticipants = [localParticipant, ...(participants || [])].filter(Boolean)
-  const participantMap = new Map()
-  rawParticipants.forEach((p) => {
-    const key = p.identity || p.sid
-    if (key && !participantMap.has(key)) {
-      participantMap.set(key, p)
-    }
-  })
-  const allParticipants = Array.from(participantMap.values())
-
-  // Auto-close expanded view if that participant disconnects
-  useEffect(() => {
-    if (expandedParticipantId) {
-      const exists = allParticipants.some((p) => (p.identity || p.sid) === expandedParticipantId)
-      if (!exists) {
-        setExpandedParticipantId(null)
-      }
-    }
-  }, [allParticipants, expandedParticipantId])
-
-  const expandedParticipant = useMemo(() => {
-    if (!expandedParticipantId) return null
-    return allParticipants.find((p) => (p.identity || p.sid) === expandedParticipantId) || null
-  }, [allParticipants, expandedParticipantId])
-
-  // Participant search state & instant local filtering
-  const [participantSearchQuery, setParticipantSearchQuery] = useState('')
-
-  const filteredParticipants = useMemo(() => {
-    if (!participantSearchQuery.trim()) return allParticipants
-    const q = participantSearchQuery.toLowerCase().trim()
-    return allParticipants.filter((p) => {
-      let email = ''
-      let username = ''
-      try {
-        const meta = JSON.parse(p?.metadata || '{}')
-        email = meta.email || ''
-        username = meta.username || ''
-      } catch (e) {}
-
-      const nameMatch = p.name ? p.name.toLowerCase().includes(q) : false
-      const identityMatch = p.identity ? p.identity.toLowerCase().includes(q) : false
-      const emailMatch = email ? email.toLowerCase().includes(q) : false
-      const usernameMatch = username ? username.toLowerCase().includes(q) : false
-
-      return nameMatch || identityMatch || emailMatch || usernameMatch
-    })
-  }, [allParticipants, participantSearchQuery])
-
-  // Derive authoritative remaining seconds for the header countdown:
-  // Uses remainingSeconds state (which ticks every second), with fallback to scheduled_end_time diff
-  // or initial duration_minutes * 60 so newly started meetings immediately show 05:00 / 15:00 / 30:00 / 40:00.
-  const displayRemainingSeconds = remainingSeconds !== null
-    ? remainingSeconds
-    : (meetingData?.scheduled_end_time
-        ? Math.max(0, Math.floor((new Date(meetingData.scheduled_end_time).getTime() - Date.now()) / 1000))
-        : (meetingData?.duration_minutes ? meetingData.duration_minutes * 60 : null))
-
+  // ── Sole Media Provider: Cloudflare RealtimeKit ─────────────
   return (
-    <div className="fixed inset-0 z-40 bg-[#04050b] flex flex-col items-stretch overflow-hidden text-left">
-      {(isShuttingDown || meetingData?.meeting_status === 'Ended') && (
-        <div className="absolute inset-0 z-50 bg-[#04050b]/90 backdrop-blur-md flex flex-col items-center justify-center gap-4 text-center">
-          {meetingData?.meeting_status === 'Ended' ? (
-            <>
-              <div className="w-16 h-16 rounded-full bg-red-500/10 border border-red-500/20 flex items-center justify-center text-red-500 text-2xl font-bold">!</div>
-              <div className="text-white text-lg font-semibold">This meeting has ended.</div>
-              <p className="text-gray-400 text-sm max-w-sm">
-                You cannot join, send chat messages, ask AI, or access controls for this meeting because it has already finished.
-              </p>
-              <Button onClick={handleLeave} className="mt-4 px-6 py-2">
-                Back to Dashboard
-              </Button>
-            </>
-          ) : (
-            <>
-              <div className="w-12 h-12 border-4 border-brand-purple border-t-transparent rounded-full animate-spin" />
-              <div className="text-white text-base font-semibold">Finalizing Meeting Details</div>
-              <div className="text-gray-400 text-sm max-w-md">
-                Please wait while the final transcript uploads and calculations complete. Do not close this window.
-              </div>
-            </>
-          )}
-        </div>
-      )}
-      {/* ── Connection Reconnecting Banner ─────────────────────────────────────
-          Shown only when LiveKit's DefaultReconnectPolicy is actively retrying
-          (RoomEvent.Reconnecting fired). Dismissed on RoomEvent.Reconnected.
-          NOT shown for intentional Leave/End actions (guarded by isIntentionalLeaveRef).
-          Non-invasive: top bar only, does not block controls.                     */}
-      {isReconnecting && !isIntentionalLeaveRef?.current && (
-        <div
-          role="status"
-          aria-live="polite"
-          className="absolute top-0 left-0 right-0 z-50 flex items-center justify-center gap-2 px-4 py-2 bg-amber-500/90 backdrop-blur-sm text-slate-950 text-[11px] font-bold select-none"
-        >
-          <div className="w-3 h-3 border-2 border-slate-950/40 border-t-slate-950 rounded-full animate-spin shrink-0" />
-          <span>Connection interrupted — reconnecting automatically…</span>
-        </div>
-      )}
-      {/* Top Header Panel */}
-      <header className="h-14 border-b border-white/5 bg-[#080913] px-6 flex items-center justify-between shrink-0 select-none">
-        <div className="flex items-center gap-3">
-          <span className="font-semibold text-sm text-white tracking-wide flex items-center gap-2">
-            <span>{meetingData?.meeting_title || 'Live Meeting Room'}</span>
-            {isHost && (
-              <button
-                onClick={handleRename}
-                className="text-gray-500 hover:text-white cursor-pointer transition-colors duration-200"
-                title="Rename Meeting"
-              >
-                <Edit2 size={12} />
-              </button>
-            )}
-          </span>
-          <div className="w-1.5 h-1.5 rounded-full bg-white/10" />
-          <span className="text-xs font-semibold text-gray-500 flex items-center gap-2">
-            <span>Code:</span>
-            <span className="text-gray-300 font-mono select-all bg-white/3 px-1.5 py-0.5 rounded border border-white/5">{meetingData?.meeting_code}</span>
-            <button onClick={handleCopyCode} className="text-gray-500 hover:text-white transition-colors cursor-pointer" title="Copy Code">
-              <Copy size={11} />
-            </button>
-            <button onClick={handleCopyLink} className="text-gray-500 hover:text-white transition-colors cursor-pointer" title="Copy Link">
-              <svg className="w-3 h-3" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5">
-                <path d="M10 13a5 5 0 0 0 7.54.54l3-3a5 5 0 0 0-7.07-7.07l-1.72 1.71" />
-                <path d="M14 11a5 5 0 0 0-7.54-.54l-3 3a5 5 0 0 0 7.07 7.07l1.71-1.71" />
-              </svg>
-            </button>
-          </span>
-        </div>
-
-        {/* Live Status Indicators */}
-        <div className="flex items-center gap-4 text-xs font-bold">
-          {(isRecordingOrPaused || isRoomRecording) && (
-            <div className="relative">
-              <button
-                type="button"
-                onClick={() => {
-                  if (canManageMeeting) {
-                    setRecordingPopoverAnchor((prev) => (prev === 'header' ? null : 'header'))
-                  }
-                }}
-                disabled={!canManageMeeting}
-                title={
-                  canManageMeeting
-                    ? 'Recording controls (Pause, Resume, Stop)'
-                    : 'Screen recording in progress'
-                }
-                className={`flex items-center gap-1.5 px-2.5 py-0.5 rounded-full border text-xs font-semibold shadow-sm transition-all ${
-                  canManageMeeting ? 'cursor-pointer hover:brightness-125' : 'cursor-default'
-                } ${
-                  isPaused
-                    ? 'bg-amber-500/15 border-amber-500/30 text-amber-400 shadow-amber-500/20'
-                    : 'bg-red-500/15 border-red-500/30 text-red-400 animate-pulse shadow-red-500/20'
-                }`}
-              >
-                <span
-                  className={`w-2 h-2 rounded-full ${
-                    isPaused ? 'bg-amber-400' : 'bg-red-500'
-                  }`}
-                />
-                <span>{isPaused ? 'PAUSED' : 'REC'}</span>
-                {isRecordingOrPaused && (
-                  <span className="text-gray-300 font-mono text-[11px] ml-1">
-                    {Math.floor(recordingDuration / 60)}:{(recordingDuration % 60).toString().padStart(2, '0')}
-                  </span>
-                )}
-              </button>
-
-              {/* Header recording popover */}
-              {canManageMeeting && (
-                <RecordingControlPopover
-                  isOpen={recordingPopoverAnchor === 'header'}
-                  onClose={() => setRecordingPopoverAnchor(null)}
-                  isPaused={isPaused}
-                  isRecording={isRecording}
-                  recordingDuration={recordingDuration}
-                  onPause={pauseRecording}
-                  onResume={resumeRecording}
-                  onStop={() => stopRecording('user_stop')}
-                  position="top"
-                />
-              )}
-            </div>
-          )}
-          <span className="flex items-center gap-1.5 text-emerald-400">
-            <Radio size={14} className="animate-pulse" />
-            <span>LIVE</span>
-          </span>
-          <span className="text-gray-400 font-mono" title="Time remaining until scheduled meeting end">{formatCountdown(displayRemainingSeconds)}</span>
-          <span className="px-2 py-0.5 rounded bg-white/5 border border-white/10 text-gray-400 text-[10px] font-mono">
-            {allParticipants.length} In Call
-          </span>
-        </div>
-      </header>
-
-      {/* Main Grid + Drawer Area */}
-      <div className="flex-1 flex overflow-hidden">
-        {/* Video Grid Section */}
-        <div className="flex-1 p-4 md:p-6 overflow-hidden flex items-center justify-center bg-[#05060b]">
-          {expandedParticipant ? (
-            <div className="w-full h-full max-w-6xl max-h-[640px] flex items-center justify-center">
-              <ExpandedParticipantStage
-                participant={expandedParticipant}
-                allParticipants={allParticipants}
-                localParticipant={localParticipant}
-                user={user}
-                localCamActive={camActive}
-                onClose={() => setExpandedParticipantId(null)}
-                onSelectParticipant={(id) => setExpandedParticipantId(id)}
-                camInitializing={camInitializing}
-                camError={camError}
-                onRetryCam={handleToggleCam}
-                raisedHandsMap={raisedHandsMap}
-                participantStatusMap={participantStatusMap}
-                activeReactionsMap={activeReactionsMap}
-              />
-            </div>
-          ) : (
-            <div className="grid grid-cols-1 md:grid-cols-2 gap-4 w-full max-w-5xl h-full max-h-[560px] overflow-y-auto">
-              {/* Screen share presentations first */}
-              {(tracks || []).map((t) => (
-                <div
-                  key={t.publication?.trackSid || t.sid || Math.random()}
-                  className="bg-slate-900/60 rounded-2xl border border-white/5 relative overflow-hidden flex flex-col justify-end items-center group shadow-xl col-span-2 min-h-[260px] md:min-h-[360px]"
-                >
-                  <ScreenShareView
-                    trackRef={t}
-                    participant={t.participant}
-                    className="absolute inset-0 w-full h-full"
-                  />
-                </div>
-              ))}
-
-              {/* Video feeds for all participants */}
-              {allParticipants.map((p) => (
-                <ParticipantVideoTile
-                  key={p.sid || p.identity || Math.random()}
-                  participant={p}
-                  localParticipant={localParticipant}
-                  user={user}
-                  localCamActive={camActive}
-                  camInitializing={camInitializing}
-                  camError={camError}
-                  onRetryCam={handleToggleCam}
-                  raisedHand={Boolean(raisedHandsMap[p.identity])}
-                  status={participantStatusMap[p.identity]}
-                  activeReaction={activeReactionsMap[p.identity]}
-                  onExpand={(identity) => setExpandedParticipantId(identity)}
-                />
-              ))}
-            </div>
-          )}
-        </div>
-
-        {/* Right Side Drawer Panel */}
-        {rightPanelOpen && (
-          <div className="w-80 h-full border-l border-white/5 bg-[#080913] flex flex-col justify-between shrink-0">
-            {/* Drawer Tabs Header */}
-            <div className="flex border-b border-white/5 select-none">
-              <button
-                onClick={() => setActiveTab('chat')}
-                className={`flex-1 py-3 text-xs font-semibold border-b-2 transition-all duration-200 cursor-pointer ${
-                  activeTab === 'chat'
-                    ? 'border-brand-purple text-white'
-                    : 'border-transparent text-gray-500 hover:text-gray-300'
-                }`}
-              >
-                Chat
-              </button>
-              <button
-                onClick={() => setActiveTab('participants')}
-                className={`flex-1 py-3 text-xs font-semibold border-b-2 transition-all duration-200 cursor-pointer ${
-                  activeTab === 'participants'
-                    ? 'border-brand-purple text-white'
-                    : 'border-transparent text-gray-500 hover:text-gray-300'
-                }`}
-              >
-                Participants
-              </button>
-              <button
-                onClick={() => setActiveTab('ai')}
-                className={`flex-1 py-3 text-xs font-semibold border-b-2 transition-all duration-200 cursor-pointer ${
-                  activeTab === 'ai'
-                    ? 'border-brand-purple text-white'
-                    : 'border-transparent text-gray-500 hover:text-gray-300'
-                }`}
-              >
-                AI Assistant
-              </button>
-              {isHost && (
-                <button
-                  onClick={() => setActiveTab('security')}
-                  className={`flex-1 py-3 text-xs font-semibold border-b-2 transition-all duration-200 cursor-pointer ${
-                    activeTab === 'security'
-                      ? 'border-brand-purple text-white'
-                      : 'border-transparent text-gray-500 hover:text-gray-300'
-                  }`}
-                >
-                  Security {waitingRequests.length > 0 && `(${waitingRequests.length})`}
-                </button>
-              )}
-            </div>
-
-            {/* Drawer Contents */}
-            <div className={`flex-1 p-4 flex flex-col ${activeTab === 'chat' ? 'overflow-hidden min-h-0' : 'overflow-y-auto justify-between'}`}>
-              {/* TAB: CHAT */}
-              {activeTab === 'chat' && (
-                <div className="h-full flex flex-col min-h-0">
-                  <MeetingChat
-                    meetingData={meetingData}
-                    user={user}
-                    localParticipant={localParticipant}
-                    participants={participants}
-                    dbParticipants={dbParticipants}
-                    socket={socket}
-                    socketReady={socketReady}
-                    isHost={isHost}
-                    showToast={showToast}
-                    messages={ephemeralChatMessages}
-                    setMessages={setEphemeralChatMessages}
-                    policy={ephemeralChatPolicy}
-                    setPolicy={setEphemeralChatPolicy}
-                    activeChatTab={activeChatConvTab}
-                    setActiveChatTab={setActiveChatConvTab}
-                    selectedRecipient={selectedChatRecipient}
-                    setSelectedRecipient={setSelectedChatRecipient}
-                  />
-                </div>
-              )}
-
-              {/* TAB: PARTICIPANTS */}
-              {activeTab === 'participants' && (
-                <div className="flex flex-col gap-3 h-full overflow-y-auto">
-                  {/* Participant Search Bar */}
-                  <div className="relative shrink-0 select-none">
-                    <Search className="absolute left-3 top-1/2 -translate-y-1/2 text-gray-400" size={14} />
-                    <input
-                      type="text"
-                      placeholder="Search participants..."
-                      value={participantSearchQuery}
-                      onChange={(e) => setParticipantSearchQuery(e.target.value)}
-                      className="w-full bg-slate-900/60 border border-white/10 rounded-xl pl-9 pr-8 py-2 text-xs text-white placeholder-gray-500 focus:outline-none focus:border-brand-purple transition-all duration-200"
-                    />
-                    {participantSearchQuery && (
-                      <button
-                        onClick={() => setParticipantSearchQuery('')}
-                        className="absolute right-2.5 top-1/2 -translate-y-1/2 text-gray-400 hover:text-white p-0.5 rounded-md cursor-pointer text-xs"
-                        title="Clear search"
-                      >
-                        ✕
-                      </button>
-                    )}
-                  </div>
-
-                  {/* Participant List */}
-                  {filteredParticipants.length === 0 ? (
-                    <div className="py-8 text-center text-gray-400 text-xs select-none">
-                      No participants found
-                    </div>
-                  ) : (
-                    filteredParticipants.map((p) => {
-                      let role = 'participant'
-                      let pUserId = resolveParticipantUserId(p, dbParticipants) || p.identity
-                      try {
-                        const meta = JSON.parse(p?.metadata || '{}')
-                        role = meta.role || 'participant'
-                      } catch (e) {}
-
-                      if (pUserId && originalHostId && String(pUserId).toLowerCase() === String(originalHostId).toLowerCase()) {
-                        role = 'host'
-                      } else if (pUserId && activeHostId && String(pUserId).toLowerCase() === String(activeHostId).toLowerCase()) {
-                        role = 'active host'
-                      } else if (pUserId && assignedHostId && String(pUserId).toLowerCase() === String(assignedHostId).toLowerCase()) {
-                        role = 'assigned host'
-                      }
-
-                      const isCurrentUser = p.identity === localParticipant?.identity
-                      const displayName = isCurrentUser ? (user?.name || user?.full_name || p.name) : p.name
-
-                      return (
-                        <div key={p.sid || p.identity} className="flex items-center gap-3 p-2 bg-white/2 border border-white/5 rounded-xl justify-between">
-                          <div className="flex items-center gap-3 flex-1 min-w-0">
-                            <div className="w-8 h-8 rounded-full bg-white/5 flex items-center justify-center text-xs font-bold text-gray-300 shrink-0">
-                              {displayName?.charAt(0).toUpperCase() || 'P'}
-                            </div>
-                            <div className="flex flex-col text-left min-w-0">
-                              <span className="text-xs font-semibold text-white truncate flex items-center gap-1.5">
-                                <span>{displayName} {isCurrentUser && ' (You)'}</span>
-                                {raisedHandsMap[p.identity] && (
-                                  <span className="px-1.5 py-0.5 rounded bg-amber-500/20 border border-amber-500/40 text-amber-300 text-[9px] font-bold shrink-0">
-                                    ✋ Hand
-                                  </span>
-                                )}
-                                {participantStatusMap[p.identity] === 'be_right_back' && (
-                                  <span className="px-1.5 py-0.5 rounded bg-amber-500/20 border border-amber-500/40 text-amber-300 text-[9px] font-bold shrink-0">
-                                    ⌛ BRB
-                                  </span>
-                                )}
-                              </span>
-                              <span className="text-[10px] text-gray-400 font-bold uppercase tracking-wider mt-0.5">{role}</span>
-                            </div>
-                          </div>
-
-                          {isHost && role !== 'host' && p.identity !== localParticipant?.identity && (() => {
-                            const micPub = p.getTrackPublication ? p.getTrackPublication(Track.Source.Microphone) : null
-                            const isMuted = p.isMicrophoneEnabled === false || (micPub && micPub.isMuted === true)
-
-                            return (
-                              <div className="flex items-center gap-1 shrink-0 select-none">
-                                <button
-                                  onClick={() => handleMuteParticipant(p)}
-                                  className={`p-1.5 rounded-lg transition-all cursor-pointer ${
-                                    isMuted
-                                      ? 'bg-red-950/50 hover:bg-red-900/50 border border-red-500/20 text-red-400 hover:text-red-300'
-                                      : 'bg-slate-800 hover:bg-slate-700 text-emerald-400 hover:text-emerald-300'
-                                  }`}
-                                  title={isMuted ? 'Request Unmute' : 'Mute Participant'}
-                                >
-                                  {isMuted ? '🚫' : '🎤'}
-                                </button>
-                                <button
-                                  onClick={() => handleRemoveParticipant(p.name, pUserId)}
-                                  className="p-1.5 bg-slate-800 hover:bg-slate-700 text-amber-500 hover:text-amber-400 rounded-lg transition-all cursor-pointer"
-                                  title="Remove Participant"
-                                >
-                                  👢
-                                </button>
-                                <button
-                                  onClick={() => handleBanDevice(p.name, pUserId)}
-                                  className="p-1.5 bg-red-950/40 hover:bg-red-900/40 border border-red-500/10 text-red-500 hover:text-red-400 rounded-lg transition-all cursor-pointer"
-                                  title="Ban Device"
-                                >
-                                  🚫
-                                </button>
-                              </div>
-                            )
-                          })()}
-                        </div>
-                      )
-                    })
-                  )}
-                </div>
-              )}
-
-              {/* TAB: SECURITY */}
-              {activeTab === 'security' && isHost && (
-                <div className="flex flex-col gap-4 h-full justify-start text-left">
-                  {/* Mute All / Microphone Lock Toggle */}
-                  <div className="flex items-center justify-between p-3 bg-red-950/20 border border-red-500/20 rounded-xl">
-                    <div className="flex flex-col text-left pr-2">
-                      <span className="text-xs font-semibold text-white flex items-center gap-1.5">
-                        <span>🔒 Mute All Participants</span>
-                      </span>
-                      <span className="text-[10px] text-gray-400">Lock all participant microphones</span>
-                    </div>
-                    <button
-                      onClick={handleToggleMuteAll}
-                      className={`relative inline-flex h-6 w-11 shrink-0 items-center rounded-full transition-colors cursor-pointer ${
-                        meetingData?.mute_all_enabled ? 'bg-red-600' : 'bg-slate-700'
-                      }`}
-                      title={meetingData?.mute_all_enabled ? "Disable Mute All Lock" : "Enable Mute All Lock"}
-                    >
-                      <span className={`inline-block h-4 w-4 transform rounded-full bg-white transition-transform ${
-                        meetingData?.mute_all_enabled ? 'translate-x-6' : 'translate-x-1'
-                      }`} />
-                    </button>
-                  </div>
-
-                  {/* Auto Admit Participants Toggle */}
-                  <div className="flex items-center justify-between p-3 bg-white/2 border border-white/5 rounded-xl">
-                    <div className="flex flex-col text-left pr-2">
-                      <span className="text-xs font-semibold text-white">Auto Admit Participants</span>
-                      <span className="text-[10px] text-gray-400">Automatically admit eligible participants</span>
-                    </div>
-                    <button
-                      onClick={handleToggleAutoAdmit}
-                      className={`relative inline-flex h-6 w-11 shrink-0 items-center rounded-full transition-colors cursor-pointer ${
-                        meetingData?.auto_admit !== false ? 'bg-purple-600' : 'bg-slate-700'
-                      }`}
-                      title={meetingData?.auto_admit !== false ? "Disable Auto Admit" : "Enable Auto Admit"}
-                    >
-                      <span className={`inline-block h-4 w-4 transform rounded-full bg-white transition-transform ${
-                        meetingData?.auto_admit !== false ? 'translate-x-6' : 'translate-x-1'
-                      }`} />
-                    </button>
-                  </div>
-
-                  <div className="flex flex-col gap-2">
-                    <h3 className="text-xs font-bold text-gray-400 select-none">
-                      Waiting Participants ({waitingRequests.length})
-                    </h3>
-                    <div className="flex flex-col gap-2 overflow-y-auto max-h-[300px]">
-                      {waitingRequests.length === 0 ? (
-                        <p className="text-[11px] text-gray-500 italic py-2">No pending join requests.</p>
-                      ) : (
-                        waitingRequests.map((req) => (
-                          <div key={req.id} className="flex flex-col gap-2 p-3 bg-slate-900/40 border border-white/5 rounded-xl">
-                            <div className="flex flex-col">
-                              <span className="text-xs font-semibold text-white">{req.fullName}</span>
-                              <span className="text-[10px] text-gray-500">{req.email}</span>
-                            </div>
-                            <div className="flex gap-2 justify-end">
-                              <button
-                                onClick={async () => {
-                                  try {
-                                    const token = typeof window !== 'undefined' ? sessionStorage.getItem('meetly_auth_token') : null
-                                    const headers = { 'Content-Type': 'application/json' }
-                                    if (token) headers['Authorization'] = `Bearer ${token}`
-
-                                    const res = await fetch(`${import.meta.env.VITE_API_URL || 'http://localhost:5000'}/api/meetings/security/accept`, {
-                                      method: 'POST',
-                                      headers,
-                                      body: JSON.stringify({ meetingCode: meetingData.meeting_code, userId: req.userId }),
-                                      credentials: 'include'
-                                    })
-                                    if (res.ok) {
-                                      showToast('User accepted.', 'success')
-                                      fetchWaitingRequests()
-                                    } else {
-                                      showToast('Failed to accept request', 'error')
-                                    }
-                                  } catch (err) {
-                                    showToast('Error accepting request', 'error')
-                                  }
-                                }}
-                                className="px-2.5 py-1 bg-emerald-600 hover:bg-emerald-500 text-white rounded text-[10px] font-bold cursor-pointer transition-all"
-                              >
-                                ✔ Accept
-                              </button>
-                              <button
-                                onClick={async () => {
-                                  try {
-                                    const token = typeof window !== 'undefined' ? sessionStorage.getItem('meetly_auth_token') : null
-                                    const headers = { 'Content-Type': 'application/json' }
-                                    if (token) headers['Authorization'] = `Bearer ${token}`
-
-                                    const res = await fetch(`${import.meta.env.VITE_API_URL || 'http://localhost:5000'}/api/meetings/security/reject`, {
-                                      method: 'POST',
-                                      headers,
-                                      body: JSON.stringify({ meetingCode: meetingData.meeting_code, userId: req.userId }),
-                                      credentials: 'include'
-                                    })
-                                    if (res.ok) {
-                                      showToast('User rejected.', 'info')
-                                      fetchWaitingRequests()
-                                    } else {
-                                      showToast('Failed to reject request', 'error')
-                                    }
-                                  } catch (err) {
-                                    showToast('Error rejecting request', 'error')
-                                  }
-                                }}
-                                className="px-2.5 py-1 bg-red-600 hover:bg-red-500 text-white rounded text-[10px] font-bold cursor-pointer transition-all"
-                              >
-                                ✗ Reject
-                              </button>
-                            </div>
-                          </div>
-                        ))
-                      )}
-                    </div>
-                  </div>
-
-                  {/* ── HOST MANAGEMENT — visible only to Original Host ── */}
-                  {canManageHostAssignment && (
-                    <div className="flex flex-col gap-2 border-t border-white/5 pt-3 mt-1">
-                      <h3 className="text-xs font-bold text-purple-300 select-none flex items-center gap-1.5">
-                        <span>👑</span> Host Management
-                      </h3>
-
-                      {/* Active Host indicator */}
-                      <div className="flex items-center justify-between p-2.5 bg-purple-950/20 border border-purple-500/20 rounded-xl">
-                        <div className="flex flex-col">
-                          <span className="text-[10px] text-gray-400">Active Host</span>
-                          <span className="text-xs font-semibold text-white">
-                            {(() => {
-                              if (!activeHostId) return '—'
-                              const activeIsCurrentUser = String(activeHostId).trim().toLowerCase() === String(currentUserId).trim().toLowerCase()
-                              const activeIsOriginalHost = String(activeHostId).trim().toLowerCase() === String(originalHostId).trim().toLowerCase()
-                              if (activeIsCurrentUser) {
-                                return activeIsOriginalHost ? 'You (Original Host)' : 'You (Active Host)'
-                              }
-                              return getDisplayNameForUserId(activeHostId, participants, dbParticipants) || '—'
-                            })()}
-                          </span>
-                        </div>
-                        <span className="text-[10px] text-emerald-400 bg-emerald-500/10 border border-emerald-500/20 px-2 py-0.5 rounded-full">Active</span>
-                      </div>
-
-                      {/* Assigned Host row */}
-                      <div className="flex items-center justify-between p-2.5 bg-white/2 border border-white/5 rounded-xl gap-2">
-                        <div className="flex flex-col min-w-0">
-                          <span className="text-[10px] text-gray-400">Assigned Host</span>
-                          <span className="text-xs font-semibold text-white truncate">
-                            {assignedHostId
-                              ? (getDisplayNameForUserId(assignedHostId, participants, dbParticipants) || assignedHostId)
-                              : <span className="text-gray-500 font-normal italic">None designated</span>}
-                          </span>
-                        </div>
-                        <div className="flex gap-1.5 shrink-0">
-                          {assignedHostId ? (
-                            <>
-                              <button
-                                onClick={() => setShowHostPicker(true)}
-                                disabled={hostActionLoading}
-                                className="px-2 py-1 bg-slate-700 hover:bg-slate-600 text-white rounded text-[10px] font-bold cursor-pointer transition-all disabled:opacity-50"
-                              >
-                                Change
-                              </button>
-                              <button
-                                onClick={async () => {
-                                  setHostActionLoading(true)
-                                  try {
-                                    const token = typeof window !== 'undefined' ? sessionStorage.getItem('meetly_auth_token') : null
-                                    const headers = { 'Content-Type': 'application/json' }
-                                    if (token) headers['Authorization'] = `Bearer ${token}`
-                                    const res = await fetch(
-                                      `${import.meta.env.VITE_API_URL || 'http://localhost:5000'}/api/meetings/${meetingData.meeting_id}/assigned-host`,
-                                      { method: 'DELETE', headers, credentials: 'include' }
-                                    )
-                                    const data = await res.json()
-                                    if (!res.ok) {
-                                      showToast(data.message || 'Failed to remove assigned host.', 'error')
-                                    } else {
-                                      setMeetingData((prev) => {
-                                        const next = prev ? {
-                                          ...prev,
-                                          assigned_host_id: null,
-                                          active_host_id: data.active_host_id || prev.host_id
-                                        } : null
-                                        console.log(`[HOST UI STATE] immediately after removeAssignedHost click meetingData update\nhost_id: ${next?.host_id}\nassigned_host_id: ${next?.assigned_host_id}\nactive_host_id: ${next?.active_host_id}`)
-                                        return next
-                                      })
-                                      showToast(data.message || 'Assigned Host designation has been removed.', 'success')
-                                    }
-                                  } catch {
-                                    showToast('Error removing assigned host.', 'error')
-                                  } finally {
-                                    setHostActionLoading(false)
-                                  }
-                                }}
-                                disabled={hostActionLoading}
-                                className="px-2 py-1 bg-red-700 hover:bg-red-600 text-white rounded text-[10px] font-bold cursor-pointer transition-all disabled:opacity-50"
-                              >
-                                Remove
-                              </button>
-                            </>
-                          ) : (
-                            <button
-                              onClick={() => setShowHostPicker(true)}
-                              disabled={hostActionLoading}
-                              className="px-2.5 py-1 bg-purple-700 hover:bg-purple-600 text-white rounded text-[10px] font-bold cursor-pointer transition-all disabled:opacity-50"
-                            >
-                              + Add Host
-                            </button>
-                          )}
-                        </div>
-                      </div>
-
-                      {/* Participant picker */}
-                      {showHostPicker && (
-                        <div className="flex flex-col gap-1.5 p-2.5 bg-slate-900/60 border border-purple-500/20 rounded-xl">
-                          <div className="flex items-center justify-between mb-1">
-                            <span className="text-[10px] text-gray-400 font-semibold">Select a participant as Assigned Host</span>
-                            <button
-                              onClick={() => setShowHostPicker(false)}
-                              className="text-gray-500 hover:text-white text-[10px] cursor-pointer"
-                            >
-                              ✕
-                            </button>
-                          </div>
-                          {(participants || [])
-                            .filter(p => {
-                              const pUserId = resolveParticipantUserId(p, dbParticipants)
-                              const origHost = String(originalHostId || currentUserId || '').trim().toLowerCase()
-                              return pUserId && pUserId.toLowerCase() !== origHost
-                            })
-                            .map((p) => {
-                              const pUserId = resolveParticipantUserId(p, dbParticipants)
-                              const isCurrentlyAssigned = Boolean(assignedHostId) && Boolean(pUserId) &&
-                                String(pUserId).trim().toLowerCase() === String(assignedHostId).trim().toLowerCase()
-                              return (
-                                <button
-                                  key={p.sid || p.identity || pUserId}
-                                  onClick={async () => {
-                                    const targetUserId = resolveParticipantUserId(p, dbParticipants)
-                                    console.log('[ASSIGN HOST PARTICIPANT DEBUG]', {
-                                      participant: p,
-                                      resolvedUserId: targetUserId,
-                                      userId: p?.userId,
-                                      id: p?.id,
-                                      identity: p?.identity,
-                                      sid: p?.sid,
-                                      name: p?.name,
-                                      metadata: p?.metadata
-                                    })
-                                    if (!targetUserId || !isUuid(targetUserId)) {
-                                      showToast('Could not resolve participant user ID (UUID).', 'error')
-                                      return
-                                    }
-                                    setHostActionLoading(true)
-                                    setShowHostPicker(false)
-                                    try {
-                                      const token = typeof window !== 'undefined' ? sessionStorage.getItem('meetly_auth_token') : null
-                                      const headers = { 'Content-Type': 'application/json' }
-                                      if (token) headers['Authorization'] = `Bearer ${token}`
-                                      const res = await fetch(
-                                        `${import.meta.env.VITE_API_URL || 'http://localhost:5000'}/api/meetings/${meetingData.meeting_id}/assign-host`,
-                                        {
-                                          method: 'POST',
-                                          headers,
-                                          credentials: 'include',
-                                          body: JSON.stringify({ userId: targetUserId })
-                                        }
-                                      )
-                                      const data = await res.json()
-                                      if (!res.ok) {
-                                        showToast(data.message || 'Failed to assign host.', 'error')
-                                      } else {
-                                        showToast(data.message || 'Host assigned successfully.', 'success')
-                                        // Update both assigned_host_id AND active_host_id immediately — assigning is an immediate transfer
-                                        setMeetingData((prev) => {
-                                          const next = prev ? {
-                                            ...prev,
-                                            assigned_host_id: targetUserId,
-                                            active_host_id: data.active_host_id || targetUserId
-                                          } : null
-                                          console.log(`[HOST UI STATE] immediately after assignHost click meetingData update\nhost_id: ${next?.host_id}\nassigned_host_id: ${next?.assigned_host_id}\nactive_host_id: ${next?.active_host_id}`)
-                                          return next
-                                        })
-                                      }
-                                    } catch {
-                                      showToast('Error assigning host.', 'error')
-                                    } finally {
-                                      setHostActionLoading(false)
-                                    }
-                                  }}
-                                  disabled={hostActionLoading}
-                                  className="flex items-center gap-2 p-2 bg-slate-800/60 hover:bg-slate-700/60 border border-white/5 rounded-lg text-left transition-all cursor-pointer disabled:opacity-50 w-full"
-                                >
-                                  <div className="w-6 h-6 rounded-full bg-purple-700 flex items-center justify-center text-[10px] font-bold text-white shrink-0">
-                                    {(p.name || p.identity || '?')[0].toUpperCase()}
-                                  </div>
-                                  <span className="text-xs text-white font-medium truncate">{p.name || p.identity}</span>
-                                  {isCurrentlyAssigned && (
-                                    <span className="ml-auto text-[9px] text-purple-400 shrink-0">current</span>
-                                  )}
-                                </button>
-                              )
-                            })}
-                          {(participants || []).filter(p => {
-                            const pUserId = resolveParticipantUserId(p, dbParticipants)
-                            const origHost = String(originalHostId || currentUserId || '').trim().toLowerCase()
-                            return pUserId && pUserId.toLowerCase() !== origHost
-                          }).length === 0 && (
-                            <p className="text-[11px] text-gray-500 italic">No other participants in the meeting.</p>
-                          )}
-                        </div>
-                      )}
-                    </div>
-                  )}
-                </div>
-              )}
-
-              {/* TAB: AI ASSISTANT */}
-              {activeTab === 'ai' && (
-                <AIChatPanel meetingId={meetingData?.meeting_id} />
-              )}
-            </div>
-          </div>
-        )}
-      </div>
-
-      {/* Bottom Controls Toolbar */}
-      <footer className="h-16 border-t border-white/5 bg-[#080913] px-6 flex items-center justify-between shrink-0 select-none">
-        {/* Toggle Right Drawer panel & AI Attendance Indicator */}
-        <div className="flex items-center gap-4">
-          <button
-            onClick={() => setRightPanelOpen(!rightPanelOpen)}
-            className={`p-2.5 rounded-xl border border-white/5 text-gray-400 hover:text-white transition-all duration-200 cursor-pointer ${rightPanelOpen ? 'bg-white/5 text-white' : 'hover:bg-white/5'}`}
-            title="Toggle Right Panel"
-          >
-            <MessageSquare size={16} />
-          </button>
-
-          {meetingData?.enable_ai_attendance && !isHost && attendanceConsent === 'Granted' && (
-            <div className="flex items-center gap-2 px-3 py-1.5 rounded-xl bg-slate-900/80 border border-white/10 select-none">
-              {attendanceCamError ? (
-                <>
-                  <span className="relative flex h-2 w-2">
-                    <span className="relative inline-flex rounded-full h-2 w-2 bg-red-500"></span>
-                  </span>
-                  <span className="text-[10px] font-bold text-red-400">
-                    AI Attendance: Camera Unavailable
-                  </span>
-                </>
-              ) : (
-                <>
-                  <span className="relative flex h-2 w-2">
-                    <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-purple-400 opacity-75"></span>
-                    <span className="relative inline-flex rounded-full h-2 w-2 bg-purple-500"></span>
-                  </span>
-                  <span className="text-[10px] font-bold text-gray-300">
-                    {camActive ? (
-                      <span>AI Attendance: Active</span>
-                    ) : (
-                      <span>Meeting Camera: Off | AI Attendance Camera: Active Locally</span>
-                    )}
-                  </span>
-                </>
-              )}
-            </div>
-          )}
-        </div>
-
-        {/* Core Media & Meeting Controls Toolbar */}
-        <div className="flex items-center gap-2 md:gap-3 relative">
-          {/* Microphone */}
-          <button
-            onClick={handleToggleMic}
-            title={!isHost && meetingData?.mute_all_enabled ? "Microphones locked by host" : (micActive ? "Mute Microphone" : "Unmute Microphone")}
-            className={`w-11 h-11 rounded-xl flex items-center justify-center border transition-all duration-200 cursor-pointer ${
-              !isHost && meetingData?.mute_all_enabled
-                ? 'bg-red-950/50 hover:bg-red-900/50 border-red-500/30 text-red-400'
-                : micActive
-                ? 'bg-[#0f1122]/60 hover:bg-[#141629] border-white/10 text-white'
-                : 'bg-red-600 hover:bg-red-500 border-transparent text-white'
-            }`}
-          >
-            {!isHost && meetingData?.mute_all_enabled ? (
-              <span className="flex items-center text-xs font-bold gap-0.5 select-none">
-                🔒 <MicOff size={14} />
-              </span>
-            ) : micActive ? (
-              <Mic size={18} />
-            ) : (
-              <MicOff size={18} />
-            )}
-          </button>
-
-          {/* Camera */}
-          <button
-            onClick={handleToggleCam}
-            title={camActive ? "Turn off camera" : "Turn on camera"}
-            className={`w-11 h-11 rounded-xl flex items-center justify-center border transition-all duration-200 cursor-pointer ${
-              camActive ? 'bg-[#0f1122]/60 hover:bg-[#141629] border-white/10 text-white' : 'bg-red-600 hover:bg-red-500 border-transparent text-white'
-            }`}
-          >
-            {camActive ? <Cam size={18} /> : <VideoOff size={18} />}
-          </button>
-
-          {/* Participants Button */}
-          <button
-            onClick={() => {
-              setActiveTab('participants')
-              setRightPanelOpen(true)
-            }}
-            title="Participants"
-            className="px-3 py-2.5 rounded-xl bg-[#0f1122]/60 hover:bg-[#141629] border border-white/10 text-white flex items-center gap-1.5 text-xs font-semibold cursor-pointer transition-all"
-          >
-            <Users size={16} />
-            <span className="hidden md:inline">Participants</span>
-            <span className="px-1.5 py-0.5 rounded-full bg-purple-600/30 text-purple-300 text-[10px] font-bold">
-              {allParticipants.length}
-            </span>
-          </button>
-
-          {/* Chat Button */}
-          <button
-            onClick={() => {
-              setActiveTab('chat')
-              setRightPanelOpen(true)
-            }}
-            title="In-meeting Chat"
-            className="px-3 py-2.5 rounded-xl bg-[#0f1122]/60 hover:bg-[#141629] border border-white/10 text-white flex items-center gap-1.5 text-xs font-semibold cursor-pointer transition-all"
-          >
-            <MessageSquare size={16} />
-            <span className="hidden md:inline">Chat</span>
-          </button>
-
-          {/* Single React Button & Unified Reaction Panel */}
-          <div className="relative">
-            <button
-              onClick={() => setActivePopup(activePopup === 'react' || activePopup === 'emoji' ? null : 'react')}
-              aria-label="Open reactions"
-              title="Reactions"
-              className={`px-3 py-2.5 rounded-xl border transition-all duration-200 cursor-pointer flex items-center gap-1.5 text-xs font-semibold ${
-                activePopup === 'react' || activePopup === 'emoji' || raisedHand || beRightBack
-                  ? 'bg-purple-600 border-purple-500 text-white shadow-lg shadow-purple-600/30'
-                  : 'bg-[#0f1122]/60 hover:bg-[#141629] border-white/10 text-white'
-              }`}
-            >
-              <Smile size={16} />
-              <span className="hidden md:inline">React</span>
-            </button>
-
-            {/* Unified React Panel */}
-            {activePopup === 'react' && (
-              <div className="absolute bottom-16 left-0 sm:left-1/2 sm:-translate-x-1/2 z-50 w-72 bg-[#0c0e1b] border border-white/10 rounded-2xl p-4 shadow-2xl backdrop-blur-xl flex flex-col gap-3.5 select-none text-left">
-                {/* 1. SEND WITH EFFECT */}
-                <div className="flex flex-col gap-1.5">
-                  <span className="text-[10px] font-bold uppercase tracking-wider text-gray-400">SEND WITH EFFECT</span>
-                  <div className="flex items-center justify-between bg-white/5 p-2 rounded-xl border border-white/5">
-                    {['🎈', '🚀', '👍', '😂', '🎉', '❤️'].map((emoji) => (
-                      <button
-                        key={emoji}
-                        onClick={() => {
-                          handleSendReaction(emoji)
-                          setActivePopup(null)
-                        }}
-                        title={`Send ${emoji} effect`}
-                        aria-label={`Send ${emoji} effect`}
-                        className="text-lg hover:scale-125 transition-transform cursor-pointer p-1 rounded hover:bg-white/10"
-                      >
-                        {emoji}
-                      </button>
-                    ))}
-                  </div>
-                </div>
-
-                {/* 2. REACTIONS */}
-                <div className="flex flex-col gap-1.5">
-                  <span className="text-[10px] font-bold uppercase tracking-wider text-gray-400">REACTIONS</span>
-                  <div className="grid grid-cols-6 gap-1 bg-white/5 p-2 rounded-xl border border-white/5">
-                    {['👋', '👍', '❤️', '😂', '😮', '🎉'].map((emoji) => (
-                      <button
-                        key={emoji}
-                        onClick={() => {
-                          handleSendReaction(emoji)
-                          setActivePopup(null)
-                        }}
-                        title={`Send ${emoji}`}
-                        aria-label={`Send ${emoji} reaction`}
-                        className="text-lg hover:scale-125 transition-transform cursor-pointer p-1 rounded hover:bg-white/10 text-center"
-                      >
-                        {emoji}
-                      </button>
-                    ))}
-                  </div>
-                </div>
-
-                {/* 3. RAISE HAND */}
-                <button
-                  onClick={() => {
-                    handleToggleRaiseHand()
-                    setActivePopup(null)
-                  }}
-                  aria-label="Raise or lower hand"
-                  title={raisedHand ? "Lower Hand" : "Raise Hand"}
-                  className={`w-full py-2.5 px-4 rounded-xl font-bold text-xs flex items-center justify-center gap-2 border transition-all cursor-pointer ${
-                    raisedHand
-                      ? 'bg-amber-500 hover:bg-amber-400 border-amber-300 text-slate-950 shadow-lg shadow-amber-500/20'
-                      : 'bg-purple-600 hover:bg-purple-500 border-purple-400/30 text-white'
-                  }`}
-                >
-                  <span className="text-base">{raisedHand ? '👇' : '✋'}</span>
-                  <span>{raisedHand ? 'Lower Hand' : 'Raise Hand'}</span>
-                </button>
-
-                {/* 4. BE RIGHT BACK */}
-                <button
-                  onClick={() => {
-                    handleToggleBeRightBack()
-                    setActivePopup(null)
-                  }}
-                  aria-label="Toggle Be Right Back status"
-                  title={beRightBack ? "I'm Back" : "Be Right Back"}
-                  className={`w-full py-2.5 px-4 rounded-xl font-bold text-xs flex items-center justify-center gap-2 border transition-all cursor-pointer ${
-                    beRightBack
-                      ? 'bg-amber-500/20 border-amber-500/40 text-amber-300'
-                      : 'bg-white/5 hover:bg-white/10 border-white/10 text-white'
-                  }`}
-                >
-                  <span className="text-base">⌛</span>
-                  <span>{beRightBack ? "I'm Back" : 'Be Right Back'}</span>
-                </button>
-
-                {/* 5. MORE EMOJI */}
-                <button
-                  onClick={() => setActivePopup('emoji')}
-                  aria-label="Open full emoji picker"
-                  title="More Emoji"
-                  className="w-full py-2.5 px-4 rounded-xl font-bold text-xs flex items-center justify-center gap-2 bg-white/5 hover:bg-white/10 border border-white/10 text-white transition-all cursor-pointer"
-                >
-                  <span className="text-base">😀</span>
-                  <span>More Emoji</span>
-                </button>
-              </div>
-            )}
-
-            {/* Full Emoji Picker Panel */}
-            {activePopup === 'emoji' && (
-              <div className="absolute bottom-16 left-0 sm:left-1/2 sm:-translate-x-1/2 z-50 w-80 bg-[#0c0e1b] border border-white/10 rounded-2xl p-4 shadow-2xl backdrop-blur-xl flex flex-col gap-3 select-none text-left max-h-[420px] overflow-hidden">
-                {/* Header & Back Button */}
-                <div className="flex items-center justify-between border-b border-white/5 pb-2">
-                  <div className="flex items-center gap-2">
-                    <button
-                      onClick={() => setActivePopup('react')}
-                      className="text-gray-400 hover:text-white text-xs font-bold px-2 py-0.5 rounded bg-white/5 hover:bg-white/10 transition-colors cursor-pointer"
-                      title="Back to React Panel"
-                    >
-                      ‹ Back
-                    </button>
-                    <span className="text-xs font-bold text-white">Emoji Picker</span>
-                  </div>
-                  <button
-                    onClick={() => setActivePopup(null)}
-                    className="text-gray-400 hover:text-white text-xs cursor-pointer p-1"
-                    title="Close"
-                  >
-                    ✕
-                  </button>
-                </div>
-
-                {/* Search Emoji */}
-                <div className="relative flex items-center">
-                  <Search size={14} className="absolute left-3 text-gray-400 pointer-events-none" />
-                  <input
-                    type="text"
-                    placeholder="Search emoji..."
-                    value={emojiSearchQuery}
-                    onChange={(e) => setEmojiSearchQuery(e.target.value)}
-                    className="w-full pl-9 pr-7 py-1.5 bg-white/5 border border-white/10 rounded-xl text-xs text-white placeholder-gray-400 focus:outline-none focus:border-purple-500 transition-colors"
-                  />
-                  {emojiSearchQuery && (
-                    <button
-                      onClick={() => setEmojiSearchQuery('')}
-                      className="absolute right-2.5 text-gray-400 hover:text-white text-xs"
-                    >
-                      ✕
-                    </button>
-                  )}
-                </div>
-
-                {/* Category Navigation Tabs */}
-                {!emojiSearchQuery && (
-                  <div className="flex items-center gap-1 overflow-x-auto pb-1 border-b border-white/5">
-                    {EMOJI_CATEGORIES.map((cat) => (
-                      <button
-                        key={cat.id}
-                        onClick={() => setEmojiCategory(cat.id)}
-                        title={cat.label}
-                        className={`px-2 py-1 rounded-lg text-xs transition-colors cursor-pointer shrink-0 ${
-                          emojiCategory === cat.id ? 'bg-purple-600 text-white font-bold' : 'text-gray-400 hover:text-white hover:bg-white/5'
-                        }`}
-                      >
-                        {cat.icon}
-                      </button>
-                    ))}
-                  </div>
-                )}
-
-                {/* Scrollable Emoji Grid */}
-                <div className="flex-1 overflow-y-auto max-h-52 flex flex-col gap-2 pr-1">
-                  {emojiSearchQuery ? (
-                    <div className="grid grid-cols-7 gap-1">
-                      {EMOJI_CATEGORIES.flatMap(c => c.emojis)
-                        .filter((e, idx, arr) => arr.indexOf(e) === idx && e.includes(emojiSearchQuery))
-                        .map((emoji) => (
-                          <button
-                            key={emoji}
-                            onClick={() => {
-                              handleSendReaction(emoji)
-                              setActivePopup(null)
-                            }}
-                            className="text-lg hover:scale-125 transition-transform cursor-pointer p-1 rounded hover:bg-white/10 text-center"
-                          >
-                            {emoji}
-                          </button>
-                        ))}
-                    </div>
-                  ) : (
-                    EMOJI_CATEGORIES.filter(c => emojiCategory === 'all' || emojiCategory === c.id).map((cat) => (
-                      <div key={cat.id} className="flex flex-col gap-1">
-                        <span className="text-[10px] font-bold text-gray-400 uppercase tracking-wider">{cat.label}</span>
-                        <div className="grid grid-cols-7 gap-1">
-                          {cat.emojis.map((emoji) => (
-                            <button
-                              key={emoji}
-                              onClick={() => {
-                                handleSendReaction(emoji)
-                                setActivePopup(null)
-                              }}
-                              className="text-lg hover:scale-125 transition-transform cursor-pointer p-1 rounded hover:bg-white/10 text-center"
-                            >
-                              {emoji}
-                            </button>
-                          ))}
-                        </div>
-                      </div>
-                    ))
-                  )}
-                </div>
-              </div>
-            )}
-          </div>
-
-          {/* Screen Share */}
-          <button
-            onClick={handleToggleShare}
-            title="Share Screen"
-            className={`w-11 h-11 rounded-xl flex items-center justify-center border transition-all duration-200 cursor-pointer ${
-              sharingActive ? 'bg-brand-blue hover:bg-brand-blue-hover border-transparent text-white shadow-lg shadow-brand-blue/20' : 'bg-[#0f1122]/60 hover:bg-[#141629] border-white/10 text-white'
-            }`}
-          >
-            <Monitor size={18} />
-          </button>
-
-          {/* Screen Recording (Host / Active Host only) */}
-          {canManageMeeting && (
-            <div className="relative">
-              <button
-                onClick={
-                  isRecordingOrPaused
-                    ? () => setRecordingPopoverAnchor((prev) => (prev === 'bottom' ? null : 'bottom'))
-                    : startRecording
-                }
-                disabled={recordingState === 'starting' || recordingState === 'finalizing'}
-                title={
-                  isRecordingOrPaused
-                    ? 'Recording controls (Pause, Resume, Stop)'
-                    : recordingState === 'starting'
-                    ? 'Starting recording...'
-                    : recordingState === 'finalizing'
-                    ? 'Finalizing recording...'
-                    : 'Start Screen Recording (Meeting Audio Included)'
-                }
-                className={`w-11 h-11 rounded-xl flex items-center justify-center border transition-all duration-200 cursor-pointer ${
-                  isPaused
-                    ? 'bg-amber-500/20 border-amber-500/40 text-amber-400 shadow-lg shadow-amber-500/20'
-                    : isRecording
-                    ? 'bg-red-500/20 border-red-500/40 text-red-400 shadow-lg shadow-red-500/20 animate-pulse'
-                    : recordingState === 'starting' || recordingState === 'finalizing'
-                    ? 'bg-[#0f1122]/60 border-yellow-500/30 text-yellow-400 opacity-70 animate-pulse'
-                    : 'bg-[#0f1122]/60 hover:bg-[#141629] border-white/10 text-white hover:text-red-400'
-                }`}
-              >
-                <Radio
-                  size={18}
-                  className={
-                    isPaused ? 'text-amber-400' : isRecording ? 'text-red-400' : ''
-                  }
-                />
-              </button>
-
-              {/* Bottom bar recording popover */}
-              <RecordingControlPopover
-                isOpen={recordingPopoverAnchor === 'bottom'}
-                onClose={() => setRecordingPopoverAnchor(null)}
-                isPaused={isPaused}
-                isRecording={isRecording}
-                recordingDuration={recordingDuration}
-                onPause={pauseRecording}
-                onResume={resumeRecording}
-                onStop={() => stopRecording('user_stop')}
-                position="bottom"
-              />
-            </div>
-          )}
-        </div>
-
-        {/* End / Leave Meeting Button (Opens Confirmation Modal) */}
-        {isHost ? (
-          <div className="flex items-center gap-2">
-            <button
-              onClick={handleToggleLock}
-              className="px-3.5 py-2 border border-[#8b5cf6]/20 hover:border-[#8b5cf6]/40 bg-[#8b5cf6]/5 hover:bg-[#8b5cf6]/10 text-[#c084fc] hover:text-[#d8b4fe] rounded-xl text-xs font-bold transition-all duration-200 cursor-pointer flex items-center gap-1.5"
-            >
-              {meetingData?.meeting_status === 'Locked' ? <Unlock size={12} /> : <Lock size={12} />}
-              <span className="hidden sm:inline">{meetingData?.meeting_status === 'Locked' ? 'Unlock Room' : 'Lock Room'}</span>
-            </button>
-            <button
-              onClick={handleDeleteMeeting}
-              className="px-3.5 py-2 border border-red-500/20 hover:border-red-500/40 bg-red-600/5 hover:bg-red-600/10 text-red-400 hover:text-red-300 rounded-xl text-xs font-bold transition-all duration-200 cursor-pointer"
-            >
-              Delete
-            </button>
-            <Button
-              variant="danger"
-              onClick={() => setShowEndConfirmModal(true)}
-              aria-label="End meeting"
-              className="px-5 py-2 rounded-xl text-xs font-semibold flex items-center gap-1.5 shadow-lg shadow-red-600/25 cursor-pointer"
-            >
-              <PhoneOff size={14} />
-              <span>End Meeting</span>
-            </Button>
-          </div>
-        ) : (
-          <Button
-            variant="danger"
-            onClick={() => setShowEndConfirmModal(true)}
-            aria-label="Leave meeting"
-            className="px-5 py-2 rounded-xl text-xs font-semibold flex items-center gap-1.5 shadow-lg shadow-red-600/25 cursor-pointer"
-          >
-            <PhoneOff size={14} />
-            <span>Leave Room</span>
-          </Button>
-        )}
-      </footer>
-
-      {/* END / LEAVE MEETING CONFIRMATION MODAL */}
-      {showEndConfirmModal && (
-        <div className="fixed inset-0 z-50 bg-black/75 backdrop-blur-md flex items-center justify-center p-4 select-none">
-          <div className="max-w-md w-full bg-[#0c0e1b] border border-white/10 rounded-2xl p-6 flex flex-col gap-5 shadow-2xl text-left">
-            <div className="flex items-center gap-3">
-              <div className="w-10 h-10 rounded-full bg-red-600/20 border border-red-500/30 flex items-center justify-center text-red-400 shrink-0">
-                <PhoneOff size={20} />
-              </div>
-              <div className="flex flex-col">
-                <h3 className="text-base font-bold text-white">
-                  {isHost ? 'End meeting for all?' : 'Leave meeting?'}
-                </h3>
-                <p className="text-xs text-gray-400 mt-0.5">
-                  {isHost
-                    ? 'You will end the meeting for all participants. Existing attendance records will be preserved.'
-                    : 'Are you sure you want to leave this meeting session?'}
-                </p>
-              </div>
-            </div>
-
-            <div className="flex flex-col gap-2 pt-2 border-t border-white/5">
-              {isHost ? (
-                <>
-                  <Button
-                    variant="danger"
-                    onClick={() => {
-                      setShowEndConfirmModal(false)
-                      handleEndWithAttendance()
-                    }}
-                    className="w-full py-2.5 rounded-xl text-xs font-bold shadow-lg shadow-red-600/30 cursor-pointer"
-                  >
-                    End meeting for all
-                  </Button>
-                  <button
-                    onClick={() => {
-                      setShowEndConfirmModal(false)
-                      handleLeaveWithAttendance()
-                    }}
-                    className="w-full py-2.5 rounded-xl bg-white/5 hover:bg-white/10 border border-white/10 text-white text-xs font-semibold transition-all cursor-pointer"
-                  >
-                    Leave meeting
-                  </button>
-                </>
-              ) : (
-                <Button
-                  variant="danger"
-                  onClick={() => {
-                    setShowEndConfirmModal(false)
-                    handleLeaveWithAttendance()
-                  }}
-                  className="w-full py-2.5 rounded-xl text-xs font-bold shadow-lg shadow-red-600/30 cursor-pointer"
-                >
-                  Leave meeting
-                </Button>
-              )}
-              <button
-                onClick={() => setShowEndConfirmModal(false)}
-                className="w-full py-2 text-xs font-semibold text-gray-400 hover:text-white transition-colors cursor-pointer"
-              >
-                Cancel
-              </button>
-            </div>
-          </div>
-        </div>
-      )}
-
-      {/* 3-MINUTE WARNING MODAL (Host Only — Strict Rule: Display only once, never if already extended) */}
-      <Modal
-        isOpen={isWarningModalOpen && canManageMeeting && !isExtensionUsed}
-        onClose={handleDeclineExtension}
-        title="Meeting Ending Soon"
-      >
-        <div className="flex flex-col gap-4 text-center py-2 select-none">
-          <div className="w-12 h-12 rounded-full bg-amber-500/10 border border-amber-500/20 flex items-center justify-center text-amber-400 mx-auto">
-            <AlertTriangle size={24} />
-          </div>
-          <div className="flex flex-col gap-1">
-            <h3 className="text-sm font-bold text-white">Your meeting will end in 3 minutes</h3>
-            <p className="text-xs text-gray-400">
-              Do you want to extend the meeting? Time remaining:{' '}
-              <span className="font-mono text-amber-400 font-bold">
-                {formatCountdown(remainingSeconds)}
-              </span>
-            </p>
-          </div>
-          <div className="grid grid-cols-2 gap-3 mt-2">
-            <button
-              type="button"
-              onClick={handleDeclineExtension}
-              className="py-2.5 px-4 rounded-xl text-xs font-bold bg-white/5 border border-white/10 text-gray-300 hover:text-white hover:bg-white/10 transition-all cursor-pointer"
-            >
-              No, Don't Extend
-            </button>
-            <button
-              type="button"
-              onClick={handleOpenExtensionModal}
-              className="py-2.5 px-4 rounded-xl text-xs font-bold bg-[#7c3aed] hover:bg-[#8b5cf6] text-white shadow-md shadow-purple-900/30 transition-all cursor-pointer"
-            >
-              Yes, Extend Meeting
-            </button>
-          </div>
-        </div>
-      </Modal>
-
-      {/* HOST EXTEND MEETING TIME MODAL */}
-      <Modal
-        isOpen={isExtensionModalOpen && canManageMeeting && !isExtensionUsed}
-        onClose={handleCancelExtension}
-        title="Extend Meeting Time"
-      >
-        <div className="flex flex-col gap-4 text-left py-2 select-none">
-          <p className="text-xs text-gray-400">
-            Select additional time to add to the current scheduled deadline:
-          </p>
-          <div className="grid grid-cols-3 gap-2.5">
-            {[5, 10, 15].map((mins) => (
-              <button
-                key={mins}
-                type="button"
-                onClick={() => setSelectedExtension(mins)}
-                className={`py-3 px-3 rounded-xl text-xs font-bold border transition-all cursor-pointer flex flex-col items-center justify-center gap-1.5 ${
-                  selectedExtension === mins
-                    ? 'bg-[#7c3aed]/25 border-[#8b5cf6] text-white shadow-md shadow-purple-900/30'
-                    : 'bg-white/2 border-white/5 text-gray-400 hover:text-white hover:border-white/20'
-                }`}
-              >
-                <Clock size={16} className={selectedExtension === mins ? 'text-[#a78bfa]' : 'text-gray-500'} />
-                <span>+{mins} min</span>
-              </button>
-            ))}
-          </div>
-          <div className="grid grid-cols-2 gap-3 mt-3">
-            <button
-              type="button"
-              onClick={handleCancelExtension}
-              disabled={isSubmittingExtension}
-              className="py-2.5 px-4 rounded-xl text-xs font-bold bg-white/5 border border-white/10 text-gray-300 hover:text-white hover:bg-white/10 transition-all cursor-pointer"
-            >
-              Cancel
-            </button>
-            <button
-              type="button"
-              onClick={handleConfirmExtension}
-              disabled={!selectedExtension || isSubmittingExtension}
-              className={`py-2.5 px-4 rounded-xl text-xs font-bold transition-all flex items-center justify-center gap-1.5 ${
-                selectedExtension && !isSubmittingExtension
-                  ? 'bg-[#7c3aed] hover:bg-[#8b5cf6] text-white shadow-md shadow-purple-900/30 cursor-pointer'
-                  : 'bg-white/5 border border-white/5 text-gray-500 cursor-not-allowed'
-              }`}
-            >
-              {isSubmittingExtension ? 'Extending...' : 'Extend Meeting'}
-            </button>
-          </div>
-        </div>
-      </Modal>
-    </div>
+    <RealtimeKitAdapter
+      {...sharedAdapterProps}
+      cloudflareToken={cloudflareToken}
+      cloudflareMeetingId={cloudflareMeetingId}
+    />
   )
 }

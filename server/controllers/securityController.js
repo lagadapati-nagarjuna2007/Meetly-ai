@@ -1,7 +1,18 @@
 import { supabase } from '../config/supabase.js'
-import { AccessToken, RoomServiceClient } from 'livekit-server-sdk'
 import { cancelCleanup } from '../services/meetingCleanup.js'
 import { authorizeHost } from '../utils/authHelper.js'
+import {
+  isCloudflareConfigured,
+  createCloudflareMeeting,
+  addCloudflareParticipant,
+  removeCloudflareParticipant,
+  endCloudflareMeeting,
+  refreshCloudflareParticipantToken
+} from '../config/cloudflareRealtime.js'
+
+// RealtimeKit participant preset
+export const getCloudflareParticipantPreset = () =>
+  process.env.CLOUDFLARE_REALTIME_PARTICIPANT_PRESET || 'meetly-participant'
 
 // Helper for structured audit logging
 const logAudit = ({ action, meetingCode, hostId, participantId, value }) => {
@@ -25,16 +36,71 @@ const isUuid = (val) => {
   return /^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$/.test(val)
 }
 
+// Pluggable Cloudflare service reference allowing test dependency injection
+let cloudflareService = {
+  isConfigured: isCloudflareConfigured,
+  createMeeting: createCloudflareMeeting,
+  addParticipant: addCloudflareParticipant,
+  removeParticipant: removeCloudflareParticipant,
+  endMeeting: endCloudflareMeeting,
+  refreshParticipantToken: refreshCloudflareParticipantToken
+}
+
+export const setCloudflareService = (service) => {
+  cloudflareService = { ...cloudflareService, ...service }
+}
+
+export const resetCloudflareService = () => {
+  cloudflareService = {
+    isConfigured: isCloudflareConfigured,
+    createMeeting: createCloudflareMeeting,
+    addParticipant: addCloudflareParticipant,
+    removeParticipant: removeCloudflareParticipant,
+    endMeeting: endCloudflareMeeting,
+    refreshParticipantToken: refreshCloudflareParticipantToken
+  }
+}
+
 /**
- * Helper to get LiveKit RoomServiceClient if environment variables exist
+ * Safely roll back participant admission when provider enrollment or DB persistence fails.
+ * Restores the pending join request and removes any falsely admitted participant record.
  */
-export const getRoomServiceClient = () => {
-  const apiKey = process.env.LIVEKIT_API_KEY
-  const apiSecret = process.env.LIVEKIT_API_SECRET
-  const livekitUrl = process.env.LIVEKIT_URL
-  if (!apiKey || !apiSecret || !livekitUrl) return null
-  const httpUrl = livekitUrl.replace(/^wss:/, 'https:').replace(/^ws:/, 'http:')
-  return new RoomServiceClient(httpUrl, apiKey, apiSecret)
+const rollbackParticipantAdmission = async (meetingId, uppercaseCode, userId, fingerprint) => {
+  try {
+    // Check existing participant status: do not delete or restore if participant was banned/removed!
+    const { data: existingPart } = await supabase
+      .from('participants')
+      .select('participant_status')
+      .eq('meeting_id', meetingId)
+      .eq('user_id', userId)
+      .maybeSingle()
+
+    if (existingPart?.participant_status === 'removed') {
+      console.log(`[Security] Rollback skipping participant deletion because user ${userId} has status 'removed'.`)
+      return
+    }
+
+    await supabase
+      .from('participants')
+      .delete()
+      .eq('meeting_id', meetingId)
+      .eq('user_id', userId)
+      .eq('participant_status', 'enrolling')
+
+    // Atomically restore join request under advisory lock; rejects if device was banned
+    const { error: restoreErr } = await supabase
+      .rpc('create_join_request_tx', {
+        p_meeting_code: uppercaseCode,
+        p_user_id: userId,
+        p_device_fingerprint: fingerprint || 'unknown-fingerprint'
+      })
+
+    if (restoreErr) {
+      console.warn(`[Security] Rollback join request restoration rejected: ${restoreErr.message}`)
+    }
+  } catch (err) {
+    console.error('[Security] Failed to rollback participant admission:', err.message)
+  }
 }
 
 
@@ -140,9 +206,11 @@ export const getPendingRequests = async (req, res) => {
 
 /**
  * POST /api/meetings/security/accept
- * Host accepts a pending participant using atomic db transaction
+ * Host accepts a pending participant using atomic db transaction and dual-provider enrollment
  */
 export const acceptJoinRequest = async (req, res) => {
+  let meeting = null
+  let cfParticipant = null
   try {
     const { meetingCode, userId } = req.body
     if (!meetingCode || !meetingCode.trim()) {
@@ -162,7 +230,7 @@ export const acceptJoinRequest = async (req, res) => {
 
     const uppercaseCode = meetingCode.trim().toUpperCase()
 
-    // 1. Verify meeting exists and caller is host
+    // 1. Authorize caller is meeting Host (Original Host or Active Host)
     const auth = await authorizeHost(uppercaseCode, req.user.id)
     if (!auth.passed) {
       if (auth.status === 403) {
@@ -179,9 +247,9 @@ export const acceptJoinRequest = async (req, res) => {
         message: auth.message
       })
     }
-    const meeting = auth.meeting
+    meeting = auth.meeting
 
-    // 2. Execute transaction inside PostgreSQL RPC function
+    // 2. Step 1: Atomic Admission Reservation (moves participant to 'enrolling' state under advisory lock)
     const { data: fingerprint, error: txErr } = await supabase
       .rpc('accept_join_request_tx', {
         p_meeting_code: uppercaseCode,
@@ -190,6 +258,53 @@ export const acceptJoinRequest = async (req, res) => {
 
     if (txErr) {
       console.error('[Security Transaction Error] accept_join_request_tx failed:', txErr)
+      if (txErr.message?.includes('device is banned') || txErr.message?.includes('user has been removed')) {
+        // Clean up the waiting request under transactional user-lock protocol (bounded retry)
+        let rejectSucceeded = false
+        for (let attempt = 1; attempt <= 2; attempt++) {
+          const { error: rejectErr } = await supabase
+            .rpc('reject_join_request_tx', {
+              p_meeting_code: uppercaseCode,
+              p_user_id: userId
+            })
+
+          if (!rejectErr) {
+            rejectSucceeded = true
+            break
+          }
+
+          console.error(
+            `[Security] reject_join_request_tx cleanup attempt ${attempt} failed for meeting: ${uppercaseCode}, user: ${userId}:`,
+            rejectErr.message
+          )
+          if (attempt < 2) {
+            await new Promise((resolve) => setTimeout(resolve, 50))
+          }
+        }
+
+        if (!rejectSucceeded) {
+          console.error(
+            `[Security] reject_join_request_tx cleanup exhausted retries for meeting: ${uppercaseCode}, user: ${userId}`
+          )
+        }
+
+        return res.status(403).json({
+          success: false,
+          code: 'FORBIDDEN',
+          message: txErr.message?.includes('user has been removed')
+            ? 'Cannot admit participant: user has been removed from this meeting.'
+            : 'Cannot admit participant: this device is banned from the meeting.'
+        })
+      }
+
+      if (txErr.message?.includes('fingerprint changed concurrently')) {
+        return res.status(409).json({
+          success: false,
+          code: 'CONCURRENCY_CONFLICT',
+          message: 'Device fingerprint changed during admission. Please retry.'
+        })
+      }
+
       return res.status(400).json({
         success: false,
         code: 'TRANSACTION_FAILED',
@@ -197,25 +312,7 @@ export const acceptJoinRequest = async (req, res) => {
       })
     }
 
-    // 2.5. Verify the participant's device is not currently banned
-    if (fingerprint) {
-      const { data: bannedRow } = await supabase
-        .from('meeting_device_bans')
-        .select('id')
-        .eq('meeting_code', uppercaseCode)
-        .eq('device_fingerprint', fingerprint)
-        .maybeSingle()
-
-      if (bannedRow) {
-        return res.status(403).json({
-          success: false,
-          code: 'FORBIDDEN',
-          message: 'Cannot admit participant: this device is banned from the meeting.'
-        })
-      }
-    }
-
-    // 3. Fetch user record to issue LiveKit token
+    // 3. Fetch user record for identity and display name
     const { data: userRecord } = await supabase
       .from('users')
       .select('*')
@@ -223,6 +320,7 @@ export const acceptJoinRequest = async (req, res) => {
       .maybeSingle()
 
     if (!userRecord) {
+      await rollbackParticipantAdmission(meeting.meeting_id, uppercaseCode, userId, fingerprint)
       return res.status(404).json({
         success: false,
         code: 'NOT_FOUND',
@@ -230,51 +328,154 @@ export const acceptJoinRequest = async (req, res) => {
       })
     }
 
-    // 4. Generate LiveKit token
-    const apiKey = process.env.LIVEKIT_API_KEY
-    const apiSecret = process.env.LIVEKIT_API_SECRET
-    const livekitUrl = process.env.LIVEKIT_URL
+    const isCloudflareMeeting = Boolean(meeting.cloudflare_meeting_id)
+    cfParticipant = null
 
-    const at = new AccessToken(apiKey, apiSecret, {
-      identity: userRecord.email || userRecord.id,
-      name: userRecord.full_name,
-      metadata: JSON.stringify({ userId: userRecord.id, role: 'participant' })
-    })
+    // 4. Step 2: Cloudflare RealtimeKit Credential Issuance (Asynchronous)
+    if (!cloudflareService.isConfigured()) {
+      console.error('[Security] Cloudflare is not configured for meeting admission.')
+      await rollbackParticipantAdmission(meeting.meeting_id, uppercaseCode, userId, fingerprint)
+      return res.status(502).json({
+        success: false,
+        code: 'CLOUDFLARE_NOT_CONFIGURED',
+        message: 'Cloudflare RealtimeKit is not configured on this server.'
+      })
+    }
 
-    at.addGrant({
-      roomJoin: true,
-      room: meeting.room_name,
-      canPublish: true,
-      canSubscribe: true
-    })
+    const presetName = getCloudflareParticipantPreset()
+    const displayName = userRecord.full_name?.trim() || 'Anonymous'
 
-    const token = await at.toJwt()
+    try {
+      cfParticipant = await cloudflareService.addParticipant(meeting.cloudflare_meeting_id, {
+        name: displayName,
+        presetName,
+        customParticipantId: userId
+      })
+      console.log(`[Security] Cloudflare participant enrolled for user ${userId} in meeting ${meeting.cloudflare_meeting_id}`)
+    } catch (enrollErr) {
+      console.error(`[Security] Cloudflare participant enrollment failed for user ${userId}:`, enrollErr.message)
+      await rollbackParticipantAdmission(meeting.meeting_id, uppercaseCode, userId, fingerprint)
+      return res.status(502).json({
+        success: false,
+        code: 'CLOUDFLARE_ENROLLMENT_FAILED',
+        message: 'Failed to enroll participant in Cloudflare RealtimeKit session.'
+      })
+    }
+
+    // 5. Step 3: Atomic Finalization Guard (enrolling -> joined under advisory lock)
+    // If a ban occurred while provider was enrolling, status was changed to 'removed',
+    // so finalize_participant_admission_tx updates 0 rows and returns FALSE.
+    const { data: isFinalized, error: finalizeErr } = await supabase.rpc(
+      'finalize_participant_admission_tx',
+      {
+        p_meeting_id: meeting.meeting_id,
+        p_user_id: userId,
+        p_cloudflare_participant_id: cfParticipant?.participantId || null
+      }
+    )
+
+    if (finalizeErr || !isFinalized) {
+      console.warn(`[Security] Admission finalization rejected for user ${userId}: participant was banned or removed during provider enrollment.`)
+
+      // If Cloudflare participant was created, evict immediately so no orphaned peer lingers
+      if (cfParticipant?.participantId && meeting.cloudflare_meeting_id) {
+        try {
+          await cloudflareService.removeParticipant(meeting.cloudflare_meeting_id, cfParticipant.participantId)
+          console.log(`[Security] Evicted mid-flight banned Cloudflare participant ${cfParticipant.participantId}`)
+        } catch (evictErr) {
+          console.warn('[Security] Concurrent ban Cloudflare eviction warning:', evictErr.message)
+        }
+      }
+
+      // Withhold credentials and return 403
+      return res.status(403).json({
+        success: false,
+        code: 'FORBIDDEN',
+        message: 'Cannot admit participant: this device is banned from the meeting.'
+      })
+    }
+
+    // 6. Step 4: Pre-Emission Delivery Verification
+    // Ensure that even in the sub-millisecond gap between finalization and socket delivery,
+    // if a ban committed, credentials are not delivered.
+    const { data: verifiedPart } = await supabase
+      .from('participants')
+      .select('participant_status')
+      .eq('meeting_id', meeting.meeting_id)
+      .eq('user_id', userId)
+      .maybeSingle()
+
+    if (verifiedPart?.participant_status !== 'joined') {
+      console.warn(`[Security] Pre-emission check detected status ${verifiedPart?.participant_status} for user ${userId}. Withholding tokens.`)
+      if (cfParticipant?.participantId && meeting.cloudflare_meeting_id) {
+        await cloudflareService.removeParticipant(meeting.cloudflare_meeting_id, cfParticipant.participantId).catch(() => {})
+      }
+      return res.status(403).json({
+        success: false,
+        code: 'FORBIDDEN',
+        message: 'Cannot admit participant: this device is banned from the meeting.'
+      })
+    }
 
     cancelCleanup(meeting.meeting_id)
 
-    // 5. Emit Socket.IO events (Post-Commit)
+    // 7. Targeted Socket.IO emission to the intended participant's socket(s) only
     const io = req.app.get('io')
+    const roomUserSockets = req.app.get('roomUserSockets')
+
     if (io) {
-      io.to(meeting.room_name).emit('participant_accepted', {
+      const acceptancePayload = {
         userId,
-        token,
-        livekitUrl: livekitUrl || 'ws://localhost:7880',
-        roomName: meeting.room_name
-      })
+        roomName: meeting.room_name,
+        cloudflareToken: cfParticipant?.token || null,
+        cloudflareMeetingId: meeting.cloudflare_meeting_id || null,
+        cloudflareParticipantId: cfParticipant?.participantId || null,
+        activeProvider: 'cloudflare'
+      }
+
+      const targetUserId = String(userId).trim().toLowerCase()
+      const userMap = roomUserSockets?.get(meeting.room_name)
+      const userSockets = userMap?.get(targetUserId)
+
+      if (userSockets && userSockets.size > 0) {
+        userSockets.forEach((sId) => {
+          io.to(sId).emit('participant_accepted', acceptancePayload)
+        })
+      } else {
+        console.warn(`[Security Socket] No active authenticated sockets found in roomUserSockets for user ${userId}.`)
+      }
+
+      // Preserve waiting_list_updated broadcast for host
       io.to(meeting.room_name).emit('waiting_list_updated')
     }
 
-    // 6. Structured audit log
+    // 7. Structured audit log
     logAudit({
       action: 'Participant Accepted',
       meetingCode: uppercaseCode,
       hostId: req.user.id,
-      participantId: userId
+      participantId: userId,
+      value: 'cloudflare'
     })
 
-    return res.status(200).json({ success: true, message: 'Participant accepted.' })
+    return res.status(200).json({
+      success: true,
+      message: 'Participant accepted.',
+      cloudflareToken: cfParticipant?.token || null,
+      cloudflareMeetingId: meeting.cloudflare_meeting_id || null,
+      cloudflareParticipantId: cfParticipant?.participantId || null,
+      activeProvider: 'cloudflare'
+    })
   } catch (err) {
     console.error('[Security] acceptJoinRequest error:', err)
+    if (meeting?.cloudflare_meeting_id && cfParticipant?.participantId) {
+      try {
+        await cloudflareService.removeParticipant(meeting.cloudflare_meeting_id, cfParticipant.participantId)
+        console.log(`[Security] Evicted orphan Cloudflare participant ${cfParticipant.participantId} on error`)
+      } catch (evictErr) {
+        console.warn('[Security] Error cleanup Cloudflare eviction warning:', evictErr.message)
+      }
+    }
     return res.status(500).json({
       success: false,
       code: 'SERVER_ERROR',
@@ -334,10 +535,24 @@ export const rejectJoinRequest = async (req, res) => {
 
     if (txErr) {
       console.error('[Security Transaction Error] reject_join_request_tx failed:', txErr)
+      if (txErr.message?.includes('fingerprint changed concurrently')) {
+        return res.status(409).json({
+          success: false,
+          code: 'CONCURRENCY_CONFLICT',
+          message: 'Device fingerprint changed concurrently; please retry.'
+        })
+      }
       return res.status(400).json({
         success: false,
         code: 'TRANSACTION_FAILED',
         message: txErr.message || 'Database transaction failed.'
+      })
+    }
+
+    if (success === false) {
+      return res.status(200).json({
+        success: true,
+        message: 'Join request already handled or not found.'
       })
     }
 
@@ -418,6 +633,13 @@ export const banDevice = async (req, res) => {
 
     if (txErr) {
       console.error('[Security Transaction Error] ban_device_tx failed:', txErr)
+      if (txErr.message?.includes('fingerprint changed concurrently')) {
+        return res.status(409).json({
+          success: false,
+          code: 'CONCURRENCY_CONFLICT',
+          message: 'Device fingerprint changed during ban operation. Please retry.'
+        })
+      }
       return res.status(400).json({
         success: false,
         code: 'TRANSACTION_FAILED',
@@ -426,34 +648,38 @@ export const banDevice = async (req, res) => {
     }
 
     // 2.5. Update participant record status to 'removed'
-    await supabase
+    const { data: participant } = await supabase
       .from('participants')
-      .update({ participant_status: 'removed', left_at: new Date().toISOString() })
+      .select('participant_id, cloudflare_participant_id')
       .eq('meeting_id', meeting.meeting_id)
       .eq('user_id', userId)
+      .maybeSingle()
 
-    // 2.6. Evict the participant server-side from LiveKit room
-    try {
-      const { data: targetUser } = await supabase
-        .from('users')
-        .select('email')
-        .eq('id', userId)
-        .maybeSingle()
+    if (participant) {
+      await supabase
+        .from('participants')
+        .update({ participant_status: 'removed', left_at: new Date().toISOString() })
+        .eq('participant_id', participant.participant_id)
+    }
 
-      const roomService = getRoomServiceClient()
-      if (roomService && meeting.room_name) {
-        const identities = Array.from(new Set([targetUser?.email, userId].filter(Boolean)))
-        for (const identity of identities) {
+    // 2.5.5. Evict participant server-side from Cloudflare RealtimeKit room (including cross-account sessions)
+    if (meeting.cloudflare_meeting_id && cloudflareService.isConfigured()) {
+      const { data: targetParts } = await supabase
+        .from('participants')
+        .select('cloudflare_participant_id')
+        .eq('meeting_id', meeting.meeting_id)
+        .or(`user_id.eq.${userId},device_fingerprint.eq.${fingerprint}`)
+
+      for (const p of targetParts || []) {
+        if (p.cloudflare_participant_id) {
           try {
-            await roomService.removeParticipant(meeting.room_name, identity)
-            console.log(`[Security] Successfully removed participant ${identity} from LiveKit room ${meeting.room_name}`)
-          } catch (lkErr) {
-            console.warn(`[Security] LiveKit removeParticipant notice for ${identity}: ${lkErr.message}`)
+            await cloudflareService.removeParticipant(meeting.cloudflare_meeting_id, p.cloudflare_participant_id)
+            console.log(`[Security] Successfully evicted banned participant ${p.cloudflare_participant_id} from Cloudflare meeting ${meeting.cloudflare_meeting_id}`)
+          } catch (cfErr) {
+            console.warn(`[Security] Cloudflare ban eviction warning for ${p.cloudflare_participant_id}:`, cfErr.message)
           }
         }
       }
-    } catch (evictErr) {
-      console.warn(`[Security] Error during server-side LiveKit eviction: ${evictErr.message}`)
     }
 
     // 3. Emit Socket.IO events (Post-Commit)
@@ -604,7 +830,7 @@ export const removeParticipant = async (req, res) => {
     // 2. Update participant status to 'removed'
     const { data: participant } = await supabase
       .from('participants')
-      .select('participant_id')
+      .select('participant_id, cloudflare_participant_id')
       .eq('meeting_id', meeting.meeting_id)
       .eq('user_id', userId)
       .maybeSingle()
@@ -621,28 +847,14 @@ export const removeParticipant = async (req, res) => {
       if (updateErr) throw updateErr
     }
 
-    // 2.5. Evict the participant server-side from LiveKit room
-    try {
-      const { data: targetUser } = await supabase
-        .from('users')
-        .select('email')
-        .eq('id', userId)
-        .maybeSingle()
-
-      const roomService = getRoomServiceClient()
-      if (roomService && meeting.room_name) {
-        const identities = Array.from(new Set([targetUser?.email, userId].filter(Boolean)))
-        for (const identity of identities) {
-          try {
-            await roomService.removeParticipant(meeting.room_name, identity)
-            console.log(`[Security] Removed participant ${identity} from LiveKit room ${meeting.room_name}`)
-          } catch (lkErr) {
-            console.warn(`[Security] LiveKit removeParticipant notice for ${identity}: ${lkErr.message}`)
-          }
-        }
+    // 2.4. Evict participant server-side from Cloudflare RealtimeKit room (if applicable)
+    if (meeting.cloudflare_meeting_id && participant?.cloudflare_participant_id && cloudflareService.isConfigured()) {
+      try {
+        await cloudflareService.removeParticipant(meeting.cloudflare_meeting_id, participant.cloudflare_participant_id)
+        console.log(`[Security] Successfully removed participant ${participant.cloudflare_participant_id} from Cloudflare meeting ${meeting.cloudflare_meeting_id}`)
+      } catch (cfErr) {
+        console.warn(`[Security] Cloudflare removeParticipant warning for ${participant.cloudflare_participant_id}:`, cfErr.message)
       }
-    } catch (evictErr) {
-      console.warn(`[Security] Error during server-side LiveKit eviction: ${evictErr.message}`)
     }
 
     // 3. Emit Socket.IO event (Post-Commit)
@@ -672,7 +884,8 @@ export const removeParticipant = async (req, res) => {
 
 /**
  * POST /api/meetings/security/mute-participant
- * Host moderator mutes or unmutes a participant's microphone via LiveKit RoomServiceClient.mutePublishedTrack
+ * Host moderator mutes or unmutes a participant's microphone.
+ * Emits real-time Socket.IO event and authorizes host action.
  */
 export const muteParticipant = async (req, res) => {
   try {
@@ -729,33 +942,7 @@ export const muteParticipant = async (req, res) => {
     const meeting = auth.meeting
     const roomName = meeting.room_name
 
-    // 2. Call LiveKit RoomServiceClient.mutePublishedTrack for BOTH mute=true and mute=false
-    const roomService = getRoomServiceClient()
-    if (!roomService) {
-      console.error('[Security Error] LiveKit server credentials missing in process.env')
-      return res.status(500).json({
-        success: false,
-        code: 'SERVER_ERROR',
-        message: 'LiveKit server credentials missing on server.'
-      })
-    }
-
-    console.log(`[Security LiveKit Mute] Calling mutePublishedTrack(room=${roomName}, identity=${participantIdentity}, trackSid=${trackSid}, muted=${!!mute})`)
-
-    try {
-      await roomService.mutePublishedTrack(roomName, participantIdentity, trackSid.trim(), !!mute)
-      console.log(`[Security LiveKit Mute] Successfully set mutePublishedTrack to ${!!mute} for track ${trackSid}`)
-    } catch (lkErr) {
-      console.error('[Security LiveKit Error] mutePublishedTrack failed:', lkErr)
-      const lkMsg = lkErr.message || String(lkErr)
-      return res.status(400).json({
-        success: false,
-        code: 'LIVEKIT_ERROR',
-        message: `LiveKit rejected remote mute operation: ${lkMsg}`
-      })
-    }
-
-    // 3. Emit Socket.IO event to room so participant client executes local setMicrophoneEnabled
+    // 2. Emit Socket.IO event to room so participant client executes local microphone disable
     const io = req.app.get('io')
     if (io) {
       io.to(roomName).emit('host_mute_toggle', {
@@ -766,7 +953,7 @@ export const muteParticipant = async (req, res) => {
       console.log(`[Security Socket] Emitted 'host_mute_toggle' (mute=${!!mute}) to room ${roomName} for ${participantIdentity}`)
     }
 
-    // 4. Structured audit log
+    // 3. Structured audit log
     logAudit({
       action: mute ? 'Host Muted Participant' : 'Host Unmuted Participant',
       meetingCode: uppercaseCode,
@@ -792,7 +979,7 @@ export const muteParticipant = async (req, res) => {
 /**
  * POST /api/meetings/security/toggle-mute-all
  * Meeting-wide Microphone Lock toggle (Host only).
- * When muteAllEnabled=true, mutes all currently published participant tracks and locks microphones.
+ * When muteAllEnabled=true, locks microphones across all participants.
  * When muteAllEnabled=false, unlocks microphone controls without blindly unmuting everyone.
  */
 export const toggleMuteAll = async (req, res) => {
@@ -842,37 +1029,7 @@ export const toggleMuteAll = async (req, res) => {
 
     console.log(`[Security Mute All] Meeting ${meeting.meeting_id} (${uppercaseCode}) Mute All toggled to ${isMuteAll}`)
 
-    // 3. If turning Mute All ON, iterate through connected LiveKit participants and mute active audio tracks
-    if (isMuteAll) {
-      const roomService = getRoomServiceClient()
-      if (roomService) {
-        try {
-          const participantsList = await roomService.listParticipants(roomName)
-          if (participantsList && participantsList.length > 0) {
-            for (const p of participantsList) {
-              // Skip host participant
-              if (p.identity === req.user.id || p.identity === req.user.email) continue
-
-              const audioTrack = p.tracks?.find(
-                (t) => t.type === 'AUDIO' || t.source === 'MICROPHONE' || t.kind === 'audio'
-              )
-              if (audioTrack && audioTrack.sid && !audioTrack.muted) {
-                try {
-                  await roomService.mutePublishedTrack(roomName, p.identity, audioTrack.sid, true)
-                  console.log(`[Security Mute All] Muted track ${audioTrack.sid} for participant ${p.identity}`)
-                } catch (tErr) {
-                  console.warn(`[Security Mute All Note] Failed to mute track for ${p.identity}:`, tErr.message)
-                }
-              }
-            }
-          }
-        } catch (lkErr) {
-          console.warn('[Security Mute All Note] LiveKit listParticipants/mute error:', lkErr.message || lkErr)
-        }
-      }
-    }
-
-    // 4. Emit Socket.IO event to room so all clients update local muteAllEnabled state
+    // 3. Emit Socket.IO event to room so all clients update local muteAllEnabled state
     const io = req.app.get('io')
     if (io) {
       io.to(roomName).emit('meeting_mute_all_changed', {
@@ -881,7 +1038,7 @@ export const toggleMuteAll = async (req, res) => {
       console.log(`[Security Socket] Emitted 'meeting_mute_all_changed' (${isMuteAll}) to room ${roomName}`)
     }
 
-    // 5. Audit log
+    // 4. Audit log
     logAudit({
       action: isMuteAll ? 'Mute All / Lock Microphones Enabled' : 'Mute All / Lock Microphones Disabled',
       meetingCode: uppercaseCode,

@@ -304,7 +304,7 @@ export default function MeetingChat({
     return null
   }, [dbParticipants])
 
-  // List of other participants available for 1:1 chat (LiveKit + admitted DB participants + restored DM peers)
+  // List of other participants available for 1:1 chat (Cloudflare RealtimeKit + admitted DB participants + restored DM peers)
   const eligibleRecipients = useMemo(() => {
     const list = []
     const seen = new Set()
@@ -326,7 +326,7 @@ export default function MeetingChat({
       })
     }
 
-    // 1. LiveKit participants currently in room
+    // 1. Cloudflare RealtimeKit participants currently in room
     for (const p of participants || []) {
       const pUserId = getParticipantUserId(p)
       if (!pUserId) continue

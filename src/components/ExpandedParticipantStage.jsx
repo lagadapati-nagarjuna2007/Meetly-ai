@@ -1,6 +1,5 @@
-import React, { useState, useRef, useEffect, useCallback } from 'react'
-import { VideoTrack } from '@livekit/components-react'
-import { Track } from 'livekit-client'
+import React, { useState, useRef, useEffect, useCallback, useId } from 'react'
+import UniversalVideoTrack from './VideoTrack'
 import {
   ZoomIn,
   ZoomOut,
@@ -30,17 +29,20 @@ export default function ExpandedParticipantStage({
   activeReactionsMap = {}
 }) {
   const stageRef = useRef(null)
+  const instanceId = useId()
   const [zoom, setZoom] = useState(100)
   const [pan, setPan] = useState({ x: 0, y: 0 })
   const [isDragging, setIsDragging] = useState(false)
   const [isFullscreen, setIsFullscreen] = useState(false)
   const dragStartRef = useRef({ startX: 0, startY: 0, initialPanX: 0, initialPanY: 0 })
 
+  const selectedSessionId = participant?.id || participant?.sid || participant?.identity || participant?.customParticipantId || null
+
   // Reset zoom & pan when switching participants
   useEffect(() => {
     setZoom(100)
     setPan({ x: 0, y: 0 })
-  }, [participant?.identity])
+  }, [selectedSessionId])
 
   // Fullscreen event listener
   useEffect(() => {
@@ -209,26 +211,69 @@ export default function ExpandedParticipantStage({
     }
   }
 
+  // Resolve host status: RealtimeKit isHost boolean + metadata role fallback
   let role = 'participant'
-  try {
-    const meta = JSON.parse(participant?.metadata || '{}')
-    role = meta.role || 'participant'
-  } catch (_) {}
+  if (participant?.isHost) {
+    role = 'host'
+  } else {
+    try {
+      const meta = typeof participant?.metadata === 'string'
+        ? JSON.parse(participant.metadata || '{}')
+        : (participant?.metadata || {})
+      role = meta.role || 'participant'
+    } catch (_) {}
+  }
 
-  const isCurrentUser = participant?.identity === localParticipant?.identity
+  // Resolve local participant identity:
+  // 1. RealtimeKit: customParticipantId matched against user.id or localParticipant.customParticipantId
+  // 2. Identity equality check
+  const isCurrentUser = Boolean(
+    (participant?.customParticipantId && user?.id && participant.customParticipantId === user.id) ||
+    (participant?.customParticipantId && localParticipant?.customParticipantId &&
+      participant.customParticipantId === localParticipant.customParticipantId) ||
+    (participant?.identity && localParticipant?.identity &&
+      participant.identity === localParticipant.identity) ||
+    (participant && localParticipant && participant === localParticipant)
+  )
+
   const displayName = isCurrentUser
     ? (user?.name || user?.full_name || participant?.name || 'You')
     : (participant?.name || 'Participant')
 
-  const isLocalCameraEnabled = typeof localCamActive === 'boolean'
-    ? Boolean(localCamActive && localParticipant?.isCameraEnabled)
-    : Boolean(localParticipant?.isCameraEnabled)
-  const isCameraEnabled = isCurrentUser
-    ? isLocalCameraEnabled
+  // Resolve video tracks (RealtimeKit MediaStreamTrack)
+  const participantVideoTrack = participant?.videoTrack || null
+  const localParticipantVideoTrack = localParticipant?.videoTrack || null
+
+  // Unique session keys for React elements
+  const rtkVideoKey = participant?.id
+    ? `rtk-expanded-${participant.id}`
+    : `rtk-expanded-${instanceId}`
+
+  const localRtkVideoKey = localParticipant?.id
+    ? `rtk-local-${localParticipant.id}`
+    : `rtk-local-${instanceId}`
+
+  // Resolve camera active state (RealtimeKit: participant.videoEnabled)
+  const isParticipantCameraActive = participant?.videoEnabled !== undefined
+    ? Boolean(participant.videoEnabled)
     : Boolean(participant?.isCameraEnabled)
-  const isHandRaised = Boolean(raisedHandsMap[participant?.identity])
-  const isAway = participantStatusMap[participant?.identity] === 'be_right_back'
-  const activeReaction = activeReactionsMap[participant?.identity]
+
+  const isLocalParticipantCameraActive = localParticipant?.videoEnabled !== undefined
+    ? Boolean(localParticipant.videoEnabled)
+    : Boolean(localParticipant?.isCameraEnabled)
+
+  const isLocalCameraRenderable = typeof localCamActive === 'boolean'
+    ? Boolean(localCamActive && isLocalParticipantCameraActive)
+    : Boolean(isLocalParticipantCameraActive)
+
+  const isCameraEnabled = isCurrentUser
+    ? isLocalCameraRenderable
+    : isParticipantCameraActive
+
+  const participantIdentifier = participant?.identity || participant?.customParticipantId || participant?.id
+  const isHandRaised = Boolean(raisedHandsMap[participantIdentifier] || (participant?.identity && raisedHandsMap[participant.identity]))
+  const isAway = (participantStatusMap[participantIdentifier] || (participant?.identity && participantStatusMap[participant.identity])) === 'be_right_back'
+  const activeReaction = activeReactionsMap[participantIdentifier] || (participant?.identity && activeReactionsMap[participant.identity])
 
   return (
     <div
@@ -350,10 +395,21 @@ export default function ExpandedParticipantStage({
           }}
         >
           {isCameraEnabled ? (
-            <VideoTrack
-              trackRef={{ participant, source: Track.Source.Camera }}
-              className="w-full h-full object-contain bg-black pointer-events-none"
-            />
+            participantVideoTrack ? (
+              <UniversalVideoTrack
+                key={rtkVideoKey}
+                track={participantVideoTrack}
+                className="w-full h-full object-contain bg-black pointer-events-none"
+              />
+            ) : (
+              /* RealtimeKit video enabled but track is null/connecting: safe loading state */
+              <div className="w-full h-full bg-slate-950 flex flex-col items-center justify-center gap-3">
+                <div className="w-10 h-10 rounded-full border-2 border-white/10 border-t-purple-500 animate-spin" />
+                <span className="text-xs font-semibold text-gray-400 uppercase tracking-widest">
+                  Connecting video...
+                </span>
+              </div>
+            )
           ) : isCurrentUser && camInitializing ? (
             <div className="w-full h-full bg-slate-950 flex flex-col items-center justify-center gap-3">
               <div className="w-10 h-10 rounded-full border-2 border-white/10 border-t-purple-500 animate-spin" />
@@ -447,11 +503,19 @@ export default function ExpandedParticipantStage({
               isThumbDragging ? 'cursor-grabbing shadow-purple-500/30' : 'cursor-grab'
             }`}
           >
-            {isLocalCameraEnabled ? (
-              <VideoTrack
-                trackRef={{ participant: localParticipant, source: Track.Source.Camera }}
-                className="absolute inset-0 w-full h-full object-cover pointer-events-none"
-              />
+            {isLocalCameraRenderable ? (
+              localParticipantVideoTrack ? (
+                <UniversalVideoTrack
+                  key={localRtkVideoKey}
+                  track={localParticipantVideoTrack}
+                  className="absolute inset-0 w-full h-full object-cover pointer-events-none"
+                />
+              ) : (
+                <div className="absolute inset-0 bg-slate-900 flex flex-col items-center justify-center gap-1.5 pointer-events-none">
+                  <div className="w-6 h-6 rounded-full border-2 border-white/10 border-t-purple-500 animate-spin" />
+                  <span className="text-[9px] text-gray-400 font-medium">Connecting...</span>
+                </div>
+              )
             ) : (
               <div className="absolute inset-0 bg-slate-900 flex flex-col items-center justify-center gap-1.5 pointer-events-none">
                 <div className="w-10 h-10 rounded-full bg-[#7c3aed]/20 border border-[#7c3aed]/40 flex items-center justify-center text-[#8b5cf6] font-bold text-sm">
@@ -482,19 +546,45 @@ export default function ExpandedParticipantStage({
           Participants ({allParticipants.length}):
         </span>
 
-        {allParticipants.map((p) => {
-          const isSelected = p.identity === participant?.identity
-          const isCurrent = p.identity === localParticipant?.identity
-          const pCamEnabled = isCurrent ? isLocalCameraEnabled : Boolean(p.isCameraEnabled)
+        {allParticipants.map((p, index) => {
+          const isSelected = Boolean(
+            (p.id && participant?.id && p.id === participant.id) ||
+            (p.sid && participant?.sid && p.sid === participant.sid) ||
+            (p.identity && participant?.identity && p.identity === participant.identity) ||
+            (p.customParticipantId && participant?.customParticipantId && p.customParticipantId === participant.customParticipantId) ||
+            (p === participant)
+          )
+
+          const isCurrent = Boolean(
+            (p.customParticipantId && user?.id && p.customParticipantId === user.id) ||
+            (p.customParticipantId && localParticipant?.customParticipantId && p.customParticipantId === localParticipant.customParticipantId) ||
+            (p.identity && localParticipant?.identity && p.identity === localParticipant.identity) ||
+            (p.id && localParticipant?.id && p.id === localParticipant.id) ||
+            (p === localParticipant)
+          )
+
+          const isPCamActive = p.videoEnabled !== undefined
+            ? Boolean(p.videoEnabled)
+            : Boolean(p.isCameraEnabled)
+          const pCamEnabled = isCurrent ? isLocalCameraRenderable : isPCamActive
+
           const pName = isCurrent
             ? (user?.name || user?.full_name || p.name || 'You')
             : (p.name || 'Participant')
 
+          const pSelectId = p.identity || p.sid || p.id || p.customParticipantId
+          const pKey = p.id
+            ? `filmstrip-rtk-${p.id}`
+            : (p.sid ? `filmstrip-lk-${p.sid}` : (p.identity ? `filmstrip-lk-${p.identity}` : `filmstrip-item-${index}`))
+
+          const pIdent = p.identity || p.customParticipantId || p.id
+          const pHandRaised = Boolean(raisedHandsMap[pIdent] || (p.identity && raisedHandsMap[p.identity]))
+
           return (
             <button
-              key={p.sid || p.identity}
+              key={pKey}
               type="button"
-              onClick={() => onSelectParticipant?.(p.identity)}
+              onClick={() => onSelectParticipant?.(pSelectId)}
               className={`h-14 px-3 rounded-xl border flex items-center gap-2.5 transition-all cursor-pointer shrink-0 ${
                 isSelected
                   ? 'bg-purple-600/20 border-purple-500 text-white shadow-lg shadow-purple-600/20'
@@ -516,7 +606,7 @@ export default function ExpandedParticipantStage({
                     }`}
                   />
                   {pCamEnabled ? 'Cam On' : 'Cam Off'}
-                  {raisedHandsMap[p.identity] && <span>✋</span>}
+                  {pHandRaised && <span>✋</span>}
                 </span>
               </div>
             </button>

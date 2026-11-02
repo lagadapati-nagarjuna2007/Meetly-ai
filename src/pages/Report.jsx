@@ -27,7 +27,7 @@ export default function Report() {
   const [searchParams] = useSearchParams()
   const navigate = useNavigate()
   const { user } = useAuth()
-  const { meetings, fetchMeetingSummary, generateMeetingSummary, getAttendanceReport } = useMeetings()
+  const { meetings, fetchMeetingSummary, generateMeetingSummary, getAttendanceReport, fetchMeetingTranscript } = useMeetings()
   const { showToast } = useToast()
 
   // Find meeting report data (do NOT fall back to meetings[0])
@@ -38,8 +38,11 @@ export default function Report() {
   const initialTab = searchParams.get('tab') || 'attendance'
   const [activeTab, setActiveTab] = useState(initialTab)
   
-  // Transcript search
+  // Transcript search & state
   const [searchTranscript, setSearchTranscript] = useState('')
+  const [transcriptRecords, setTranscriptRecords] = useState(null)
+  const [isLoadingTranscript, setIsLoadingTranscript] = useState(false)
+  const [transcriptError, setTranscriptError] = useState(null)
 
   // AI Summary State
   const [summaryData, setSummaryData] = useState(null)
@@ -101,6 +104,27 @@ export default function Report() {
         })
     }
   }, [activeTab, meeting?.dbId, fetchMeetingSummary])
+
+  // Fetch real transcript records when transcript tab is active
+  useEffect(() => {
+    const targetMeetingId = meeting?.dbId || id
+    if (activeTab === 'transcript' && targetMeetingId && !transcriptRecords && !isLoadingTranscript) {
+      setIsLoadingTranscript(true)
+      fetchMeetingTranscript(targetMeetingId)
+        .then((data) => {
+          const list = Array.isArray(data?.chunks) ? data.chunks : []
+          setTranscriptRecords(list)
+          setTranscriptError(null)
+        })
+        .catch((err) => {
+          console.warn('[Report] Failed to fetch meeting transcript:', err.message)
+          setTranscriptError(err.message || 'No transcript available.')
+        })
+        .finally(() => {
+          setIsLoadingTranscript(false)
+        })
+    }
+  }, [activeTab, meeting?.dbId, id, transcriptRecords, isLoadingTranscript, fetchMeetingTranscript])
 
   // Fetch real recording metadata when recording tab is active
   useEffect(() => {
@@ -351,8 +375,9 @@ export default function Report() {
     )
   }
 
-  // Filter transcript
-  const filteredTranscript = (meeting.transcript || []).filter(t =>
+  // Filter transcript (prefer real backend transcript records, fallback to meeting.transcript)
+  const allTranscripts = transcriptRecords || meeting.transcript || []
+  const filteredTranscript = allTranscripts.filter(t =>
     (t.speaker || '').toLowerCase().includes(searchTranscript.toLowerCase()) ||
     (t.text || '').toLowerCase().includes(searchTranscript.toLowerCase())
   )
@@ -980,7 +1005,12 @@ export default function Report() {
 
             {/* Transcript Logs */}
             <div className="flex flex-col gap-4 max-h-[340px] overflow-y-auto pr-2 mt-1">
-              {filteredTranscript.length > 0 ? (
+              {isLoadingTranscript ? (
+                <div className="flex flex-col items-center justify-center py-12 gap-3 text-gray-400">
+                  <div className="w-8 h-8 rounded-full border-2 border-brand-purple border-t-transparent animate-spin" />
+                  <span className="text-xs font-semibold">Loading transcript...</span>
+                </div>
+              ) : filteredTranscript.length > 0 ? (
                 filteredTranscript.map((log, idx) => (
                   <div key={idx} className="flex gap-4 p-3 bg-white/2 border border-white/3 rounded-xl">
                     {/* Timestamp & Speaker Tag */}
@@ -997,7 +1027,7 @@ export default function Report() {
                 ))
               ) : (
                 <div className="text-center py-10 text-gray-500 text-xs font-semibold">
-                  No transcript matched your search filter.
+                  {transcriptError || 'No transcript matched your search filter.'}
                 </div>
               )}
             </div>

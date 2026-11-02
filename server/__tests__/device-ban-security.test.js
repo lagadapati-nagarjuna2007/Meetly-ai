@@ -371,25 +371,25 @@ describe('Meetly AI — Master Device Ban Security Hardening Test Suite', () => 
     assert.equal(isAllowed, false, 'Removed/banned participant must be denied even when auto_admit is true')
   })
 
-  // 11. Banned participant is removed from LiveKit server-side
-  it('11. A banned participant is evicted from LiveKit server-side via RoomServiceClient', async () => {
-    let evictedRoom = null
-    let evictedIdentity = null
+  // 11. Banned participant is evicted from Cloudflare RealtimeKit server-side
+  it('11. A banned participant is evicted from Cloudflare RealtimeKit server-side via cloudflareService.removeParticipant', async () => {
+    let evictedMeetingId = null
+    let evictedParticipantId = null
 
-    const mockRoomService = {
-      removeParticipant: async (room, identity) => {
-        evictedRoom = room
-        evictedIdentity = identity
+    const mockCloudflareService = {
+      removeParticipant: async (meetingId, participantId) => {
+        evictedMeetingId = meetingId
+        evictedParticipantId = participantId
         return true
       }
     }
 
-    const targetUser = db._usersTable.get(PARTICIPANT_A)
-    const identity = targetUser.email || targetUser.id
-    await mockRoomService.removeParticipant(ROOM_NAME, identity)
+    const CF_MEETING_ID = 'cf-mtg-ban-123'
+    const CF_PARTICIPANT_ID = 'cf-part-ban-456'
+    await mockCloudflareService.removeParticipant(CF_MEETING_ID, CF_PARTICIPANT_ID)
 
-    assert.equal(evictedRoom, ROOM_NAME)
-    assert.equal(evictedIdentity, 'alice@meetly.ai')
+    assert.equal(evictedMeetingId, CF_MEETING_ID)
+    assert.equal(evictedParticipantId, CF_PARTICIPANT_ID)
   })
 
   // 12. A participant cannot rejoin after being removed
