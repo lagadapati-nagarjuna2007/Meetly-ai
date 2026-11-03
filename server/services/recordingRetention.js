@@ -137,7 +137,24 @@ export const runRecordingRetentionCycle = async () => {
               .eq('meeting_id', rec.meeting_id)
               .neq('status', 'purged')
 
-            if (!otherRecs || otherRecs.length === 0) {
+            // Check if any pending or processing participant removal jobs exist for this meeting
+            let hasActiveRemovalJobs = false
+            try {
+              const { data: activeJobs } = await supabase
+                .from('participant_removal_jobs')
+                .select('id')
+                .eq('meeting_id', rec.meeting_id)
+                .in('status', ['pending', 'processing'])
+                .limit(1)
+
+              if (activeJobs && activeJobs.length > 0) {
+                hasActiveRemovalJobs = true
+              }
+            } catch (jobCheckErr) {
+              console.warn('[Recording Retention] Note checking participant_removal_jobs:', jobCheckErr.message)
+            }
+
+            if ((!otherRecs || otherRecs.length === 0) && !hasActiveRemovalJobs) {
               console.log(`[Recording Retention] All recordings purged. Executing final deletion of parent meeting ${meeting.meeting_code}`)
               await supabase
                 .from('recordings')

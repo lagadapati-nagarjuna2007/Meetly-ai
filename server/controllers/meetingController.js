@@ -2799,6 +2799,24 @@ export const startRetentionCleanup = () => {
           .neq('status', 'purged')
 
         const protectedIds = new Set((recCheck || []).map(r => r.meeting_id))
+
+        // Exclude meetings that have pending or processing participant removal jobs
+        try {
+          const { data: removalCheck, error: remErr } = await supabase
+            .from('participant_removal_jobs')
+            .select('meeting_id')
+            .in('meeting_id', candidateIds)
+            .in('status', ['pending', 'processing'])
+
+          if (!remErr && removalCheck && removalCheck.length > 0) {
+            removalCheck.forEach(r => {
+              if (r.meeting_id) protectedIds.add(r.meeting_id)
+            })
+          }
+        } catch (remEx) {
+          console.warn('[Cleanup Job] Note checking participant_removal_jobs:', remEx.message)
+        }
+
         const expiredIds = candidateIds.filter(id => !protectedIds.has(id))
 
         if (expiredIds.length > 0) {

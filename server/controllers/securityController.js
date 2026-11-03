@@ -1,6 +1,7 @@
 import { supabase } from '../config/supabase.js'
 import { cancelCleanup } from '../services/meetingCleanup.js'
 import { authorizeHost } from '../utils/authHelper.js'
+import { executeParticipantRemoval } from '../services/participantRemovalService.js'
 import {
   isCloudflareConfigured,
   createCloudflareMeeting,
@@ -827,35 +828,15 @@ export const removeParticipant = async (req, res) => {
     }
     const meeting = auth.meeting
 
-    // 2. Update participant status to 'removed'
-    const { data: participant } = await supabase
-      .from('participants')
-      .select('participant_id, cloudflare_participant_id')
-      .eq('meeting_id', meeting.meeting_id)
-      .eq('user_id', userId)
-      .maybeSingle()
-
-    if (participant) {
-      const { error: updateErr } = await supabase
-        .from('participants')
-        .update({
-          participant_status: 'removed',
-          left_at: new Date().toISOString()
-        })
-        .eq('participant_id', participant.participant_id)
-
-      if (updateErr) throw updateErr
-    }
-
-    // 2.4. Evict participant server-side from Cloudflare RealtimeKit room (if applicable)
-    if (meeting.cloudflare_meeting_id && participant?.cloudflare_participant_id && cloudflareService.isConfigured()) {
-      try {
-        await cloudflareService.removeParticipant(meeting.cloudflare_meeting_id, participant.cloudflare_participant_id)
-        console.log(`[Security] Successfully removed participant ${participant.cloudflare_participant_id} from Cloudflare meeting ${meeting.cloudflare_meeting_id}`)
-      } catch (cfErr) {
-        console.warn(`[Security] Cloudflare removeParticipant warning for ${participant.cloudflare_participant_id}:`, cfErr.message)
-      }
-    }
+    // 2. Consolidated participant removal & reliable Cloudflare eviction with retries
+    const removalResult = await executeParticipantRemoval({
+      meeting,
+      userId,
+      initiatorUserId: req.user.id,
+      dbClient: supabase,
+      cfService: cloudflareService,
+      ioInstance: req.app.get('io')
+    })
 
     // 3. Emit Socket.IO event (Post-Commit)
     const io = req.app.get('io')
@@ -871,13 +852,39 @@ export const removeParticipant = async (req, res) => {
       participantId: userId
     })
 
-    return res.status(200).json({ success: true, message: 'Participant removed successfully.' })
+    return res.status(200).json({
+      success: true,
+      status: removalResult.status,
+      message: 'Participant removed successfully.'
+    })
   } catch (err) {
     console.error('[Security] removeParticipant error:', err)
+    if (err.code === 'CANNOT_REMOVE_ORIGINAL_HOST') {
+      return res.status(403).json({
+        success: false,
+        code: 'FORBIDDEN',
+        message: err.message
+      })
+    }
+    if (err.code === 'CANNOT_REMOVE_SELF') {
+      return res.status(400).json({
+        success: false,
+        code: 'BAD_REQUEST',
+        message: err.message
+      })
+    }
+    if (err.code === 'CLOUDFLARE_REVOCATION_PENDING') {
+      return res.status(202).json({
+        success: false,
+        code: 'REVOCATION_PENDING',
+        status: 'pending_revocation',
+        message: err.message
+      })
+    }
     return res.status(500).json({
       success: false,
-      code: 'SERVER_ERROR',
-      message: 'Server error removing participant.'
+      code: err.code || 'SERVER_ERROR',
+      message: err.message || 'Server error removing participant.'
     })
   }
 }
